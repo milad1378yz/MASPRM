@@ -1,0 +1,652 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>MASPRM: Multi-Agent System Process Reward Model</title>
+
+    <link
+      href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css"
+      rel="stylesheet"
+    />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Playfair+Display:wght@600&display=swap"
+      rel="stylesheet"
+    />
+    <link
+      rel="stylesheet"
+      href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css"
+      integrity="sha512-1ycn6Ica9999npYl+V7LowL6Nv1Y/FvYNF9hP2GSKP5l9O+V40YAjW4rX0Lz8bWvN2p43Z66Y89C0c7XqkTwg=="
+      crossorigin="anonymous"
+      referrerpolicy="no-referrer"
+    />
+    <style>
+      :root {
+        --primary-sage: #8a8d6f;
+        --accent-forest: #3d4f46;
+        --muted-sand: #f7f4ef;
+        --card-cream: #ffffff;
+        --text-dark: #2f2f2f;
+      }
+
+      body {
+        font-family: "Inter", sans-serif;
+        background-color: var(--muted-sand);
+        color: var(--text-dark);
+        scroll-behavior: smooth;
+      }
+
+      .navbar {
+        background-color: rgba(247, 244, 239, 0.95);
+        backdrop-filter: blur(6px);
+        border-bottom: 1px solid rgba(58, 66, 60, 0.05);
+      }
+
+      .navbar-brand {
+        font-family: "Playfair Display", serif;
+        font-weight: 600;
+        letter-spacing: 0.03em;
+        color: var(--accent-forest) !important;
+      }
+
+      .nav-link {
+        font-weight: 500;
+        color: #444 !important;
+      }
+
+      .nav-link.active {
+        color: var(--accent-forest) !important;
+      }
+
+      header.hero {
+        background: linear-gradient(
+            140deg,
+            rgba(138, 141, 111, 0.15),
+            rgba(247, 244, 239, 0.9)
+          ),
+          url("https://images.unsplash.com/photo-1526378722470-75c67d049f86?auto=format&fit=crop&w=1600&q=80")
+            center/cover no-repeat;
+        border-radius: 0 0 28px 28px;
+        padding: 6rem 0 4rem 0;
+        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.08);
+      }
+
+      header.hero h1 {
+        font-family: "Playfair Display", serif;
+        font-size: clamp(2.5rem, 5vw, 3.4rem);
+        line-height: 1.2;
+        color: var(--accent-forest);
+      }
+
+      header.hero p.lead {
+        font-size: 1.15rem;
+        max-width: 700px;
+        margin-top: 1.5rem;
+      }
+
+      .hero-meta {
+        margin-top: 2.5rem;
+      }
+
+      .hero-meta .badge {
+        background-color: rgba(61, 79, 70, 0.1);
+        color: var(--accent-forest);
+        padding: 0.75rem 1rem;
+        font-weight: 500;
+        border-radius: 999px;
+        margin-right: 0.75rem;
+        margin-bottom: 0.5rem;
+      }
+
+      .content-card {
+        background-color: var(--card-cream);
+        border-radius: 18px;
+        padding: 2.5rem;
+        margin-bottom: 1.75rem;
+        box-shadow: 0 12px 30px rgba(61, 79, 70, 0.08);
+        transition: transform 0.3s ease, box-shadow 0.3s ease;
+        opacity: 0;
+        transform: translateY(40px);
+      }
+
+      .content-card.visible {
+        opacity: 1;
+        transform: translateY(0);
+      }
+
+      .content-card:hover {
+        transform: translateY(-6px);
+        box-shadow: 0 16px 40px rgba(61, 79, 70, 0.12);
+      }
+
+      .section-title {
+        font-size: 1.9rem;
+        font-weight: 600;
+        color: var(--accent-forest);
+        margin-bottom: 1.5rem;
+      }
+
+      .highlight-pill {
+        background-color: rgba(138, 141, 111, 0.1);
+        border-left: 4px solid var(--primary-sage);
+        padding: 1rem 1.25rem;
+        border-radius: 14px;
+        margin-bottom: 1rem;
+      }
+
+      .stat-grid {
+        display: grid;
+        gap: 1rem;
+      }
+
+      @media (min-width: 992px) {
+        .stat-grid {
+          grid-template-columns: repeat(3, minmax(0, 1fr));
+        }
+      }
+
+      .stat-card {
+        background-color: rgba(61, 79, 70, 0.08);
+        border-radius: 16px;
+        padding: 1.75rem;
+        height: 100%;
+      }
+
+      .stat-card h4 {
+        font-size: 2rem;
+        font-weight: 700;
+        margin-bottom: 0.25rem;
+        color: var(--accent-forest);
+      }
+
+      .stat-card span {
+        text-transform: uppercase;
+        font-size: 0.75rem;
+        letter-spacing: 0.08em;
+        color: rgba(47, 47, 47, 0.7);
+      }
+
+      .callout {
+        background-color: rgba(255, 255, 255, 0.6);
+        border: 1px solid rgba(138, 141, 111, 0.16);
+        border-radius: 14px;
+        padding: 1.5rem;
+      }
+
+      .method-steps {
+        counter-reset: step;
+        list-style: none;
+        padding: 0;
+      }
+
+      .method-steps li {
+        counter-increment: step;
+        padding: 1.5rem 1.5rem 1.5rem 3.5rem;
+        background-color: rgba(61, 79, 70, 0.07);
+        border-radius: 16px;
+        position: relative;
+        margin-bottom: 1rem;
+      }
+
+      .method-steps li::before {
+        content: counter(step, decimal-leading-zero);
+        position: absolute;
+        left: 1.5rem;
+        top: 50%;
+        transform: translateY(-50%);
+        font-weight: 700;
+        color: var(--accent-forest);
+        letter-spacing: 0.1em;
+      }
+
+      .resource-links a {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.5rem;
+        margin-right: 1rem;
+        margin-bottom: 1rem;
+        text-decoration: none;
+        font-weight: 600;
+        color: var(--accent-forest);
+      }
+
+      pre.bibtex-block {
+        background-color: rgba(0, 0, 0, 0.7);
+        color: #f8f8f8;
+        padding: 1.5rem;
+        border-radius: 14px;
+        overflow-x: auto;
+      }
+
+      footer {
+        margin-top: 4rem;
+        padding: 3rem 0;
+        background-color: rgba(61, 79, 70, 0.12);
+        color: rgba(47, 47, 47, 0.75);
+      }
+
+      footer .footer-box {
+        background: rgba(255, 255, 255, 0.7);
+        border-radius: 16px;
+        padding: 2rem;
+      }
+    </style>
+  </head>
+  <body data-bs-spy="scroll" data-bs-target="#navbar" data-bs-offset="80">
+    <nav id="navbar" class="navbar navbar-expand-lg fixed-top shadow-sm">
+      <div class="container">
+        <a class="navbar-brand" href="#">MASPRM</a>
+        <button
+          class="navbar-toggler"
+          type="button"
+          data-bs-toggle="collapse"
+          data-bs-target="#navbarNav"
+          aria-controls="navbarNav"
+          aria-expanded="false"
+          aria-label="Toggle navigation"
+        >
+          <span class="navbar-toggler-icon"></span>
+        </button>
+        <div class="collapse navbar-collapse" id="navbarNav">
+          <ul class="navbar-nav ms-auto">
+            <li class="nav-item"><a class="nav-link" href="#abstract">Overview</a></li>
+            <li class="nav-item">
+              <a class="nav-link" href="#contributions">Highlights</a>
+            </li>
+            <li class="nav-item"><a class="nav-link" href="#method">Method</a></li>
+            <li class="nav-item">
+              <a class="nav-link" href="#experiments">Results</a>
+            </li>
+            <li class="nav-item">
+              <a class="nav-link" href="#resources">Resources</a>
+            </li>
+            <li class="nav-item"><a class="nav-link" href="#team">Team</a></li>
+            <li class="nav-item"><a class="nav-link" href="#bibtex">BibTeX</a></li>
+          </ul>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="container">
+        <div class="row align-items-center">
+          <div class="col-lg-8">
+            <h1>MASPRM: Multi-Agent System Process Reward Model</h1>
+            <p class="lead">
+              A compute-aware controller that assigns per-action, per-agent values
+              to multi-agent reasoning trajectories, enabling selective inference-time
+              exploration with beam search and Monte Carlo Tree Search.
+            </p>
+            <div class="mt-4 d-flex flex-wrap gap-2">
+              <a
+                class="btn btn-dark btn-lg px-4"
+                href="https://arxiv.org/abs/2510.24803"
+                target="_blank"
+                rel="noopener"
+              >
+                <i class="fa-solid fa-book-open"></i> Read on arXiv
+              </a>
+              <a
+                class="btn btn-outline-dark btn-lg px-4"
+                href="https://arxiv.org/pdf/2510.24803"
+                target="_blank"
+                rel="noopener"
+              >
+                <i class="fa-regular fa-file-pdf"></i> Download PDF
+              </a>
+              <a
+                class="btn btn-outline-secondary btn-lg px-4"
+                href="https://github.com/milad1378yz/MASPRM"
+                target="_blank"
+                rel="noopener"
+              >
+                <i class="fa-brands fa-github"></i> Code Repository
+              </a>
+            </div>
+            <div class="hero-meta">
+              <span class="badge">arXiv: 2510.24803</span>
+              <span class="badge">Categories: cs.MA, cs.AI</span>
+              <span class="badge">First posted: 27 Oct 2025</span>
+            </div>
+            <div class="mt-4">
+              <span class="fw-semibold">Authors:</span>
+              Milad Yazdani · Mahdi Mostajabdaveh · Zirui Zhou · Ying Xiong
+            </div>
+          </div>
+        </div>
+      </div>
+    </header>
+
+    <main class="py-5">
+      <div class="container">
+        <section id="abstract" class="content-card">
+          <h2 class="section-title">Abstract &amp; TL;DR</h2>
+          <div class="row g-4 align-items-start">
+            <div class="col-lg-7">
+              <p class="fs-5">
+                MASPRM augments multi-agent systems with a <strong>process reward model</strong>
+                that scores partial conversations at inference time. By estimating per-agent
+                progress on-the-fly, MASPRM steers search algorithms toward promising reasoning
+                branches and prunes unproductive ones, improving reliability without additional
+                human supervision.
+              </p>
+              <div class="highlight-pill">
+                <i class="fa-solid fa-bolt me-2 text-muted"></i>
+                Trained purely from multi-agent Monte Carlo Tree Search rollouts—no step-level
+                human annotations required.
+              </div>
+              <p>
+                When paired with outcome reward models, MASPRM delivers sizeable gains on open-ended
+                math reasoning benchmarks while respecting compute budgets. The same controller
+                transfers across tasks, demonstrating strong generalization and plug-and-play
+                compatibility with existing verifier-style decoders.
+              </p>
+            </div>
+            <div class="col-lg-5">
+              <div class="stat-grid">
+                <div class="stat-card">
+                  <span>GSM8K</span>
+                  <h4>+30.7</h4>
+                  <p class="mb-0">Exact Match lift over a straight-through MAS baseline.</p>
+                </div>
+                <div class="stat-card">
+                  <span>MATH</span>
+                  <h4>+22.9</h4>
+                  <p class="mb-0">EM improvement at fixed compute using MASPRM-guided decoding.</p>
+                </div>
+                <div class="stat-card">
+                  <span>Zero-Shot Transfer</span>
+                  <h4>+8.4</h4>
+                  <p class="mb-0">Additional EM on MATH when reusing a GSM8K-trained controller.</p>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section id="contributions" class="content-card">
+          <h2 class="section-title">Key Highlights</h2>
+          <div class="row g-4">
+            <div class="col-md-6">
+              <div class="callout h-100">
+                <h5 class="fw-semibold mb-3">
+                  <i class="fa-solid fa-diagram-project me-2 text-muted"></i>
+                  Process-Level Value Modeling
+                </h5>
+                <p class="mb-0">
+                  MASPRM estimates per-agent returns for partial transcripts, enabling
+                  fine-grained control during inference rather than relying solely on
+                  final-answer verifiers.
+                </p>
+              </div>
+            </div>
+            <div class="col-md-6">
+              <div class="callout h-100">
+                <h5 class="fw-semibold mb-3">
+                  <i class="fa-solid fa-tree me-2 text-muted"></i>
+                  Plug-in Controller for Search
+                </h5>
+                <p class="mb-0">
+                  The model slots into beam search and MCTS policies, allocating computation
+                  to high-value branches while pruning early failures to respect tight
+                  budgets.
+                </p>
+              </div>
+            </div>
+            <div class="col-md-6">
+              <div class="callout h-100">
+                <h5 class="fw-semibold mb-3">
+                  <i class="fa-solid fa-database me-2 text-muted"></i>
+                  Self-Supervised Training Signal
+                </h5>
+                <p class="mb-0">
+                  Process rewards are generated automatically by propagating returns from
+                  multi-agent rollouts, eliminating the need for step-level human labels.
+                </p>
+              </div>
+            </div>
+            <div class="col-md-6">
+              <div class="callout h-100">
+                <h5 class="fw-semibold mb-3">
+                  <i class="fa-solid fa-arrows-spin me-2 text-muted"></i>
+                  Generalization Across Tasks
+                </h5>
+                <p class="mb-0">
+                  Controllers trained on one benchmark transfer to new domains with minimal
+                  adaptation, complementing existing outcome reward models for reliable
+                  reasoning.
+                </p>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section id="method" class="content-card">
+          <h2 class="section-title">Method Overview</h2>
+          <div class="row g-4">
+            <div class="col-lg-6">
+              <h5 class="fw-semibold">1. Training with MCTS Rollouts</h5>
+              <p>
+                MASPRM collects trajectories from cooperative multi-agent reasoning runs augmented
+                with Monte Carlo Tree Search. Returns are propagated to every agent’s intermediate
+                actions, creating dense targets aligned with global success.
+              </p>
+              <ul class="method-steps">
+                <li>
+                  Sample multi-agent conversations while expanding the search frontier using MCTS.
+                </li>
+                <li>
+                  Attribute credit to individual agent turns by backing up rollout returns.
+                </li>
+                <li>
+                  Distill these signals into a neural value model conditioned on partial transcripts.
+                </li>
+              </ul>
+            </div>
+            <div class="col-lg-6">
+              <h5 class="fw-semibold">2. Inference-Time Control</h5>
+              <p>
+                During decoding, MASPRM evaluates every candidate branch and drives search policies
+                to focus on trajectories with the highest estimated utility. It naturally integrates
+                with verifier models that score terminal answers.
+              </p>
+              <div class="callout">
+                <h6 class="fw-semibold text-uppercase small text-muted mb-3">
+                  Controller Outputs
+                </h6>
+                <div class="d-grid gap-2">
+                  <div>
+                    <strong>Per-agent values:</strong> guides coordination and specialization.
+                  </div>
+                  <div>
+                    <strong>Early pruning:</strong> retires low-reward branches before they consume
+                    compute.
+                  </div>
+                  <div>
+                    <strong>Budget awareness:</strong> balances depth vs. breadth given compute caps.
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section id="experiments" class="content-card">
+          <h2 class="section-title">Results &amp; Ablations</h2>
+          <p>
+            MASPRM consistently raises exact-match accuracy on demanding math reasoning benchmarks
+            while keeping generation budgets fixed. It pairs seamlessly with outcome reward models
+            to vet final answers, yielding an inference stack that is both <em>deeply explorative</em>
+            and <em>compute-aware</em>.
+          </p>
+          <div class="table-responsive">
+            <table class="table align-middle">
+              <thead class="table-light">
+                <tr>
+                  <th scope="col">Benchmark</th>
+                  <th scope="col">Decoder Setup</th>
+                  <th scope="col">MASPRM Impact</th>
+                  <th scope="col">Notes</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>GSM8K</td>
+                  <td>MAS agents + Outcome Reward Model</td>
+                  <td><strong>+30.7 EM</strong> over single straight-through pass</td>
+                  <td>Improved stability during long-chain reasoning.</td>
+                </tr>
+                <tr>
+                  <td>MATH</td>
+                  <td>MAS agents + Outcome Reward Model</td>
+                  <td><strong>+22.9 EM</strong> at the same compute budget</td>
+                  <td>MCTS guided by MASPRM focuses on viable derivations early.</td>
+                </tr>
+                <tr>
+                  <td>MATH (zero-shot)</td>
+                  <td>Controller trained on GSM8K</td>
+                  <td><strong>+8.4 EM</strong> without retraining</td>
+                  <td>Demonstrates cross-task generalization of process rewards.</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="highlight-pill">
+            <i class="fa-solid fa-chart-line me-2 text-muted"></i>
+            Ablations show that removing MASPRM reverts performance to baseline levels, confirming
+            that per-agent process values—not just outcome verifiers—drive the observed gains.
+          </div>
+        </section>
+
+        <section id="resources" class="content-card">
+          <h2 class="section-title">Resources</h2>
+          <div class="resource-links">
+            <a href="https://arxiv.org/abs/2510.24803" target="_blank" rel="noopener">
+              <i class="fa-solid fa-link"></i> arXiv Abstract
+            </a>
+            <a href="https://arxiv.org/pdf/2510.24803" target="_blank" rel="noopener">
+              <i class="fa-regular fa-file-pdf"></i> PDF Download
+            </a>
+            <a href="https://github.com/milad1378yz/MASPRM" target="_blank" rel="noopener">
+              <i class="fa-brands fa-github"></i> GitHub Repository
+            </a>
+          </div>
+          <div class="row g-4 mt-3">
+            <div class="col-md-4">
+              <div class="callout h-100">
+                <h6 class="fw-semibold text-uppercase small text-muted mb-2">
+                  Reproducibility
+                </h6>
+                <p class="mb-0">
+                  The repository includes instructions for generating MASPRM training rollouts,
+                  fine-tuning controllers, and integrating them into beam search and MCTS pipelines.
+                </p>
+              </div>
+            </div>
+            <div class="col-md-4">
+              <div class="callout h-100">
+                <h6 class="fw-semibold text-uppercase small text-muted mb-2">
+                  Evaluation Protocols
+                </h6>
+                <p class="mb-0">
+                  Detailed compute budgets, rollout depths, and verifier configurations are provided
+                  to ease comparison with future multi-agent reasoning systems.
+                </p>
+              </div>
+            </div>
+            <div class="col-md-4">
+              <div class="callout h-100">
+                <h6 class="fw-semibold text-uppercase small text-muted mb-2">
+                  Extensibility
+                </h6>
+                <p class="mb-0">
+                  MASPRM is architected as a lightweight plug-in compatible with diverse team
+                  structures and scales, making it straightforward to adapt to new domains.
+                </p>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section id="team" class="content-card">
+          <h2 class="section-title">Research Team</h2>
+          <p class="mb-4">
+            MASPRM is a collaboration across multi-agent reasoning and machine learning research.
+            Please reach out through the corresponding author for questions, collaborations,
+            or industrial deployments.
+          </p>
+          <div class="row g-3">
+            <div class="col-md-6 col-lg-3">
+              <div class="callout h-100">
+                <h6 class="fw-semibold mb-1">Milad Yazdani</h6>
+                <p class="mb-0 small text-muted">Lead Author · Multi-Agent Systems</p>
+              </div>
+            </div>
+            <div class="col-md-6 col-lg-3">
+              <div class="callout h-100">
+                <h6 class="fw-semibold mb-1">Mahdi Mostajabdaveh</h6>
+                <p class="mb-0 small text-muted">Process Reward Modeling</p>
+              </div>
+            </div>
+            <div class="col-md-6 col-lg-3">
+              <div class="callout h-100">
+                <h6 class="fw-semibold mb-1">Zirui Zhou</h6>
+                <p class="mb-0 small text-muted">Reasoning Controllers</p>
+              </div>
+            </div>
+            <div class="col-md-6 col-lg-3">
+              <div class="callout h-100">
+                <h6 class="fw-semibold mb-1">Ying Xiong</h6>
+                <p class="mb-0 small text-muted">Monte Carlo Tree Search</p>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section id="bibtex" class="content-card">
+          <h2 class="section-title">BibTeX</h2>
+          <pre class="bibtex-block"><code>@article{yazdani2025masprm,
+  title={{MASPRM}: Multi-Agent System Process Reward Model},
+  author={Yazdani, Milad and Mostajabdaveh, Mahdi and Zhou, Zirui and Xiong, Ying},
+  journal={arXiv preprint arXiv:2510.24803},
+  year={2025}
+}</code></pre>
+        </section>
+      </div>
+    </main>
+
+    <footer>
+      <div class="container">
+        <div class="footer-box text-center mx-auto">
+          <h6 class="fw-semibold">Acknowledgments</h6>
+          <p class="mb-0">
+            We thank the broader multi-agent learning community for open-sourcing evaluation
+            protocols and benchmarks that enabled MASPRM. Feedback and pull requests are welcome.
+          </p>
+        </div>
+        <p class="text-center small mb-0 mt-3">
+          © 2025 MASPRM Authors · Designed for <a href="https://milad1378yz.github.io/MASPRM" class="fw-semibold text-decoration-none">milad1378yz.github.io/MASPRM</a>
+        </p>
+      </div>
+    </footer>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+      document.addEventListener("DOMContentLoaded", function () {
+        const cards = document.querySelectorAll(".content-card");
+        const observer = new IntersectionObserver(
+          (entries) => {
+            entries.forEach((entry) => {
+              if (entry.isIntersecting) {
+                entry.target.classList.add("visible");
+              }
+            });
+          },
+          { threshold: 0.2 },
+        );
+
+        cards.forEach((card) => observer.observe(card));
+      });
+    </script>
+  </body>
+</html>
