@@ -10,7 +10,7 @@ import argparse
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from dataset_handler import load_hard_dataset
 
-from utils import (
+from ray_eval import (
     WorkerInit,
     ConditionSpec,
     evaluate_conditions_ray,

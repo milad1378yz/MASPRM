@@ -28,9 +28,10 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 from transformers.utils import logging as hf_logging
 import yaml
 
+from answer_utils import is_correct
 from mas import MAS
 from agent import Agent
-from mcts import Node, MAS_MCTS, is_correct
+from mcts import Node, MAS_MCTS
 from dataset_handler import load_hard_dataset
 from show_tree import build_graph, draw_tree
 
