@@ -1,0 +1,24 @@
+agents:
+  - name: Reader
+    system_prompt: "You are the Reader. Extract key facts and restate the question."
+    max_new_tokens: 1024
+  - name: Planner
+    system_prompt: "You are the Planner. Propose a concise plan to solve the task."
+    max_new_tokens: 1024
+  - name: Solver
+    system_prompt: "You are the Solver. Carry out the plan and compute results."
+    max_new_tokens: 1024
+  - name: Verifier
+    system_prompt: "You are the Verifier. Double-check the result and produce the final answer only."
+    max_new_tokens: 1024
+
+# Edges (src, dst). Use -1 for ROOT (Question).
+# This replicates your original connections:
+#   (-1->0), (-1->1), (0->1), (1->2), (-1->3), (2->3)
+edges:
+  - [-1, 0]
+  - [-1, 1]
+  - [0, 1]
+  - [1, 2]
+  - [-1, 3]
+  - [2, 3]

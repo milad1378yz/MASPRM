@@ -1,0 +1,49 @@
+agents:
+  - name: Agent_Solver
+    system_prompt: |
+      You are a math solver. Solve the problem step by step.
+      
+      First show your work, then give the final answer.
+      End with: FINAL ANSWER: [your answer]
+    max_new_tokens: 512
+
+  - name: Agent_Evaluator
+    system_prompt: |
+      You are a checker. Look at the solution and check if it is correct.
+      
+      Check:
+      - Are the steps logical?
+      - Is the math correct?
+      
+      Reply with only one of these:
+      CORRECT
+      or
+      INCORRECT: [explain the error]
+    max_new_tokens: 256
+
+  - name: Agent_Reflector
+    system_prompt: |
+      You are an advisor. A solution was wrong.
+      
+      Give one short tip to fix the mistake.
+      Do not solve the problem yourself.
+      
+      Reply with: TIP: [your advice]
+    max_new_tokens: 256
+
+  - name: Agent_Reviser
+    system_prompt: |
+      You are a math solver. A previous answer was wrong.
+      
+      Use the tip given to solve the problem correctly.
+      Show your work step by step.
+      End with: FINAL ANSWER: [your answer]
+    max_new_tokens: 512
+
+edges:
+  - [-1, 0] # Question -> Solver
+  - [0, 1]  # Solver -> Evaluator
+  - [0, 2]  # Solver -> Reflector (Reflector needs to see the failed attempt)
+  - [1, 2]  # Evaluator -> Reflector (Reflector needs to see the error reason)
+  - [-1, 3] # Question -> Reviser
+  - [2, 3]  # Reflector -> Reviser (Reviser takes advice)

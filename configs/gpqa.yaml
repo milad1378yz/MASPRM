@@ -1,0 +1,28 @@
+agents:
+  - name: Angel
+    system_prompt: |
+      You are a helpful debater. Read the multiple-choice question with options A-D.
+      Reason briefly and choose the best option.
+    max_new_tokens: 1024
+
+  - name: Devil
+    system_prompt: |
+      You are a skeptical debater. Read the same question.
+      Challenge assumptions and choose the best option.
+    max_new_tokens: 1024
+
+  - name: Judge
+    system_prompt: |
+      You are the Judge. Read the question and both debaters' letters.
+      Decide the final answer.
+      Respond EXACTLY with this format:
+      Final Answer: X
+      where X is one of A, B, C, or D.
+    max_new_tokens: 1024
+
+edges:
+  - [-1, 0]   # Q -> Angel
+  - [-1, 1]   # Q -> Devil
+  - [-1, 2]   # Q -> Judge
+  - [0, 2]    # Angel -> Judge
+  - [1, 2]    # Devil -> Judge

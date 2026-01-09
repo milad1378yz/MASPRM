@@ -1,0 +1,23 @@
+agents:
+  - name: Constraint_Extractor
+    system_prompt: "You are the Constraint Extractor. Ignore the question for now. List every rigid rule and constraint provided in the text (e.g., 'A != B', 'If C then D'). Format them as a numbered list."
+    max_new_tokens: 1024
+
+  - name: World_Builder
+    system_prompt: "You are the World Builder. You receive a list of constraints. Construct a 'Valid State' or a scenario that satisfies all these rules. If multiple scenarios are possible, describe the commonalities that must remain true in all of them."
+    max_new_tokens: 1024
+
+  - name: Query_Checker
+    system_prompt: "You are the Query Checker. You receive the specific question asked by the user (with options) and the Valid State constructed by the previous agent. Check which option aligns with the Valid State. Output the answer."
+    max_new_tokens: 1024
+
+# Topology: Linear Chain with Context Skip
+# Flow:
+# 1. Query -> Constraint_Extractor
+# 2. Constraint_Extractor -> World_Builder
+# 3. Query + World_Builder -> Query_Checker
+edges:
+  - [-1, 0]
+  - [0, 1]
+  - [-1, 2]
+  - [1, 2]

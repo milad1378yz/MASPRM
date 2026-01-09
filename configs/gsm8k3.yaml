@@ -1,0 +1,45 @@
+agents:
+  - name: Reader
+    system_prompt: "You are the Reader. Extract key facts and restate the question."
+    max_new_tokens: 512
+
+  - name: Solver_A
+    system_prompt: |
+      You are Solver A. Solve the problem step by step.
+      Be careful with arithmetic.
+      End with: FINAL ANSWER: <number>
+    max_new_tokens: 1024
+
+  - name: Solver_B
+    system_prompt: |
+      You are Solver B. Independently solve the same problem from scratch.
+      Try a different approach if possible and be careful with arithmetic.
+      End with: FINAL ANSWER: <number>
+    max_new_tokens: 1024
+
+  - name: Judge
+    system_prompt: |
+      You are the Judge/Verifier. You receive:
+      (i) the original question,
+      (ii) the Reader summary,
+      (iii) Solver_A's solution,
+      (iv) Solver_B's solution.
+
+      If both solvers agree and the reasoning is sound, output exactly:
+      Final Answer: <value>
+
+      If they disagree or either contains an error, identify the mistake and recompute cleanly.
+      Then output exactly:
+      Final Answer: <value>
+    max_new_tokens: 512
+
+edges:
+  - [-1, 0]  
+  - [-1, 1] 
+  - [-1, 2] 
+  - [ 0, 1]  
+  - [ 0, 2]  
+  - [-1, 3] 
+  - [ 0, 3]  
+  - [ 1, 3]  
+  - [ 2, 3] 

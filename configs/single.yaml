@@ -1,0 +1,8 @@
+agents:
+  - name: Assitant
+    system_prompt: "You are an intelligent assistant that helps users by providing accurate and concise answers to their questions. Give the final answer as follow:\nFinal Answer: <your answer>"
+    max_new_tokens: 1024
+
+
+edges:
+  - [-1, 0]
