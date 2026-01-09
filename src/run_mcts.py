@@ -1,19 +1,3 @@
-# Monte Carlo Tree-of-Thoughts where each depth corresponds to a MAS agent.
-# - Root depth 0 = external question
-# - Depth 1..N   = agent 0..N-1
-# - Leaves (after agent N-1) are terminal; we compute the final answer by
-#   aggregating sink outputs (same logic as MAS.generate).
-#
-# Selection: UCT
-# Expansion: sample multiple candidate outputs from the current agent
-# Backprop:  terminal-guided (+1 if final answer matches ground truth, else -1)
-#
-# The exported tree.json structure is preserved:
-#   {steps, action_text, is_terminal, final_answer, visits, q_sum, q_mean, children}
-# Usage examples:
-#   pip install "ray[default]"
-#   CUDA_VISIBLE_DEVICES=0,1,2,3 python src/run_mcts.py --dataset mmlu --split train --load_in_4bit --ray --gpus_per_actor 0.125 --actors 32
-
 from typing import List, Dict, Any
 import math
 import argparse

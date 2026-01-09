@@ -1,3 +1,4 @@
 *temp*
 *.sh
 __pycache__
+.vscode

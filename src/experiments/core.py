@@ -18,8 +18,6 @@ from mcts import propose_agent_candidates, _replay_trajectory, _aggregate_final
 from agent import Agent
 
 
-
-
 def _seed_everything(seed: int) -> None:
     try:
         os.environ["PYTHONHASHSEED"] = str(int(seed))

@@ -28,11 +28,6 @@ from core import (
 )
 
 
-# =========================================================
-#                  Ray worker + evaluator
-# =========================================================
-
-
 @dataclass
 class WorkerInit:
     # MAS graph

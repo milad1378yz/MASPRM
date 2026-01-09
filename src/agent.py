@@ -6,7 +6,6 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from openai import OpenAI
 
 
-
 class Agent:
     def __init__(
         self,
@@ -55,9 +54,7 @@ class Agent:
     # ========= LOCAL (transformers) BACKEND ========= #
 
     def _to_inputs(self, msgs):
-        enc = self.tok.apply_chat_template(
-            msgs, tokenize=True, add_generation_prompt=True
-        )
+        enc = self.tok.apply_chat_template(msgs, tokenize=True, add_generation_prompt=True)
 
         if isinstance(enc, list):  # list[int]
             return self.tok.pad({"input_ids": [enc]}, return_tensors="pt")
@@ -69,18 +66,13 @@ class Agent:
             return {"input_ids": enc, "attention_mask": attn}
 
         # Fallback: build string and tokenize normally (slower but safe)
-        s = self.tok.apply_chat_template(
-            msgs, tokenize=False, add_generation_prompt=True
-        )
+        s = self.tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
         return self.tok(s, return_tensors="pt", add_special_tokens=False)
 
     @torch.inference_mode()
     def _generate_local(self, msgs, **gen_kwargs) -> str:
         inputs = self._to_inputs(msgs)
-        inputs = {
-            k: v.to(self.model.device, non_blocking=True)
-            for k, v in inputs.items()
-        }
+        inputs = {k: v.to(self.model.device, non_blocking=True) for k, v in inputs.items()}
 
         out = self.model.generate(
             **inputs,
@@ -98,10 +90,7 @@ class Agent:
     @torch.inference_mode()
     def _generate_n_local(self, msgs, n: int, **gen_kwargs):
         inputs = self._to_inputs(msgs)
-        inputs = {
-            k: v.to(self.model.device, non_blocking=True)
-            for k, v in inputs.items()
-        }
+        inputs = {k: v.to(self.model.device, non_blocking=True) for k, v in inputs.items()}
 
         out = self.model.generate(
             **inputs,
@@ -169,7 +158,7 @@ class Agent:
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.runpod_api_key}",
         }
-        
+
         # Reuse helper to format messages correctly
         messages = self._openai_messages(msgs)
 
@@ -182,7 +171,7 @@ class Agent:
                     "max_tokens": gen_kwargs.get("max_new_tokens", self.max_new_tokens),
                     "temperature": gen_kwargs.get("temperature", self.temperature),
                     "top_p": gen_kwargs.get("top_p", self.top_p),
-                }
+                },
             }
         }
 
@@ -190,12 +179,12 @@ class Agent:
             response = requests.post(url, headers=headers, json=data)
             response.raise_for_status()
             result = response.json()
-            
+
             # RunPod 'runsync' usually wraps the result in 'output'
             # Since we hit /v1/chat/completions, 'output' should mimic OpenAI response
             output = result.get("output", {})
             return output[0]["choices"][0]["message"]["content"].strip()
-            
+
         except requests.exceptions.RequestException as e:
             return f"RunPod Error: {e}"
         except (KeyError, IndexError) as e:
@@ -215,7 +204,7 @@ class Agent:
         """
         if self.use_openai:
             return self._generate_openai(msgs, **gen_kwargs)
-        elif self.use_runpod: 
+        elif self.use_runpod:
             return self._generate_runpod(msgs, **gen_kwargs)
         else:
             return self._generate_local(msgs, **gen_kwargs)
@@ -223,7 +212,7 @@ class Agent:
     def generate_n(self, msgs, n: int, **gen_kwargs):
         if self.use_openai:
             return self._generate_n_openai(msgs, n, **gen_kwargs)
-        elif self.use_runpod: 
+        elif self.use_runpod:
             return self._generate_n_runpod(msgs, n, **gen_kwargs)
         else:
             return self._generate_n_local(msgs, n, **gen_kwargs)
