@@ -1,4 +1,4 @@
-from typing import List, Tuple, Dict, Set
+from typing import List, Tuple, Dict, Set, Optional, Any
 from agent import Agent
 
 
@@ -125,3 +125,41 @@ class MAS:
             ]
             return "\n\n".join(ordered), agent_io
         return last, agent_io
+
+
+def build_mas_from_specs(
+    model,
+    tok,
+    agent_specs: List[Dict[str, Any]],
+    edges: List[List[int]],
+    *,
+    use_openai: bool = False,
+    openai_client=None,
+    openai_model: str = "gpt-4.1-mini",
+    openai_api_key: Optional[str] = None,
+    openai_base_url: Optional[str] = None,
+    use_runpod: bool = False,
+) -> MAS:
+    """
+    Build a MAS from config-provided agent specs and edges.
+    Each agent spec supports:
+      - system_prompt (str)
+      - max_new_tokens (int, default 512)
+    """
+    agents = []
+    for spec in agent_specs:
+        agents.append(
+            Agent(
+                model,
+                tok,
+                system_prompt=spec.get("system_prompt", ""),
+                max_new_tokens=int(spec.get("max_new_tokens", 512)),
+                use_openai=use_openai,
+                openai_client=openai_client,
+                openai_model=openai_model,
+                openai_api_key=openai_api_key,
+                openai_base_url=openai_base_url,
+                use_runpod=use_runpod,
+            )
+        )
+    return MAS(edges, agents)

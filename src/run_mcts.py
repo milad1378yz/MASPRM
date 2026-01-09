@@ -29,8 +29,7 @@ from transformers.utils import logging as hf_logging
 import yaml
 
 from answer_utils import is_correct
-from mas import MAS
-from agent import Agent
+from mas import build_mas_from_specs
 from mcts import Node, MAS_MCTS
 from dataset_handler import load_hard_dataset
 from show_tree import build_graph, draw_tree
@@ -45,40 +44,6 @@ os.environ.setdefault(
     "PYTORCH_CUDA_ALLOC_CONF",
     "max_split_size_mb:128",
 )
-
-
-def build_mas(
-    model,
-    tok,
-    agent_specs: List[Dict[str, Any]],
-    edges: List[List[int]],
-    use_openai: bool = False,
-    openai_client=None,
-    openai_model: str = "gpt-4",
-) -> MAS:
-    """
-    Build MAS from config-provided agent specs and edges.
-    Each agent spec supports:
-      - system_prompt (str)
-      - max_new_tokens (int, default 512)
-    """
-    agents = []
-    for spec in agent_specs:
-        system_prompt = spec.get("system_prompt", "")
-        max_new_tokens = int(spec.get("max_new_tokens", 512))
-
-        agents.append(
-            Agent(
-                model,
-                tok,
-                system_prompt=system_prompt,
-                max_new_tokens=max_new_tokens,
-                use_openai=use_openai,
-                openai_client=openai_client,
-                openai_model=openai_model,
-            )
-        )
-    return MAS(edges, agents)
 
 
 def load_policy(
@@ -246,8 +211,8 @@ class RayWorker:
                 compile_model=compile_model,
             )
 
-        # Update build_mas call to pass new params
-        self.mas = build_mas(
+        # Build MAS once with shared config
+        self.mas = build_mas_from_specs(
             self.mdl,
             self.tok,
             agent_specs,
@@ -469,7 +434,7 @@ def main():
         )
         mdl = None
         print("Building MAS...")
-        mas = build_mas(
+        mas = build_mas_from_specs(
             mdl,
             tok,
             agent_specs,
@@ -487,7 +452,7 @@ def main():
             compile_model=not args.no_compile,
         )
         print("Building MAS...")
-        mas = build_mas(mdl, tok, agent_specs, edges)
+        mas = build_mas_from_specs(mdl, tok, agent_specs, edges)
 
     print("Running MAS-MCTS...")
 

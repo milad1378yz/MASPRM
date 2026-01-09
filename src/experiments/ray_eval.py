@@ -13,8 +13,7 @@ from ray.util.queue import Queue
 from openai import OpenAI
 
 from answer_utils import is_correct
-from agent import Agent
-from mas import MAS
+from mas import MAS, build_mas_from_specs
 from core import (
     _seed_everything,
     TokenStats,
@@ -200,21 +199,15 @@ def evaluate_conditions_ray(
 
         # --- build MAS graph for each decode
         def _build_mas(self) -> MAS:
-            agents = []
-            for spec in self.agent_specs:
-                agents.append(
-                    Agent(
-                        self.policy_model,
-                        self.policy_tok,
-                        system_prompt=spec.get("system_prompt", ""),
-                        max_new_tokens=int(spec.get("max_new_tokens", 512)),
-                        # OpenAI args
-                        use_openai=self.use_openai,
-                        openai_client=self.openai_client,
-                        openai_model=self.openai_model_name,
-                    )
-                )
-            return MAS(self.edges, agents)
+            return build_mas_from_specs(
+                self.policy_model,
+                self.policy_tok,
+                self.agent_specs,
+                self.edges,
+                use_openai=self.use_openai,
+                openai_client=self.openai_client,
+                openai_model=self.openai_model_name,
+            )
 
         # --- decoders by spec.kind
         def _decode_by_spec(

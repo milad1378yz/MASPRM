@@ -12,15 +12,12 @@ from transformers import AutoModelForTokenClassification, AutoTokenizer, AutoMod
 from transformers import BitsAndBytesConfig
 from peft import PeftModel, PeftConfig
 
-# Project imports
 from answer_utils import numbers_equal
-from mcts import MAS, propose_agent_candidates, _replay_trajectory, _aggregate_final
+from mas import MAS
+from mcts import propose_agent_candidates, _replay_trajectory, _aggregate_final
 from agent import Agent
 
 
-# =========================================================
-#                      Token accounting
-# =========================================================
 
 
 def _seed_everything(seed: int) -> None:
@@ -599,21 +596,6 @@ def render_state_text(
         else:
             break
     return step_separator.join(parts)
-
-
-def build_mas_from_specs(model, tok, agent_specs: List[Dict[str, Any]], edges: List[List[int]]):
-    """Shared MAS builder from config specs."""
-    agents = []
-    for spec in agent_specs:
-        agents.append(
-            Agent(
-                model,
-                tok,
-                system_prompt=spec.get("system_prompt", ""),
-                max_new_tokens=int(spec.get("max_new_tokens", 512)),
-            )
-        )
-    return MAS(edges, agents)
 
 
 # =========================================================
