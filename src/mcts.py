@@ -3,16 +3,7 @@ import random
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set
 
-from answer_utils import (
-    normalize_answer,
-    extract_final_letter,
-    answers_equal,
-    _to_number,
-    extract_pred_number,
-    eq,
-    numbers_equal,
-    is_correct,
-)
+from answer_utils import is_correct
 from mas import MAS
 from tqdm import tqdm
 
@@ -117,8 +108,6 @@ def _aggregate_final(mas: MAS, primary_out: Dict[int, str], last: str) -> str:
         return "\n\n".join(ordered)
     return last
 
-
-# Answer parsing/comparison utilities live in answer_utils.py (re-exported here for compatibility).
 
 @dataclass
 class Node:
@@ -304,36 +293,12 @@ class MAS_MCTS:
                 terminals = [ch for ch in node.children if ch.is_terminal]
                 if terminals:
                     # Choose one terminal child to continue this rollout's path
-                    ###################################################################################
                     chosen = random.choice(terminals)
                     # Backpropagate on the other terminal siblings right now
                     for sib in terminals:
                         if sib is not chosen:
                             # immediate backprop
                             self._backprop(path + [sib])
-
-                    
-                    ###################################################################################
-
-
-                                        # # True:
-                    # for ch in terminals:
-                    #     # Ensure final_answer is computed
-                    #     if ch.final_answer is None:
-                    #         inbox2, primary_out2, last2 = _replay_trajectory(
-                    #             self.mas, self.question, ch.trajectory
-                    #         )
-                    #         ch.final_answer = _aggregate_final(self.mas, primary_out2, last2)
-                    #         ch.is_terminal = True
-
-                    #     # "Soon backprop" **locally**: initialize the leaf’s own stats
-                    #     reward = 1.0 if is_correct(ch.final_answer, self.truth) else -1.0
-                    #     ch.visits = 1
-                    #     ch.q_sum = reward
-
-                    # # For this rollout, pick exactly ONE terminal child and continue path
-                    # chosen = random.choice(terminals)
-                    ###################################################################################
                     node = chosen
                     path.append(node)
                     continue

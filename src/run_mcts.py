@@ -490,7 +490,6 @@ def main():
 
         os.makedirs(result_path, exist_ok=True)
         json_data = node_to_dict(root)
-        pathlib.Path(f"{result_path}/{i}.json)").write_text(json.dumps(json_data, indent=2))
         pathlib.Path(f"{result_path}/{i}.json").write_text(json.dumps(json_data, indent=2))
         G = build_graph(json_data, max_depth=6, max_children=4)
         draw_tree(G, f"{result_path}/{i}.png", dpi=400, font_size=9)

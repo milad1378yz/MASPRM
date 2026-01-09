@@ -374,18 +374,6 @@ def _majority_by_numbers_equal(preds: List[str]) -> str:
     return min(members[best_i], key=len)
 
 
-def make_majority_voter(
-    base_decoder: Callable[[Any, str], str], build_mas: Callable[[], Any], k: int = 5
-) -> Callable[[Any, str], str]:
-    def decoder(mas: Any, q: str) -> str:
-        preds: List[str] = [base_decoder(mas, q)]
-        for _ in range(max(0, k - 1)):
-            preds.append(base_decoder(build_mas(), q))
-        return _majority_by_numbers_equal(preds)
-
-    return decoder
-
-
 def _safe_exp(v: float) -> float:
     if v < -700:
         return 0.0
