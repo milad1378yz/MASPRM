@@ -19,9 +19,9 @@
 <p align="center"><em>MASPRM training pipeline (main paper figure).</em></p>
 
 ## Highlights
-- MASPRM adds a process reward model to guide multi-agent reasoning.
-- Plugs into MCTS and search-time decoding for better trajectory selection.
-- Improves exact-match on challenging math reasoning benchmarks.
+- MASPRM adds a process reward model to guide multi-agent sytem.
+- Plugs into MCTS and inference time search for better trajectory selection.
+- Improves exact-match on challenging reasoning benchmarks.
 
 ## Quickstart
 ```bash
