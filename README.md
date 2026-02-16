@@ -3,15 +3,15 @@
   <p>Multi-Agent System Process Reward Model</p>
   <p>A lightweight process reward model that guides multi-agent reasoning at search time.</p>
   <p>
-    <a href="https://arxiv.org/abs/2510.24803">Paper</a> ·
-    <a href="https://arxiv.org/pdf/2510.24803">PDF</a> ·
-    <a href="https://milad1378yz.github.io/MASPRM">Project Page</a>
+    <a href="">Paper</a> ·
+    <a href="">PDF</a> ·
+    <a href="">Project Page</a>
   </p>
 </div>
 
 <p align="center">
   <img
-    src="https://arxiv.org/html/2510.24803v1/figs/PRM_MAS-MCTS2data.drawio.png"
+    src=""
     alt="MASPRM training pipeline"
     width="900"
   />
