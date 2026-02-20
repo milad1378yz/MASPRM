@@ -34,13 +34,3 @@ python src/run_mcts.py --dataset mmlu --split train --load_in_4bit --ray --gpus_
 docker build -t masprm .
 docker run --rm -it -v "$PWD:/app" masprm python src/run_mcts.py --help
 ```
-
-## BibTeX
-```bibtex
-@article{yazdani2025masprm,
-  title={{MASPRM}: Multi-Agent System Process Reward Model},
-  author={Yazdani, Milad and Mostajabdaveh, Mahdi and Zhou, Zirui and Xiong, Ying},
-  journal={arXiv preprint arXiv:2510.24803},
-  year={2025}
-}
-```
