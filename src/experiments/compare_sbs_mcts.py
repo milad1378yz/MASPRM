@@ -30,7 +30,7 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--prm_dir",
-        default="/data/milad/workspace/agentreward/checkpoints/Qwen2.5-1.5B-1.5B-PPM-qlora-512-mmlu",
+        default="checkpoints/Qwen2.5-1.5B-1.5B-PPM-qlora-512-mmlu",
     )
     parser.add_argument("--prm_base_model_id", default="Qwen/Qwen2.5-1.5B-Instruct")
     parser.add_argument("--gen_model_id", default="Qwen/Qwen2.5-1.5B-Instruct")
@@ -40,7 +40,7 @@ def main():
     parser.add_argument("--openai_api_key", type=str, default=None)
     parser.add_argument(
         "--orm_dir",
-        default="/data/milad/workspace/agentreward/checkpoints/Qwen2.5-1.5B-1.5B-ORM-qlora-512-mmlu",
+        default="checkpoints/Qwen2.5-1.5B-1.5B-ORM-qlora-512-mmlu",
     )
     args = parser.parse_args()
 
