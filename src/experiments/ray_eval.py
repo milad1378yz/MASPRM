@@ -141,6 +141,7 @@ def evaluate_conditions_ray(
                     init.prm_dir,
                     base_model_id=init.prm_base_model_id,
                     torch_dtype=self.dtype,
+                    step_separator=self.step_sep,
                 )
 
                 # modify the PRM tokenizer/model with the separator
@@ -185,12 +186,18 @@ def evaluate_conditions_ray(
             # 4) ORM scorer (optional) — same API as PRM loader
             self.orm_score_fn = None
             self.orm_tok = None
+            self.orm_model = None
             if init.orm_dir:
-                self.orm_score_fn, self.orm_tok, _ = load_prm_scorer(
+                self.orm_score_fn, self.orm_tok, self.orm_model = load_prm_scorer(
                     init.orm_dir,
                     base_model_id=None,  # read from adapter config
                     torch_dtype=self.dtype,
+                    step_separator=self.step_sep,
                 )
+                added = ensure_separator_token(self.orm_tok, self.step_sep)
+                print(f"[Worker {self.rank}] Added {added} special tokens for ORM separator.")
+                if added > 0 and self.orm_model is not None:
+                    align_model_to_tokenizer(self.orm_model, self.orm_tok)
 
         # --- build MAS graph for each decode
         def _build_mas(self) -> MAS:
