@@ -305,21 +305,30 @@ class ORMRegressionTrainer(PRMRegressionTrainer):
         train_on_last_step_only=False,  # ignored; always True for ORM
         is_eval=False,
     ):
-        # Ask the base PRM to build a mask only for the *last* step.
+        # TRL's PRMTrainer.tokenize_row right-truncates with input_ids[:max_length],
+        # which drops the LAST step separator — the only labeled token for ORM —
+        # whenever the sequence exceeds max_length. `tokenizer.truncation_side`
+        # is not consulted there. To keep the final separator, we disable TRL's
+        # length caps and perform left-truncation ourselves below.
         row = PRMTrainer.tokenize_row(
             features,
             tokenizer,
             step_separator,
-            max_length,
-            max_prompt_length,
-            max_completion_length,
+            None,  # max_length: let TRL emit the full sequence
+            max_prompt_length,  # prompt is already left-kept in TRL
+            None,  # max_completion_length: avoid right-truncation
             True,  # force: only last step is labeled
             is_eval,
         )
 
+        # Left-truncate the full sequence so the last step separator survives.
+        if max_length is not None and len(row["input_ids"]) > max_length:
+            row["input_ids"] = row["input_ids"][-max_length:]
+            row["labels"] = row["labels"][-max_length:]
+
         # Overwrite row["labels"] with a single float target at the last-step position.
         int_mask = torch.tensor(row["labels"], dtype=torch.long)
-        mask = int_mask != -100  # either one position or 0 if truncated
+        mask = int_mask != -100  # exactly one position after the fix above
 
         if mask.any():
             if "labels" not in features or len(features["labels"]) == 0:

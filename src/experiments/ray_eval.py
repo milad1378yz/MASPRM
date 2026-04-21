@@ -234,6 +234,10 @@ def evaluate_conditions_ray(
 
             pass_k = max(1, int(p.get("pass_k", 5)))
 
+            # Scope of state text fed to PRM/ORM: "full" = routed transcript,
+            # "local" = only what the scored agent itself received + produced.
+            view_mode = str(p.get("view_mode", "full")).lower()
+
             # Helper: single-run decode with trace (policy-only)
             def base_policy_with_trace(mas: MAS, q: str):
                 pred, usage, tr = sbs_decode2(
@@ -280,6 +284,7 @@ def evaluate_conditions_ray(
                     gen_kwargs=sbs_kwargs,
                     step_separator=self.step_sep,
                     final_answers_out=finals,
+                    view_mode=view_mode,
                 )
                 candidates = finals[:pass_k] if finals else [pred]
                 return pred, candidates, usage.generated, usage.prm_calls, usage.agent_runs
@@ -333,6 +338,7 @@ def evaluate_conditions_ray(
                     leaf_score_type=p.get("leaf_score_type", None),
                     logprob_agg=p.get("logprob_agg", "sum"),
                     leaf_score_fn=leaf_fn,
+                    view_mode=view_mode,
                 )
                 pred, usage = infer.decode(n_simulations=n_sims)
                 try:
@@ -392,6 +398,7 @@ def evaluate_conditions_ray(
                     k=k,
                     logprob_agg=p.get("logprob_agg", "sum"),
                     return_all_answers=True,
+                    view_mode=view_mode,
                 )
                 res = voter(mas0, q)
                 if isinstance(res, tuple) and len(res) == 3:
