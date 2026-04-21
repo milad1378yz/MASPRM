@@ -190,11 +190,11 @@ def score_path_prm_product(
     return product, usage
 
 
-def score_orm_end(orm_fn, answer_text: str, tokenizer=None) -> tuple[float, TokenStats]:
+def score_orm_end(orm_fn, text: str, tokenizer=None) -> tuple[float, TokenStats]:
     usage = TokenStats()
-    v = float(orm_fn(answer_text))  # expect ~[-1, 1]
+    v = float(orm_fn(text))  # expect ~[-1, 1]
     if tokenizer is not None:
-        usage.scorer += _text_token_len_tok(tokenizer, answer_text)
+        usage.scorer += _text_token_len_tok(tokenizer, text)
     return v, usage
 
 
@@ -430,7 +430,9 @@ def make_scored_voter(
                 raw_score, u2 = score_path_logprob(mas_i, q, steps, agg=logprob_agg)
                 w = _safe_exp(raw_score)
             elif score_mode == "orm":
-                raw_score, u2 = score_orm_end(score_fn, ans, tokenizer=orm_tokenizer)
+                traj = {j: [text] for j, text in enumerate(steps)}
+                state_text = render_state_text(mas_i, q, traj, step_separator)
+                raw_score, u2 = score_orm_end(score_fn, state_text, tokenizer=orm_tokenizer)
                 w = _sigmoid(raw_score)
             else:
                 w, u2 = 1.0, TokenStats()
@@ -469,6 +471,7 @@ def load_prm_scorer(
     base_model_id: str = None,
     max_length: int = 2048,
     torch_dtype: torch.dtype = torch.float16,
+    step_separator: str = "</step>",
 ):
     """
     Returns: (score: Callable[[str], float], tokenizer, model)
@@ -516,7 +519,14 @@ def load_prm_scorer(
         inputs = tok(text, return_tensors="pt", truncation=True, max_length=max_length)
         inputs = {k: v.to(device) for k, v in inputs.items()}
         out = model(**inputs)  # logits: (1, T, 1)
-        z = out.logits[0, -1, 0].float()
+        input_ids = inputs["input_ids"][0]
+        sep_ids = tok.encode(step_separator, add_special_tokens=False)
+        if len(sep_ids) == 1:
+            sep_pos = (input_ids == sep_ids[0]).nonzero(as_tuple=True)[0]
+            idx = int(sep_pos[-1].item()) if sep_pos.numel() > 0 else int(input_ids.shape[0] - 1)
+        else:
+            idx = int(input_ids.shape[0] - 1)
+        z = out.logits[0, idx, 0].float()
         return float(torch.tanh(z).item())
 
     return score, tok, model
@@ -574,14 +584,14 @@ def render_state_text(
     trajectory: Dict[int, List[str]],
     step_separator: str = "</step>",
 ) -> str:
-    """Question + chosen primary outputs so far, joined with separator."""
+    """Match TRL PRM tokenization: prompt + step_1 + sep + ... + step_n + sep."""
     parts = [question]
     for j in range(mas.n):
         if j in trajectory and trajectory[j]:
-            parts.append(trajectory[j][0])
+            parts.append(trajectory[j][0] + step_separator)
         else:
             break
-    return step_separator.join(parts)
+    return "".join(parts)
 
 
 # =========================================================
@@ -826,11 +836,10 @@ class MCTSInfer:
             self.usage.add(u)
 
         else:  # "orm"
-            inbox, primary_out, last = _replay_trajectory(self.mas, self.q, leaf_traj)
-            ans = _aggregate_final(self.mas, primary_out, last)
+            state_text = render_state_text(self.mas, self.q, leaf_traj, self.sep)
             v_leaf, u = score_orm_end(
-                self.leaf_score_fn, ans, tokenizer=self.orm_tokenizer
-            )  # use leaf scorer
+                self.leaf_score_fn, state_text, tokenizer=self.orm_tokenizer
+            )  # use leaf scorer on the same format seen during training
             self.usage.add(u)
             self.usage.prm_calls += 1
 
