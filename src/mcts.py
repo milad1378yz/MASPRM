@@ -54,59 +54,16 @@ def propose_agent_candidates(
     return normd
 
 
-def _seed_inbox_with_query(mas: MAS, query: str) -> Dict[int, Dict[int, str]]:
-    """inbox[node][parent] = payload received from that parent."""
-    inbox: Dict[int, Dict[int, str]] = {}
-    for j in mas.children.get(MAS.INPUT, []):
-        inbox.setdefault(j, {})[MAS.INPUT] = query
-    return inbox
-
-
-def _deliver_outputs(mas: MAS, agent_idx: int, outs: List[str], inbox: Dict[int, Dict[int, str]]):
-    """Deliver outs to children using the same broadcast/pairwise rule as MAS.generate."""
-    children = sorted(mas.children.get(agent_idx, []))
-    if not children:
-        return
-    if outs and len(outs) == len(children):
-        pairs = zip(children, outs)
-    elif outs:
-        pairs = ((c, outs[0]) for c in children)
-    else:
-        pairs = ()
-    for c, msg in pairs:
-        inbox.setdefault(c, {})[agent_idx] = msg
-
-
 def _replay_trajectory(mas: MAS, query: str, trajectory: Dict[int, List[str]]):
     """
     Recompute inbox and primary_out given a trajectory {agent: outs}.
     Also return `last` (last primary text produced, for fallback).
     """
-    inbox = _seed_inbox_with_query(mas, query)
-    primary_out: Dict[int, str] = {}
-    last = query
-    for j in range(mas.n):
-        if j not in trajectory:
-            continue
-        outs = trajectory[j]
-        if outs:
-            primary_out[j] = outs[0]
-            last = outs[0]
-        _deliver_outputs(mas, j, outs, inbox)
-    return inbox, primary_out, last
+    return mas._replay(query, set(trajectory), trajectory)
 
 
 def _aggregate_final(mas: MAS, primary_out: Dict[int, str], last: str) -> str:
-    finals = [primary_out[i] for i in mas.sinks if i in primary_out]
-    if len(finals) == 1:
-        return finals[0]
-    if len(finals) > 1:
-        ordered = [
-            f"[agent {i}] {primary_out[i]}"
-            for i in sorted(k for k in mas.sinks if k in primary_out)
-        ]
-        return "\n\n".join(ordered)
-    return last
+    return mas._aggregate_final(primary_out, last)
 
 
 @dataclass

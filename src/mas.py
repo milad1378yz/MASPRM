@@ -1,5 +1,45 @@
-from typing import List, Tuple, Dict, Set, Optional, Any
+from typing import Annotated, Dict, List, Optional, Set, Tuple, Any, TypedDict
+
 from agent import Agent
+from langgraph.graph import END, START, StateGraph
+from langgraph.types import Command
+
+
+def _merge_nested_dicts(
+    left: Optional[Dict[int, Dict[int, str]]], right: Optional[Dict[int, Dict[int, str]]]
+) -> Dict[int, Dict[int, str]]:
+    merged: Dict[int, Dict[int, str]] = {
+        int(k): dict(v) for k, v in (left or {}).items()
+    }
+    for key, value in (right or {}).items():
+        key = int(key)
+        child_updates = dict(value)
+        if key in merged:
+            next_value = dict(merged[key])
+            next_value.update(child_updates)
+            merged[key] = next_value
+        else:
+            merged[key] = child_updates
+    return merged
+
+
+def _merge_dicts(left: Optional[Dict[int, Any]], right: Optional[Dict[int, Any]]) -> Dict[int, Any]:
+    merged = dict(left or {})
+    merged.update(right or {})
+    return merged
+
+
+class _MASState(TypedDict):
+    query: str
+    inbox: Annotated[Dict[int, Dict[int, str]], _merge_nested_dicts]
+    agent_io: Annotated[Dict[int, Dict[str, Dict[int, str]]], _merge_dicts]
+    primary_out: Annotated[Dict[int, str], _merge_dicts]
+    executed: Annotated[Dict[int, bool], _merge_dicts]
+    active_agents: Optional[Set[int]]
+    forced_outputs: Dict[int, List[str]]
+    rounds: int
+    max_rounds: int
+    execution_order: List[int]
 
 
 class MAS:
@@ -15,9 +55,20 @@ class MAS:
         for s, t in self.edges:
             self.children.setdefault(s, []).append(t)
             self.parents.setdefault(t, []).append(s)
+        for node in self.children:
+            self.children[node].sort()
+        for node in self.parents:
+            self.parents[node].sort()
 
         self.edge_index = {e: i for i, e in enumerate(self.edges)}
         self.sinks = [i for i in range(self.n) if len(self.children.get(i, [])) == 0]
+        self.required_parents: Dict[int, Set[int]] = {
+            i: set(self.parents.get(i, [])) for i in range(self.n)
+        }
+        self.parent_order: Dict[int, List[int]] = {
+            i: sorted(self.required_parents[i]) for i in range(self.n)
+        }
+        self._graph = self._build_graph()
 
     # It returns a list of output strings (one per outgoing edge, or a single value to broadcast).
     def step(self, messages: List[str], idx: int, **gen_kwargs) -> List[str]:
@@ -33,98 +84,189 @@ class MAS:
             return [str(x) for x in out]
         return [str(out)]
 
-    # CHANGED: the second return value now records, for each agent, its inputs and outputs.
-    def generate(
-        self, query: str, max_steps: int = 64
-    ) -> Tuple[str, Dict[int, Dict[str, Dict[int, str]]]]:
-        # inbox[node][parent] = payload received from that parent
+    def _agent_node_name(self, idx: int) -> str:
+        return f"agent_{idx}"
+
+    def _seed_inbox_with_query(self, query: str) -> Dict[int, Dict[int, str]]:
         inbox: Dict[int, Dict[int, str]] = {}
+        for agent_idx in self.children.get(self.INPUT, []):
+            inbox.setdefault(agent_idx, {})[self.INPUT] = query
+        return inbox
 
-        # agent_io[agent] = {"inputs": {parent: msg}, "outputs": {child: msg}}
-        agent_io: Dict[int, Dict[str, Dict[int, str]]] = {}
+    def _normalize_outs(self, out: Any) -> List[str]:
+        if isinstance(out, list):
+            return [str(x) for x in out]
+        if out is None:
+            return []
+        return [str(out)]
 
-        # Parents required for each node (includes -1 if (-1, node) is in edges)
-        required_parents: Dict[int, Set[int]] = {
-            i: set(self.parents.get(i, [])) for i in range(self.n)
+    def _build_initial_state(
+        self,
+        query: str,
+        *,
+        max_rounds: int,
+        active_agents: Optional[Set[int]] = None,
+        forced_outputs: Optional[Dict[int, List[str]]] = None,
+    ) -> _MASState:
+        return {
+            "query": query,
+            "inbox": self._seed_inbox_with_query(query),
+            "agent_io": {},
+            "primary_out": {},
+            "executed": {},
+            "active_agents": None if active_agents is None else {int(i) for i in active_agents},
+            "forced_outputs": {
+                int(agent_idx): self._normalize_outs(outs)
+                for agent_idx, outs in (forced_outputs or {}).items()
+            },
+            "rounds": 0,
+            "max_rounds": max(0, int(max_rounds)),
+            "execution_order": [],
         }
 
-        # Seed inputs from the external INPUT node to its children
-        frontier: Set[int] = set(self.children.get(self.INPUT, []))
-        for j in frontier:
-            inbox.setdefault(j, {})[self.INPUT] = query
+    def _scheduler_node(self, state: _MASState):
+        if state["rounds"] >= state["max_rounds"]:
+            return Command(goto=END)
 
-        # Only run nodes after they are fully ready; those ready now will be run in the first iteration.
-        frontier = {j for j in frontier if required_parents[j].issubset(set(inbox[j].keys()))}
+        active_agents = state["active_agents"]
+        executed = state["executed"]
+        inbox = state["inbox"]
 
-        executed: Set[int] = set()  # ensure each agent is called at most once
-        primary_out: Dict[int, str] = (
-            {}
-        )  # representative single string per agent (for final aggregation)
+        ready: List[int] = []
+        for agent_idx in range(self.n):
+            if agent_idx in executed:
+                continue
+            if active_agents is not None and agent_idx not in active_agents:
+                continue
+            have = inbox.get(agent_idx, {})
+            if have and self.required_parents[agent_idx].issubset(set(have.keys())):
+                ready.append(agent_idx)
 
-        last = query
-        steps = 0
+        if not ready:
+            return Command(goto=END)
 
-        while frontier and steps < max_steps:
-            next_frontier: Set[int] = set()
+        return Command(
+            update={
+                "rounds": state["rounds"] + 1,
+                "execution_order": state["execution_order"] + ready,
+            },
+            goto=[self._agent_node_name(agent_idx) for agent_idx in ready],
+        )
 
-            for j in sorted(frontier):
-                if j in executed:
-                    continue
+    def _agent_node(self, idx: int):
+        def run(state: _MASState):
+            have = state["inbox"].get(idx, {})
+            ordered_parents = self.parent_order[idx]
+            inputs = [have[parent_idx] for parent_idx in ordered_parents if parent_idx in have]
 
-                have = inbox.get(j, {})
-                # Order parents to form a deterministic input list
-                ordered_parents = sorted(required_parents[j])
-                inputs = [have[p] for p in ordered_parents if p in have]
+            if state["active_agents"] is not None:
+                outs = self._normalize_outs(state["forced_outputs"].get(idx, []))
+            else:
+                outs = self.step(inputs, idx)
 
-                # Run the agent once with all its inputs
-                outs = self.step(inputs, j)
-                executed.add(j)
+            delivered: Dict[int, Dict[int, str]] = {}
+            outputs: Dict[int, str] = {}
+            children = self.children.get(idx, [])
+            if outs and len(outs) == len(children):
+                pairs = zip(children, outs)
+            elif outs:
+                pairs = ((child_idx, outs[0]) for child_idx in children)
+            else:
+                pairs = ()
 
-                # Record inputs/outputs by neighbor id
-                agent_io[j] = {
-                    "inputs": {p: have[p] for p in ordered_parents if p in have},
-                    "outputs": {},
-                }
+            for child_idx, msg in pairs:
+                delivered.setdefault(child_idx, {})[idx] = msg
+                outputs[child_idx] = msg
 
-                if outs:
-                    primary_out[j] = outs[0]
-                    last = outs[0]
+            update: Dict[str, Any] = {
+                "executed": {idx: True},
+                "agent_io": {
+                    idx: {
+                        "inputs": {p: have[p] for p in ordered_parents if p in have},
+                        "outputs": outputs,
+                    }
+                },
+            }
+            if outs:
+                update["primary_out"] = {idx: outs[0]}
+            if delivered:
+                update["inbox"] = delivered
+            return update
 
-                # Deliver outputs to children (pairwise if lengths match, else broadcast first)
-                children = sorted(self.children.get(j, []))
-                if children:
-                    if outs and len(outs) == len(children):
-                        pairs = zip(children, outs)
-                    elif outs:
-                        pairs = ((c, outs[0]) for c in children)
-                    else:
-                        pairs = ()
+        return run
 
-                    for c, msg in pairs:
-                        inbox.setdefault(c, {})[j] = msg
-                        agent_io[j]["outputs"][c] = msg
+    def _build_graph(self):
+        graph = StateGraph(_MASState)
+        graph.add_node("scheduler", self._scheduler_node)
+        for agent_idx in range(self.n):
+            graph.add_node(self._agent_node_name(agent_idx), self._agent_node(agent_idx))
+            graph.add_edge(self._agent_node_name(agent_idx), "scheduler")
+        graph.add_edge(START, "scheduler")
+        return graph.compile()
 
-                    # Any child that just became fully ready is queued for the *next* iteration
-                    for c in children:
-                        if c not in executed:
-                            req = required_parents[c]
-                            if req.issubset(set(inbox.get(c, {}).keys())):
-                                next_frontier.add(c)
+    def _run_graph(
+        self,
+        query: str,
+        *,
+        max_rounds: int,
+        active_agents: Optional[Set[int]] = None,
+        forced_outputs: Optional[Dict[int, List[str]]] = None,
+    ) -> _MASState:
+        state = self._build_initial_state(
+            query,
+            max_rounds=max_rounds,
+            active_agents=active_agents,
+            forced_outputs=forced_outputs,
+        )
+        recursion_limit = max(4, 2 * max(0, int(max_rounds)) + self.n + 4)
+        return self._graph.invoke(state, config={"recursion_limit": recursion_limit})
 
-            frontier = next_frontier
-            steps += 1
+    def _last_primary_out(self, state: _MASState) -> str:
+        last = state["query"]
+        primary_out = state["primary_out"]
+        for agent_idx in state["execution_order"]:
+            if agent_idx in primary_out:
+                last = primary_out[agent_idx]
+        return last
 
-        # Aggregate finals from sink nodes if available; otherwise fall back to the last produced text
+    def _aggregate_final(self, primary_out: Dict[int, str], last: str) -> str:
         finals = [primary_out[i] for i in self.sinks if i in primary_out]
         if len(finals) == 1:
-            return finals[0], agent_io
+            return finals[0]
         if len(finals) > 1:
             ordered = [
                 f"[agent {i}] {primary_out[i]}"
                 for i in sorted(k for k in self.sinks if k in primary_out)
             ]
-            return "\n\n".join(ordered), agent_io
-        return last, agent_io
+            return "\n\n".join(ordered)
+        return last
+
+    def _replay(
+        self,
+        query: str,
+        active_agents: Set[int],
+        forced_outputs: Dict[int, List[str]],
+        *,
+        include_agent_io: bool = False,
+    ):
+        state = self._run_graph(
+            query,
+            max_rounds=self.n,
+            active_agents=active_agents,
+            forced_outputs=forced_outputs,
+        )
+        last = self._last_primary_out(state)
+        if include_agent_io:
+            return state["inbox"], state["primary_out"], last, state["agent_io"]
+        return state["inbox"], state["primary_out"], last
+
+    # CHANGED: the second return value now records, for each agent, its inputs and outputs.
+    def generate(
+        self, query: str, max_steps: int = 64
+    ) -> Tuple[str, Dict[int, Dict[str, Dict[int, str]]]]:
+        state = self._run_graph(query, max_rounds=max_steps)
+        last = self._last_primary_out(state)
+        return self._aggregate_final(state["primary_out"], last), state["agent_io"]
 
 
 def build_mas_from_specs(
