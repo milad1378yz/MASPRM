@@ -173,14 +173,23 @@ def score_path_logprob(
 
 
 def score_path_prm_product(
-    score_fn, mas, question: str, steps: list[str], tokenizer=None, step_separator: str = "</step>"
+    score_fn,
+    mas,
+    question: str,
+    steps: list[str],
+    tokenizer=None,
+    step_separator: str = "</step>",
+    *,
+    view_mode: str = "full",
 ) -> tuple[float, TokenStats]:
     usage = TokenStats()
     traj = {}
     product = 1.0
     for j, text in enumerate(steps):
         traj[j] = [text]
-        s_text = render_state_text(mas, question, traj, step_separator)
+        s_text = render_state_text(
+            mas, question, traj, step_separator, view=view_mode, agent_idx=j
+        )
         v = float(score_fn(s_text))  # [-1, 1]
         usage.prm_calls += 1
         w = (v + 1.0) / 2.0
@@ -218,6 +227,7 @@ def sbs_decode2(
     *,
     logprob_agg: str = "sum",  # "sum" | "avg_token" | "avg_step"
     final_answers_out: Optional[List[str]] = None,  # collect beam finals for pass@k
+    view_mode: str = "full",  # "full" | "local" — PRM state scope
 ):
 
     usage = TokenStats()
@@ -278,7 +288,14 @@ def sbs_decode2(
             for outs in scored_cands:
                 if score_type == "prm":
                     traj2 = {**traj, agent_idx: outs}
-                    s_text = render_state_text(mas, question, traj2, step_separator)
+                    s_text = render_state_text(
+                        mas,
+                        question,
+                        traj2,
+                        step_separator,
+                        view=view_mode,
+                        agent_idx=agent_idx,
+                    )
                     v = 0.0 if score_fn is None else float(score_fn(s_text))
                     if score_fn is not None:
                         usage.prm_calls += 1
@@ -396,6 +413,7 @@ def make_scored_voter(
     k: int = 5,
     logprob_agg: str = "sum",  # "sum" | "avg_token" | "avg_step"
     return_all_answers: bool = False,  # expose the k raw answers for pass@k
+    view_mode: str = "full",  # "full" | "local" — scope of state text fed to PRM/ORM
 ) -> Callable[[Any, str], Any]:
     """
     Runs k decodes with trace, groups predictions by numeric equivalence, and picks the
@@ -425,13 +443,24 @@ def make_scored_voter(
                     steps,
                     tokenizer=prm_tokenizer,
                     step_separator=step_separator,
+                    view_mode=view_mode,
                 )
             elif score_mode == "logprob":
                 raw_score, u2 = score_path_logprob(mas_i, q, steps, agg=logprob_agg)
                 w = _safe_exp(raw_score)
             elif score_mode == "orm":
                 traj = {j: [text] for j, text in enumerate(steps)}
-                state_text = render_state_text(mas_i, q, traj, step_separator)
+                # ORM scores the final state; for local view, scope to the last
+                # decided agent (typically the sink producing the final answer).
+                last_idx = (max(traj.keys()) if traj else (mas_i.n - 1)) if steps else None
+                state_text = render_state_text(
+                    mas_i,
+                    q,
+                    traj,
+                    step_separator,
+                    view=view_mode,
+                    agent_idx=last_idx,
+                )
                 raw_score, u2 = score_orm_end(score_fn, state_text, tokenizer=orm_tokenizer)
                 w = _sigmoid(raw_score)
             else:
@@ -583,15 +612,56 @@ def render_state_text(
     question: str,
     trajectory: Dict[int, List[str]],
     step_separator: str = "</step>",
+    *,
+    view: str = "full",
+    agent_idx: Optional[int] = None,
 ) -> str:
-    """Match TRL PRM tokenization: prompt + step_1 + sep + ... + step_n + sep."""
-    parts = [question]
-    for j in range(mas.n):
-        if j in trajectory and trajectory[j]:
-            parts.append(trajectory[j][0] + step_separator)
-        else:
-            break
-    return "".join(parts)
+    """Build the text the scorer sees.
+
+    view="full" (default, routed transcript — matches PRM training format):
+        question + step_1 + sep + ... + step_n + sep
+
+    view="local" (agent-local scope):
+        Only the inputs routed to `agent_idx` (its inbox from parents, which
+        includes the question iff it is an entry agent) followed by that
+        agent's own output. Nothing from siblings or other branches of the
+        DAG leaks in. If `agent_idx` is None, the deepest decided agent is
+        used.
+    """
+    if view == "full":
+        parts = [question]
+        for j in range(mas.n):
+            if j in trajectory and trajectory[j]:
+                parts.append(trajectory[j][0] + step_separator)
+            else:
+                break
+        return "".join(parts)
+
+    if view == "local":
+        if agent_idx is None:
+            decided = [j for j in range(mas.n) if j in trajectory and trajectory[j]]
+            if not decided:
+                return question + step_separator
+            agent_idx = decided[-1]
+
+        # Replay ONLY the decisions upstream of agent_idx so its inbox reflects
+        # what this agent actually received in the routed DAG.
+        prior = {j: trajectory[j] for j in trajectory if j < agent_idx and trajectory[j]}
+        inbox, _, _ = _replay_trajectory(mas, question, prior)
+
+        ordered_parents = sorted(set(mas.parents.get(agent_idx, [])))
+        have = inbox.get(agent_idx, {})
+        inputs = [have[p] for p in ordered_parents if p in have]
+
+        parts: List[str] = []
+        user_content = "\n\n".join(inputs).strip()
+        if user_content:
+            parts.append(user_content + step_separator)
+        if agent_idx in trajectory and trajectory[agent_idx]:
+            parts.append(trajectory[agent_idx][0] + step_separator)
+        return "".join(parts) if parts else (question + step_separator)
+
+    raise ValueError(f"Unknown view mode: {view!r}")
 
 
 # =========================================================
@@ -640,6 +710,7 @@ class MCTSInfer:
         leaf_score_type: Optional[str] = None,  # override leaf eval, e.g., "orm"
         logprob_agg: str = "sum",  # "sum" | "avg_token" | "avg_step"
         leaf_score_fn: Optional[Callable[[str], float]] = None,  # leaf PRM/ORM
+        view_mode: str = "full",  # "full" | "local" — scope of state text for PRM/ORM
     ):
         self.mas = mas
         self.q = question
@@ -656,6 +727,7 @@ class MCTSInfer:
         self.uct_type = (uct_type or "uct").lower()
         self.leaf = (leaf_score_type or "").lower() or None
         self.logprob_agg = (logprob_agg or "sum").lower()
+        self.view_mode = (view_mode or "full").lower()
 
         self.required_parents = {i: set(self.mas.parents.get(i, [])) for i in range(self.mas.n)}
         self.parent_order = {i: sorted(self.required_parents[i]) for i in range(self.mas.n)}
@@ -687,8 +759,10 @@ class MCTSInfer:
             return self._puct(parent, child)
         return self._uct(parent, child)
 
-    def _state_text(self, traj: Dict[int, List[str]]) -> str:
-        return render_state_text(self.mas, self.q, traj, self.sep)
+    def _state_text(self, traj: Dict[int, List[str]], agent_idx: Optional[int] = None) -> str:
+        return render_state_text(
+            self.mas, self.q, traj, self.sep, view=self.view_mode, agent_idx=agent_idx
+        )
 
     def _expand(self, node: _Node) -> None:
         d = self._depth(node)
@@ -749,14 +823,13 @@ class MCTSInfer:
             child_texts.append(outs[0] if outs else "")
 
             if self.score_type == "prm":
-                v = 0.0 if self.score_fn is None else float(self.score_fn(self._state_text(traj2)))
+                s_text = self._state_text(traj2, agent_idx=d)
+                v = 0.0 if self.score_fn is None else float(self.score_fn(s_text))
 
                 if self.score_fn is not None:
                     self.usage.prm_calls += 1
                 if self.prm_tokenizer is not None:
-                    self.usage.scorer += _text_token_len_tok(
-                        self.prm_tokenizer, self._state_text(traj2)
-                    )
+                    self.usage.scorer += _text_token_len_tok(self.prm_tokenizer, s_text)
 
             elif self.score_type == "logprob":
                 v_lp, _, g_len = compute_logprob_and_token_counts(
@@ -836,7 +909,8 @@ class MCTSInfer:
             self.usage.add(u)
 
         else:  # "orm"
-            state_text = render_state_text(self.mas, self.q, leaf_traj, self.sep)
+            leaf_last = max(leaf_traj.keys()) if leaf_traj else (self.mas.n - 1)
+            state_text = self._state_text(leaf_traj, agent_idx=leaf_last)
             v_leaf, u = score_orm_end(
                 self.leaf_score_fn, state_text, tokenizer=self.orm_tokenizer
             )  # use leaf scorer on the same format seen during training
