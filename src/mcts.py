@@ -97,7 +97,7 @@ class BaseMCTS:
         if not self._is_terminal(node):
             return
         if node.final_answer is None:
-            inbox, primary_out, last = self.mas._replay(
+            _, primary_out, last = self.mas._replay(
                 self.question,
                 set(node.trajectory),
                 node.trajectory,

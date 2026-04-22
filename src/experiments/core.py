@@ -39,9 +39,6 @@ class TokenStats:
     prm_calls: int = 0  # how many times PRM was called
     agent_runs: int = 0  # how many times we ran a single agent (one step decode)
 
-    def total(self) -> int:
-        return self.prompt + self.generated + self.scorer
-
     def add(self, other: "TokenStats") -> "TokenStats":
         self.prompt += other.prompt
         self.generated += other.generated
@@ -231,9 +228,6 @@ def sbs_decode2(
 
     usage = TokenStats()
     gen_kwargs = gen_kwargs or {}
-    required_parents = getattr(
-        mas, "required_parents", {i: set(mas.parents.get(i, [])) for i in range(mas.n)}
-    )
     agent_order = _agent_order(mas)
     beams: List[Tuple[Dict[int, List[str]], float]] = [({}, 0.0)]
     local_trace: List[Dict[str, Any]] = [] if (trace is not None or return_trace) else None
@@ -339,7 +333,7 @@ def sbs_decode2(
     if final_answers_out is not None:
         final_answers_out.clear()
         for traj, _ in beams:
-            inbox_i, primary_out_i, last_i = mas._replay(question, set(traj), traj)
+            _, primary_out_i, last_i = mas._replay(question, set(traj), traj)
             final_answers_out.append(mas._aggregate_final(primary_out_i, last_i))
 
     best_traj, _ = beams[0]
@@ -833,12 +827,10 @@ class MCTSInfer(BaseMCTS):
                 self.usage.generated += _text_token_len_tok(self.mas.agents[agent_idx].tok, outs[0])
 
         vals: List[float] = []
-        child_texts: List[str] = []
 
         # Compute values for each candidate
         for outs in candidates:
             traj2 = {**node.trajectory, agent_idx: outs}
-            child_texts.append(outs[0] if outs else "")
 
             if self.score_type == "prm":
                 s_text = render_state_text(
@@ -894,7 +886,7 @@ class MCTSInfer(BaseMCTS):
                     pass  # keep uniform
 
         # 3) create children with v_init and prior
-        for v, outs, a_text, p0 in zip(vals, candidates, child_texts, priors):
+        for v, outs, p0 in zip(vals, candidates, priors):
             node.children.append(
                 self._make_child(
                     node,
@@ -961,7 +953,7 @@ class MCTSInfer(BaseMCTS):
             node = max(node.children, key=lambda ch: ch.q_mean)
             traj = node.trajectory
 
-        inbox, primary_out, last = self.mas._replay(self.q, set(traj), traj)
+        _, primary_out, last = self.mas._replay(self.q, set(traj), traj)
         return self.mas._aggregate_final(primary_out, last), self.usage
 
     def get_topk_answers(self, k: int = 5) -> List[str]:
@@ -978,7 +970,7 @@ class MCTSInfer(BaseMCTS):
             node = stack.pop()
             # Use nodes that can serve as final states (leaf or terminal) and that have a trajectory.
             if node.trajectory and self._is_terminal(node) and node.visits > 0:
-                inbox, primary_out, last = self.mas._replay(
+                _, primary_out, last = self.mas._replay(
                     self.q,
                     set(node.trajectory),
                     node.trajectory,

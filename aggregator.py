@@ -4,7 +4,6 @@ import csv
 import statistics
 from collections import defaultdict
 
-
 LOG_DIR = "logs"
 OUTPUT_CSV = "aggregated_results.csv"
 
@@ -49,7 +48,7 @@ def parse_log_content(file_path):
         # We find all occurrences, but filter ONLY for pass@3 and pass@5 per instructions
         pass_k_matches = re.findall(r"Pass@(\d+):\s*([\d\.]+)", content)
         for k, val in pass_k_matches:
-            if k in ['3', '5']:
+            if k in ["3", "5"]:
                 metrics[f"pass@{k}"] = float(val)
 
         # 3. Parse Tokens
@@ -95,7 +94,7 @@ def main():
     print(f"Found {len(files)} log files. Parsing...")
 
     for filename in files:
-        exp_id, seed = get_experiment_id_and_seed(filename)
+        exp_id, _ = get_experiment_id_and_seed(filename)
         file_path = os.path.join(LOG_DIR, filename)
 
         metrics = parse_log_content(file_path)

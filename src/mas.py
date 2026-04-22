@@ -144,20 +144,6 @@ class MAS:
             {"role": "user", "content": user_content},
         ]
 
-    def step(self, messages: List[str], idx: int, **gen_kwargs) -> List[str]:
-        user_content = "\n\n".join(messages).strip()
-        agent = self.agents[idx]
-        if hasattr(agent, "format_messages"):
-            msgs = agent.format_messages(user_content)
-        else:
-            sys_prompt = getattr(agent, "system_prompt", "You are a helpful assistant.")
-            msgs = [
-                {"role": "system", "content": sys_prompt},
-                {"role": "user", "content": user_content},
-            ]
-        out = agent.generate(msgs, **gen_kwargs)
-        return self._normalize_outs(out)
-
     def run_agent(self, idx: int, inbox: Dict[int, Dict[int, str]], **gen_kwargs) -> List[str]:
         out = self.agents[idx].generate(self.agent_messages(idx, inbox), **gen_kwargs)
         return self._normalize_outs(out)

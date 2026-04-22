@@ -258,10 +258,10 @@ def _ppm_pairs_from_tree(
             continue
 
         # Cross product, filtered by margin and capped globally
-        for p_raw, _pnode, pq in reversed(poss):  # iterate high to low on positive side
+        for p_raw, _, pq in reversed(poss):  # iterate high to low on positive side
             if pairs_made_total >= max_pairs:
                 break
-            for n_raw, _nnode, nq in negs:
+            for n_raw, _, nq in negs:
                 if pairs_made_total >= max_pairs:
                     break
                 # ensure strictly better positive
