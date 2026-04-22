@@ -63,25 +63,18 @@ class BaseMCTS:
         return len(node.trajectory)
 
     def _is_terminal(self, node: Node) -> bool:
-        return self._depth_of(node) >= len(self.order)
+        # A node is terminal when the dynamic graph has quiesced for its
+        # trajectory — i.e., no remaining agent has all required parents
+        # delivered. In a static DAG this is equivalent to deciding every
+        # agent; with conditional edges some agents may be implicitly
+        # skipped because a parent-edge didn't fire.
+        return self.mas.next_runnable(self.question, node.trajectory) is None
 
     def _expansion_context(self, node: Node) -> tuple[int, Dict[int, Dict[int, str]]]:
-        depth = self._depth_of(node)
-        if depth >= len(self.order):
+        nxt = self.mas.next_runnable(self.question, node.trajectory)
+        if nxt is None:
             raise RuntimeError("Tried to expand a terminal MCTS node.")
-
-        agent_idx = self.order[depth]
-        inbox, _, _ = self.mas._replay(self.question, set(node.trajectory), node.trajectory)
-
-        req = self.required_parents[agent_idx]
-        have = set(inbox.get(agent_idx, {}).keys())
-        if not req.issubset(have):
-            missing = sorted(req - have)
-            raise RuntimeError(
-                f"Agent {agent_idx} cannot run; missing parents {missing}. "
-                "Check edges and per-depth ordering."
-            )
-        return agent_idx, inbox
+        return nxt
 
     def _sample_candidates(self, node: Node, n_candidates: int) -> tuple[int, List[List[str]]]:
         agent_idx, inbox = self._expansion_context(node)

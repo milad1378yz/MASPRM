@@ -1,8 +1,53 @@
 import heapq
-from typing import Annotated, Any, Dict, List, Optional, Set, Tuple, TypedDict
+import re
+from typing import Annotated, Any, Callable, Dict, List, Optional, Set, Tuple, TypedDict, Union
 
 from agent import Agent
 from langgraph.graph import START, StateGraph
+
+
+Predicate = Callable[[str], bool]
+
+
+def _always_true(_text: str) -> bool:
+    return True
+
+
+def _parse_condition(spec: Union[str, Predicate, None]) -> Predicate:
+    """Compile a small DSL for conditional edges, applied to the source output.
+
+      None / "" / "always"    -> fires unconditionally
+      "contains:TEXT"         -> case-insensitive substring match
+      "not_contains:TEXT"     -> negated substring match
+      "regex:PATTERN"         -> re.search (use (?i) inline for case-insensitive)
+      "not_regex:PATTERN"     -> negated re.search
+      callable                -> used as-is (programmatic configs only)
+    """
+    if spec is None or spec == "" or spec == "always":
+        return _always_true
+    if callable(spec):
+        return spec
+    if not isinstance(spec, str):
+        raise ValueError(f"Unsupported condition spec: {spec!r}")
+
+    tag, sep, payload = spec.partition(":")
+    if not sep:
+        raise ValueError(f"Condition missing ':' separator: {spec!r}")
+
+    tag = tag.strip()
+    if tag == "contains":
+        needle = payload.lower()
+        return lambda t, n=needle: n in (t or "").lower()
+    if tag == "not_contains":
+        needle = payload.lower()
+        return lambda t, n=needle: n not in (t or "").lower()
+    if tag == "regex":
+        compiled = re.compile(payload)
+        return lambda t, c=compiled: c.search(t or "") is not None
+    if tag == "not_regex":
+        compiled = re.compile(payload)
+        return lambda t, c=compiled: c.search(t or "") is None
+    raise ValueError(f"Unknown condition tag: {tag!r}")
 
 
 def _merge_nested_dicts(
@@ -41,8 +86,42 @@ class MAS:
     INPUT = -1  # special node id for the external query
     _INPUT_NODE = "mas_input"
 
-    def __init__(self, edges: List[Tuple[int, int]], agents: List[Agent]):
-        self.edges = [(int(s), int(t)) for s, t in edges]
+    def __init__(self, edges: List[Any], agents: List[Agent]):
+        """
+        Each edge is either (src, dst) or (src, dst, condition_spec). The
+        condition (see `_parse_condition`) is evaluated against the source
+        agent's output at dispatch time; if it is False, the edge does not
+        write to the destination's inbox. Because `_agent_node` requires
+        every declared parent to be present in the inbox before running,
+        a suppressed parent-edge naturally gates the child — so feedback
+        loops, skips, and branches are all expressible with the same edge
+        primitive while the graph itself remains an acyclic DAG.
+        """
+        parsed_edges: List[Tuple[int, int]] = []
+        edge_conditions: Dict[Tuple[int, int], Predicate] = {}
+        edge_condition_specs: Dict[Tuple[int, int], Optional[str]] = {}
+        for edge in edges:
+            if isinstance(edge, dict):
+                src = int(edge["src"])
+                dst = int(edge["dst"])
+                cond_spec = edge.get("condition")
+            else:
+                if len(edge) == 2:
+                    src, dst = int(edge[0]), int(edge[1])
+                    cond_spec = None
+                elif len(edge) == 3:
+                    src, dst, cond_spec = int(edge[0]), int(edge[1]), edge[2]
+                else:
+                    raise ValueError(
+                        f"Edge must be [src, dst] or [src, dst, condition]: {edge!r}"
+                    )
+            parsed_edges.append((src, dst))
+            edge_conditions[(src, dst)] = _parse_condition(cond_spec)
+            edge_condition_specs[(src, dst)] = cond_spec if isinstance(cond_spec, str) else None
+
+        self.edges = parsed_edges
+        self.edge_conditions = edge_conditions
+        self.edge_condition_specs = edge_condition_specs
         self.agents = agents
         self.n = len(agents)
 
@@ -175,9 +254,39 @@ class MAS:
             pairs = ()
 
         for child_idx, msg in pairs:
+            cond = self.edge_conditions.get((idx, child_idx), _always_true)
+            if not cond(msg):
+                continue
             delivered.setdefault(child_idx, {})[idx] = msg
             outputs[child_idx] = msg
         return delivered, outputs
+
+    def is_runnable(self, agent_idx: int, inbox: Dict[int, Dict[int, str]]) -> bool:
+        """An agent is runnable iff every declared parent has delivered to its inbox."""
+        have = inbox.get(agent_idx, {})
+        if not have:
+            return not self.required_parents[agent_idx]
+        return self.required_parents[agent_idx].issubset(set(have.keys()))
+
+    def next_runnable(
+        self,
+        question: str,
+        trajectory: Dict[int, List[str]],
+    ) -> Optional[Tuple[int, Dict[int, Dict[int, str]]]]:
+        """Next agent that should make a decision given the current trajectory.
+
+        Walks agent_order (topological); returns the first undecided agent
+        whose required parents have delivered in the replayed inbox. Returns
+        None when no further decision can be made (the dynamic graph has
+        quiesced for this trajectory).
+        """
+        inbox, _, _ = self._replay(question, set(trajectory), trajectory)
+        for idx in self.agent_order:
+            if idx in trajectory:
+                continue
+            if self.is_runnable(idx, inbox):
+                return idx, inbox
+        return None
 
     def _build_initial_state(
         self,

@@ -1,0 +1,70 @@
+# Self-Refine (Madaan et al., 2023) pattern for GSM8k, expressed as an
+# acyclic DAG with one conditional edge. Topology:
+#
+#   Q ──────────────┐
+#   Q ─► Reader ─► Planner ─► Solver ─► Verifier ──(INCORRECT)──► Refiner
+#                                             │ (CORRECT: Refiner's Verifier-gate
+#                                             ▼   edge is suppressed and it skips)
+#                                       Final answer
+#   Q ─► Refiner  (unconditional context)
+#   Solver ─► Refiner  (unconditional: the draft being refined)
+#
+# Runtime behavior:
+#   - Verifier writes "VERDICT: CORRECT\nFinal Answer: <n>" or
+#     "VERDICT: INCORRECT\n<critique>".
+#   - The conditional edge on 3->4 only fires when the Verifier's text
+#     matches /verdict:\s*incorrect/i. Otherwise Refiner loses a required
+#     parent and skips — Verifier becomes the effective sink and its
+#     "Final Answer: <n>" is aggregated as the output.
+#   - When Refiner runs, it is the only sink and its final answer wins.
+
+agents:
+  - name: Reader
+    system_prompt: "You are the Reader. Extract key facts and restate the question."
+    max_new_tokens: 512
+
+  - name: Planner
+    system_prompt: "You are the Planner. Propose a concise plan to solve the task."
+    max_new_tokens: 512
+
+  - name: Solver
+    system_prompt: |
+      You are the Solver. Carry out the plan and show your arithmetic step by step.
+      End with a line exactly of the form:
+      Final Answer: <number>
+    max_new_tokens: 1024
+
+  - name: Verifier
+    system_prompt: |
+      You are the Verifier. You receive the original question and the Solver's
+      worked solution. Re-derive the answer independently and compare.
+
+      If the Solver's reasoning AND final number are correct, output EXACTLY:
+      VERDICT: CORRECT
+      Final Answer: <number>
+
+      Otherwise, output EXACTLY:
+      VERDICT: INCORRECT
+      <one short paragraph identifying the specific mistake; do NOT give a new answer here>
+    max_new_tokens: 512
+
+  - name: Refiner
+    system_prompt: |
+      You are the Refiner. You receive the original question, the Solver's
+      flawed attempt, and the Verifier's critique. Produce a corrected
+      solution that addresses the critique, showing arithmetic step by step.
+      End with a line exactly of the form:
+      Final Answer: <number>
+    max_new_tokens: 1024
+
+# Edges: [src, dst] or [src, dst, condition]. -1 is the external question.
+edges:
+  - [-1, 0]            # Q -> Reader
+  - [-1, 1]            # Q -> Planner
+  - [ 0, 1]            # Reader -> Planner
+  - [ 1, 2]            # Planner -> Solver
+  - [-1, 3]            # Q -> Verifier
+  - [ 2, 3]            # Solver -> Verifier
+  - [-1, 4]            # Q -> Refiner
+  - [ 2, 4]            # Solver -> Refiner
+  - [ 3, 4, "regex:(?i)verdict:\\s*incorrect"]  # Verifier -> Refiner (only when INCORRECT)

@@ -143,12 +143,18 @@ def score_path_logprob(
     agg: str = "sum",
 ) -> tuple[float, TokenStats]:
     usage = TokenStats()
-    traj_so_far = {}
+    traj_so_far: Dict[int, List[str]] = {}
     s_total = 0.0
     token_total = 0
 
-    for agent_idx, text in zip(_agent_order(mas), steps):
-        inbox, _, _ = mas._replay(question, set(traj_so_far), traj_so_far)
+    # Walk the dynamic graph: the k-th provided step belongs to whichever
+    # agent is runnable given the trajectory so far (in a static DAG this
+    # collapses to agent_order[k], matching the old behavior).
+    for text in steps:
+        result = mas.next_runnable(question, traj_so_far)
+        if result is None:
+            break
+        agent_idx, inbox = result
         msgs = mas.agent_messages(agent_idx, inbox)
 
         lp, p_len, g_len = compute_logprob_and_token_counts(mas.agents[agent_idx], msgs, text)
@@ -179,9 +185,13 @@ def score_path_prm_product(
     view_mode: str = "full",
 ) -> tuple[float, TokenStats]:
     usage = TokenStats()
-    traj = {}
+    traj: Dict[int, List[str]] = {}
     product = 1.0
-    for agent_idx, text in zip(_agent_order(mas), steps):
+    for text in steps:
+        result = mas.next_runnable(question, traj)
+        if result is None:
+            break
+        agent_idx, _inbox = result
         traj[agent_idx] = [text]
         s_text = render_state_text(
             mas, question, traj, step_separator, view=view_mode, agent_idx=agent_idx
@@ -232,11 +242,26 @@ def sbs_decode2(
     beams: List[Tuple[Dict[int, List[str]], float]] = [({}, 0.0)]
     local_trace: List[Dict[str, Any]] = [] if (trace is not None or return_trace) else None
 
+    # Walk agent_order (topological). For each agent, only beams that have
+    # its required parents delivered (is_runnable) actually produce
+    # candidates — other beams are carried forward unchanged. This lets
+    # different beams traverse different subsets of the DAG when
+    # conditional edges suppress dispatch.
     for agent_idx in agent_order:
         new_beams: List[Tuple[Dict[int, List[str]], float]] = []
+        cand_infos_all: List[Tuple[List[str], float]] = []
+        any_beam_ran = False
 
-        for traj, _ in beams:
+        for traj, prev_score in beams:
             inbox, _, _ = mas._replay(question, set(traj), traj)
+
+            if not mas.is_runnable(agent_idx, inbox) or agent_idx in traj:
+                # Beam skips this agent (conditional edge suppressed, or
+                # somehow already decided). Carry it forward unchanged.
+                new_beams.append((traj, prev_score))
+                continue
+
+            any_beam_ran = True
             msgs = mas.agent_messages(agent_idx, inbox)
 
             # PRE-ENCODE prompt once; reuse for accounting and logprob scoring
@@ -299,35 +324,41 @@ def sbs_decode2(
                 else:
                     v = 0.0
                 cand_infos.append((outs, v))
+                cand_infos_all.append((outs, v))
 
             for outs, v in cand_infos:
                 new_beams.append(({**traj, agent_idx: outs}, v))
 
-            if local_trace is not None:
-                local_trace.append(
-                    {
-                        "agent_idx": agent_idx,
-                        "candidates": [
-                            {
-                                "text": (outs[0] if outs else ""),
-                                "score": (float(v) if score_type != "none" else None),
-                            }
-                            for outs, v in cand_infos
-                        ],
-                        "chosen_text": None,
-                        "chosen_score": None if score_type == "none" else float("-inf"),
-                    }
-                )
+        if local_trace is not None and any_beam_ran:
+            local_trace.append(
+                {
+                    "agent_idx": agent_idx,
+                    "candidates": [
+                        {
+                            "text": (outs[0] if outs else ""),
+                            "score": (float(v) if score_type != "none" else None),
+                        }
+                        for outs, v in cand_infos_all
+                    ],
+                    "chosen_text": None,
+                    "chosen_score": None if score_type == "none" else float("-inf"),
+                }
+            )
 
         if score_type != "none":
             new_beams.sort(key=lambda x: x[1], reverse=True)
         beams = new_beams[: max(1, B1)]
 
-        if local_trace is not None and len(local_trace) > 0:
+        if local_trace is not None and any_beam_ran:
             chosen_traj, chosen_val = beams[0]
-            chosen_text = chosen_traj.get(agent_idx, [""])[0]
-            local_trace[-1]["chosen_text"] = chosen_text
-            local_trace[-1]["chosen_score"] = None if score_type == "none" else float(chosen_val)
+            chosen_outs = chosen_traj.get(agent_idx)
+            # If the top beam was a carry-forward (didn't run this agent),
+            # leave chosen_text as None so downstream consumers skip it.
+            if chosen_outs:
+                local_trace[-1]["chosen_text"] = chosen_outs[0]
+                local_trace[-1]["chosen_score"] = (
+                    None if score_type == "none" else float(chosen_val)
+                )
 
     # collect final answers for all surviving beams (for pass@k)
     if final_answers_out is not None:
@@ -416,7 +447,15 @@ def make_scored_voter(
         for mas_i in mas_list:
             ans, u, tr = base_decoder_with_trace(mas_i, q)
             usages.add(u)
-            steps = [e["chosen_text"] for e in tr] if tr else []
+            # Only keep trace entries where the winning beam actually ran
+            # this agent (chosen_text set). In dynamic graphs, some entries
+            # correspond to beams that were never on the winning path.
+            tr_run = [
+                e for e in (tr or [])
+                if e.get("chosen_text") not in (None, "")
+            ]
+            steps = [e["chosen_text"] for e in tr_run]
+            agent_ids = [e["agent_idx"] for e in tr_run]
 
             if score_mode == "prm":
                 w, u2 = score_path_prm_product(
@@ -432,10 +471,11 @@ def make_scored_voter(
                 raw_score, u2 = score_path_logprob(mas_i, q, steps, agg=logprob_agg)
                 w = _safe_exp(raw_score)
             elif score_mode == "orm":
-                traj = {agent_idx: [text] for agent_idx, text in zip(_agent_order(mas_i), steps)}
-                # ORM scores the final state; for local view, scope to the last
-                # decided agent (typically the sink producing the final answer).
-                last_idx = next(reversed(traj)) if traj else (_agent_order(mas_i)[-1] if steps else None)
+                traj = {aid: [text] for aid, text in zip(agent_ids, steps)}
+                # ORM scores the final state; for local view, scope to the
+                # last decided agent on the winning path (typically the
+                # sink producing the final answer).
+                last_idx = agent_ids[-1] if agent_ids else None
                 state_text = render_state_text(
                     mas_i,
                     q,
@@ -671,12 +711,13 @@ def render_state_text(
         used.
     """
     if view == "full":
+        # Include every decided agent in topological order. In a dynamic
+        # graph some agents may be skipped by conditional edges and still
+        # have downstream decisions; don't stop at the first gap.
         parts = [question]
         for agent_idx in _agent_order(mas):
             if agent_idx in trajectory and trajectory[agent_idx]:
                 parts.append(trajectory[agent_idx][0] + step_separator)
-            else:
-                break
         return "".join(parts)
 
     if view == "local":
@@ -925,7 +966,11 @@ class MCTSInfer(BaseMCTS):
             self.usage.add(u)
 
         else:  # "orm"
-            leaf_last = max(leaf_traj.keys()) if leaf_traj else (self.mas.n - 1)
+            # Pick the last decided agent in topological order (the sink of
+            # the realized path), not just the highest index — different in
+            # dynamic graphs where conditional edges can skip agents.
+            decided = [agent_idx for agent_idx in self.order if leaf_traj.get(agent_idx)]
+            leaf_last = decided[-1] if decided else (self.mas.n - 1)
             state_text = render_state_text(
                 self.mas,
                 self.q,

@@ -1,0 +1,65 @@
+# Self-Refine (Madaan et al., 2023) pattern for competition_math. Same
+# topology as gsm8k_refine.yaml, with prompts adapted for MATH — solutions
+# include LaTeX and the conventional \boxed{} final-answer wrapper. See
+# that file for an explanation of how the conditional edge gates Refiner.
+
+agents:
+  - name: Reader
+    system_prompt: |
+      You are the Reader. Restate the problem, call out constraints
+      (domains, bounds, units), and list relevant definitions or
+      formulas that look useful. Do not solve.
+    max_new_tokens: 512
+
+  - name: Planner
+    system_prompt: |
+      You are the Planner. Outline a concise strategy for solving the
+      math problem: name the technique (algebra, induction, casework,
+      combinatorial identity, etc.), the key steps, and any expected
+      intermediate quantities. Do not compute the final answer.
+    max_new_tokens: 512
+
+  - name: Solver
+    system_prompt: |
+      You are the Solver. Execute the plan rigorously. Show each
+      algebraic manipulation. Use LaTeX where helpful and keep arithmetic
+      careful. End with a line exactly of the form:
+      Final Answer: \boxed{<value>}
+    max_new_tokens: 1536
+
+  - name: Verifier
+    system_prompt: |
+      You are the Verifier. Given the original problem and the Solver's
+      worked solution, re-derive the answer independently (or audit the
+      Solver's derivation line by line) and compare.
+
+      If the reasoning is sound AND the final value is correct, output EXACTLY:
+      VERDICT: CORRECT
+      Final Answer: \boxed{<value>}
+
+      Otherwise, output EXACTLY:
+      VERDICT: INCORRECT
+      <one short paragraph identifying the specific error — wrong identity,
+       arithmetic slip, missed case, sign, domain, etc. — without giving
+       the corrected final value>
+    max_new_tokens: 768
+
+  - name: Refiner
+    system_prompt: |
+      You are the Refiner. You receive the original problem, the
+      Solver's flawed attempt, and the Verifier's critique. Produce a
+      corrected solution that addresses the critique directly, with
+      rigorous step-by-step work. End with a line exactly of the form:
+      Final Answer: \boxed{<value>}
+    max_new_tokens: 1536
+
+edges:
+  - [-1, 0]
+  - [-1, 1]
+  - [ 0, 1]
+  - [ 1, 2]
+  - [-1, 3]
+  - [ 2, 3]
+  - [-1, 4]
+  - [ 2, 4]
+  - [ 3, 4, "regex:(?i)verdict:\\s*incorrect"]
