@@ -14,32 +14,19 @@ from ray.util.queue import Queue
 from answer_utils import is_correct
 from mas import MAS, build_mas_from_specs
 
-try:
-    from .core import (
-        _seed_everything,
-        TokenStats,
-        sbs_decode2,
-        make_scored_voter,
-        load_prm_scorer,
-        ensure_separator_token,
-        align_model_to_tokenizer,
-        build_runtime,
-        MCTSInfer,
-        _majority_by_numbers_equal,
-    )
-except ImportError:
-    from core import (
-        _seed_everything,
-        TokenStats,
-        sbs_decode2,
-        make_scored_voter,
-        load_prm_scorer,
-        ensure_separator_token,
-        align_model_to_tokenizer,
-        build_runtime,
-        MCTSInfer,
-        _majority_by_numbers_equal,
-    )
+
+from core import (
+    _seed_everything,
+    TokenStats,
+    sbs_decode2,
+    make_scored_voter,
+    load_prm_scorer,
+    ensure_separator_token,
+    align_model_to_tokenizer,
+    build_runtime,
+    MCTSInfer,
+    _majority_by_numbers_equal,
+)
 
 
 @dataclass
