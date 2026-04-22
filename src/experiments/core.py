@@ -721,6 +721,10 @@ def render_state_text(
         return "".join(parts)
 
     if view == "local":
+        # Local view = only this agent's routed inputs + its own output,
+        # terminated by ONE separator so the scorer's last-sep logit aligns
+        # with the single labeled separator in training records of the form
+        # {prompt=<agent_inputs>, completions=[<agent_output>], labels=[q]}.
         order = _agent_order(mas)
         position = _agent_position(mas)
         if agent_idx is None:
@@ -729,8 +733,6 @@ def render_state_text(
                 return question + step_separator
             agent_idx = decided[-1]
 
-        # Replay ONLY the decisions upstream of agent_idx so its inbox reflects
-        # what this agent actually received in the routed DAG.
         cutoff = position[agent_idx]
         prior = {
             idx: trajectory[idx]
@@ -739,13 +741,19 @@ def render_state_text(
         }
         inbox, _, _ = mas._replay(question, set(prior), prior)
 
-        parts: List[str] = []
         user_content = mas.agent_user_content(agent_idx, inbox)
+        output = (
+            trajectory[agent_idx][0]
+            if agent_idx in trajectory and trajectory[agent_idx]
+            else ""
+        )
+        if user_content and output:
+            return user_content + "\n\n" + output + step_separator
+        if output:
+            return output + step_separator
         if user_content:
-            parts.append(user_content + step_separator)
-        if agent_idx in trajectory and trajectory[agent_idx]:
-            parts.append(trajectory[agent_idx][0] + step_separator)
-        return "".join(parts) if parts else (question + step_separator)
+            return user_content + step_separator
+        return question + step_separator
 
     raise ValueError(f"Unknown view mode: {view!r}")
 

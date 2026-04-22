@@ -1,21 +1,77 @@
 """
 Example:
-    # PRM-only (original behavior)
-    python src/train/preprocess_data.py --target-nodes 4 --dedupe 
+    # PRM-only (original behavior, global view)
+    python src/train/preprocess_data.py --target-nodes 4 --dedupe
 
-    # PPM
+    # PPM (global view)
     python preprocess_prm.py \
         --input trees_dir_or_file \
         --make-ppm \
         --ppm-max-pairs 8
+
+    # Local view (MASPRM: each record scoped to a single agent's inbox + output)
+    python src/train/preprocess_data.py --view local --make-ppm
 """
 
 import argparse
 import json
 import math
+import re
+import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from tqdm import tqdm
+
+import yaml
+
+
+_ACTION_TEXT_RE = re.compile(r"^\[agent\s+(\d+)\]")
+
+
+def _parse_agent_idx(action_text: Optional[str]) -> Optional[int]:
+    """Recover the agent index from a tree node's action_text (set by MCTS).
+
+    Nodes store `action_text = f"[agent {idx}] {output}"`; for the root and
+    anything malformed, return None.
+    """
+    if not isinstance(action_text, str):
+        return None
+    m = _ACTION_TEXT_RE.match(action_text)
+    return int(m.group(1)) if m else None
+
+
+def _derive_config_path(input_dir: Path) -> Path:
+    """Map `results/<dataset>_res_<...>` → `configs/<dataset>.yaml`."""
+    dataset = input_dir.name.split("_res_")[0]
+    return Path("configs") / f"{dataset}.yaml"
+
+
+def _build_stub_mas(config_path: Path):
+    """Build a model-less MAS used only for inbox routing.
+
+    MAS._replay with `active_agents` set uses forced_outputs and never calls
+    agent.generate, so agents don't need a real model or tokenizer.
+    """
+    # Ensure src/ is importable for `mas` and `agent` modules.
+    src_root = Path(__file__).resolve().parent.parent
+    if str(src_root) not in sys.path:
+        sys.path.insert(0, str(src_root))
+    from mas import MAS  # noqa: E402
+    from agent import Agent  # noqa: E402
+
+    cfg = yaml.safe_load(Path(config_path).read_text())
+    agent_specs = cfg["agents"]
+    edges = cfg["edges"]
+    agents = [
+        Agent(
+            model=None,
+            tok=None,
+            system_prompt=spec.get("system_prompt", "You are a helpful assistant."),
+            max_new_tokens=int(spec.get("max_new_tokens", 512)),
+        )
+        for spec in agent_specs
+    ]
+    return MAS(edges, agents)
 
 
 def _node_value(nd: Dict[str, Any]) -> Optional[float]:
@@ -131,6 +187,94 @@ def _records_from_tree(
             n_neg += 1
 
         out.append({"prompt": prompt, "completions": actions, "labels": labels})
+
+    return out, n_pos, n_neg
+
+
+def _records_from_tree_local(
+    data: Dict[str, Any],
+    *,
+    mas: Any,
+    filename_hint: str,
+    target_nodes: int = 5,
+) -> Tuple[List[Dict[str, Any]], int, int]:
+    """Local-view PRM records: one record per (path, step).
+
+    Each record's `prompt` is the current agent's replayed inbox (i.e., the
+    concatenation of messages routed to it by MAS given the prior decisions),
+    and `completions=[node_text]` with `labels=[q]` — exactly the scope seen
+    by `render_state_text(view="local")` at inference time.
+    """
+    question = _extract_prompt(data, fallback=filename_hint)
+
+    # Preserve the same root-q filter as the global path.
+    root_q = _node_value(data)
+    if (root_q is None) or not (-0.7 <= float(root_q) <= 0.7):
+        return [], 0, 0
+
+    out: List[Dict[str, Any]] = []
+    n_pos = 0
+    n_neg = 0
+
+    for path in _iter_paths_exact_nodes(data, target_nodes=target_nodes):
+        leaf = path[-1]
+        if not bool(leaf.get("is_terminal", False)):
+            continue
+        leaf_q = _node_value(leaf)
+        if not _is_pm1(leaf_q):
+            continue
+
+        # Recover per-step (agent_idx, output, q) for the path (root excluded).
+        step_info: List[Tuple[int, str, float]] = []
+        ok = True
+        for nd in path[1:]:
+            aidx = _parse_agent_idx(nd.get("action_text"))
+            if aidx is None:
+                ok = False
+                break
+            txt = (nd.get("node_text") or "").strip()
+            if not txt:
+                ok = False
+                break
+            q = _node_value(nd)
+            if q is None:
+                ok = False
+                break
+            step_info.append((aidx, txt, max(-1.0, min(1.0, float(q)))))
+        if not ok or len(step_info) != (target_nodes - 1):
+            continue
+
+        if float(leaf_q) > 0:
+            n_pos += 1
+        else:
+            n_neg += 1
+
+        # Emit one local record per step, replaying only the prior decisions
+        # to recover the agent's inbox at that point in the routed DAG.
+        for i, (aidx, output, q) in enumerate(step_info):
+            prior_forced = {a: [t] for (a, t, _) in step_info[:i]}
+            try:
+                inbox, _, _ = mas._replay(question, set(prior_forced), prior_forced)
+            except Exception:
+                continue
+            user_content = mas.agent_user_content(aidx, inbox)
+            if not user_content:
+                # Entry agent with no routed parents (shouldn't happen once the
+                # INPUT edge is set, but guard anyway).
+                user_content = question
+            out.append(
+                {
+                    "prompt": user_content,
+                    "completions": [output],
+                    "labels": [q],
+                    "meta": {
+                        "agent_idx": aidx,
+                        "step_index": i,
+                        "target_nodes": target_nodes,
+                        "view": "local",
+                    },
+                }
+            )
 
     return out, n_pos, n_neg
 
@@ -300,6 +444,157 @@ def _ppm_pairs_from_tree(
     return out
 
 
+def _ppm_pairs_from_tree_local(
+    data: Dict[str, Any],
+    *,
+    mas: Any,
+    filename_hint: str,
+    target_nodes: int,
+    pos_topk: int = 4,
+    neg_topk: int = 4,
+    max_pairs: int = 8,
+    require_root_window: Optional[Tuple[float, float]] = None,
+) -> List[Dict[str, Any]]:
+    """Local-view PPM pairs: each pair differs at one agent's step output, with
+    the shared upstream prefix collapsed into `prompt` via MAS inbox replay.
+    """
+    if require_root_window is not None:
+        root_q = _node_value(data)
+        lo, hi = require_root_window
+        if (root_q is None) or not (float(lo) <= float(root_q) <= float(hi)):
+            return []
+
+    question = _extract_prompt(data, fallback=filename_hint)
+
+    def _norm_text(s: str) -> str:
+        return " ".join(s.split())
+
+    out: List[Dict[str, Any]] = []
+    seen_pairs: set = set()
+    pairs_made_total = 0
+    MIN_MARGIN = 1e-9
+
+    # DFS stack carries (node, node_path, agent_idx_path). agent_idx_path
+    # mirrors node_path[1:] (root excluded) and lets us build prefix_forced
+    # without re-parsing action_text each time.
+    stack: List[Tuple[Dict[str, Any], List[Dict[str, Any]], List[int]]] = [(data, [data], [])]
+    while stack and (pairs_made_total < max_pairs):
+        nd, path, agent_prefix = stack.pop()
+        depth = len(path) - 1
+
+        if depth < target_nodes - 1:
+            for ch in reversed(nd.get("children") or []):
+                child_aidx = _parse_agent_idx(ch.get("action_text"))
+                if child_aidx is None:
+                    continue
+                stack.append((ch, path + [ch], agent_prefix + [child_aidx]))
+
+        if depth >= target_nodes - 1:
+            continue
+
+        children = nd.get("children") or []
+        if depth == target_nodes - 2:
+            children = [c for c in children if bool(c.get("is_terminal", False))]
+        if not children:
+            continue
+
+        # MCTS expands one agent per node, so all children share an agent_idx.
+        current_agent_idx = _parse_agent_idx(children[0].get("action_text"))
+        if current_agent_idx is None:
+            continue
+
+        scored: List[Tuple[str, str, Dict[str, Any], float]] = []
+        for ch in children:
+            raw = (ch.get("node_text") or "").strip()
+            if not raw:
+                continue
+            q = _node_value(ch)
+            if q is None:
+                continue
+            scored.append((_norm_text(raw), raw, ch, float(q)))
+        if not scored:
+            continue
+
+        best_by_text: Dict[str, Tuple[str, Dict[str, Any], float]] = {}
+        for norm, raw, ch, q in scored:
+            cur = best_by_text.get(norm)
+            if (cur is None) or (q > cur[2]):
+                best_by_text[norm] = (raw, ch, q)
+
+        uniq = [(raw, ch, q) for (raw, ch, q) in best_by_text.values()]
+        if len(uniq) < 2:
+            continue
+
+        uniq.sort(key=lambda t: t[2])
+        k_neg = min(neg_topk, max(1, len(uniq) // 2))
+        k_pos = min(pos_topk, max(1, len(uniq) - k_neg))
+        if k_neg + k_pos > len(uniq):
+            k_pos = max(1, len(uniq) - k_neg)
+        negs = uniq[:k_neg]
+        poss = uniq[-k_pos:]
+        if not negs or not poss:
+            continue
+
+        # Build prefix trajectory (agent_idx -> [text]) and replay inboxes.
+        prefix_forced: Dict[int, List[str]] = {}
+        ok_prefix = True
+        for nd_p, aidx_p in zip(path[1:], agent_prefix):
+            s = (nd_p.get("node_text") or "").strip()
+            if not s:
+                ok_prefix = False
+                break
+            prefix_forced[aidx_p] = [s]
+        if not ok_prefix:
+            continue
+
+        try:
+            inbox, _, _ = mas._replay(question, set(prefix_forced), prefix_forced)
+        except Exception:
+            continue
+        user_content = mas.agent_user_content(current_agent_idx, inbox)
+        if not user_content:
+            user_content = question
+
+        for p_raw, _, pq in reversed(poss):
+            if pairs_made_total >= max_pairs:
+                break
+            for n_raw, _, nq in negs:
+                if pairs_made_total >= max_pairs:
+                    break
+                if pq <= nq + MIN_MARGIN:
+                    continue
+                if p_raw == n_raw:
+                    continue
+
+                key = (user_content, p_raw, n_raw)
+                if key in seen_pairs:
+                    continue
+                seen_pairs.add(key)
+
+                out.append(
+                    {
+                        "prompt": user_content,
+                        "chosen_actions": [p_raw],
+                        "rejected_actions": [n_raw],
+                        "meta": {
+                            "agent_idx": current_agent_idx,
+                            "step_index": depth,
+                            "shared_prefix_len": depth,
+                            "target_nodes": target_nodes,
+                            "parent_visits": int(nd.get("visits", 0)),
+                            "pos_q": float(pq),
+                            "neg_q": float(nq),
+                            "q_gap": float(pq - nq),
+                            "final_step_only_terminal": (depth == target_nodes - 2),
+                            "view": "local",
+                        },
+                    }
+                )
+                pairs_made_total += 1
+
+    return out
+
+
 def _load_trees(input_path: Path) -> Iterable[Dict[str, Any]]:
     # .json
     obj = json.loads(input_path.read_text(encoding="utf-8"))
@@ -345,14 +640,44 @@ def main():
         metavar=("LO", "HI"),
         help="Optional root-q window filter for PPM (e.g., -0.7 0.7). If omitted, no root filter is applied.",
     )
+    ap.add_argument(
+        "--view",
+        choices=["full", "local"],
+        default="full",
+        help="State scope used to build training records. "
+        "'full' (default) concatenates all decided steps (global view). "
+        "'local' scopes each record to a single agent's inbox + output (MASPRM).",
+    )
+    ap.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="Path to the MAS config YAML (used only for --view local). "
+        "Defaults to configs/<dataset>.yaml derived from --input's directory name.",
+    )
 
     args = ap.parse_args()
-    prm_output_path = args.input.with_name(f"prm_samples_{args.input.stem}.jsonl")
+    view_tag = "" if args.view == "full" else f"_{args.view}"
+    prm_output_path = args.input.with_name(f"prm_samples{view_tag}_{args.input.stem}.jsonl")
     prm_output_path.parent.mkdir(parents=True, exist_ok=True)
 
     ppm_output_path = (
-        args.input.with_name(f"ppm_pairs_{args.input.stem}.jsonl") if args.make_ppm else None
+        args.input.with_name(f"ppm_pairs{view_tag}_{args.input.stem}.jsonl")
+        if args.make_ppm
+        else None
     )
+
+    # Local view needs a MAS to replay inboxes; build it once.
+    mas_local = None
+    if args.view == "local":
+        config_path = args.config or _derive_config_path(args.input)
+        if not Path(config_path).exists():
+            raise FileNotFoundError(
+                f"Config YAML for local view not found: {config_path}. "
+                f"Pass --config <path> to override."
+            )
+        print(f"[preprocess_prm][local] Using MAS config: {config_path}")
+        mas_local = _build_stub_mas(Path(config_path))
 
     seen_prm = set()
     seen_ppm = set()
@@ -380,9 +705,17 @@ def main():
             continue
         for t in trees:
             # PRM
-            recs, cpos, cneg = _records_from_tree(
-                t, filename_hint=f.stem, target_nodes=args.target_nodes
-            )
+            if args.view == "local":
+                recs, cpos, cneg = _records_from_tree_local(
+                    t,
+                    mas=mas_local,
+                    filename_hint=f.stem,
+                    target_nodes=args.target_nodes,
+                )
+            else:
+                recs, cpos, cneg = _records_from_tree(
+                    t, filename_hint=f.stem, target_nodes=args.target_nodes
+                )
             prm_n_pos += cpos
             prm_n_neg += cneg
             for r in recs:
@@ -401,17 +734,31 @@ def main():
 
             # PPM
             if ppm_out is not None:
-                pairs = _ppm_pairs_from_tree(
-                    t,
-                    filename_hint=f.stem,
-                    target_nodes=args.target_nodes,
-                    pos_topk=args.ppm_pos_topk,
-                    neg_topk=args.ppm_neg_topk,
-                    max_pairs=args.ppm_max_pairs,
-                    require_root_window=(
-                        tuple(args.ppm_root_window) if args.ppm_root_window else None
-                    ),
-                )
+                if args.view == "local":
+                    pairs = _ppm_pairs_from_tree_local(
+                        t,
+                        mas=mas_local,
+                        filename_hint=f.stem,
+                        target_nodes=args.target_nodes,
+                        pos_topk=args.ppm_pos_topk,
+                        neg_topk=args.ppm_neg_topk,
+                        max_pairs=args.ppm_max_pairs,
+                        require_root_window=(
+                            tuple(args.ppm_root_window) if args.ppm_root_window else None
+                        ),
+                    )
+                else:
+                    pairs = _ppm_pairs_from_tree(
+                        t,
+                        filename_hint=f.stem,
+                        target_nodes=args.target_nodes,
+                        pos_topk=args.ppm_pos_topk,
+                        neg_topk=args.ppm_neg_topk,
+                        max_pairs=args.ppm_max_pairs,
+                        require_root_window=(
+                            tuple(args.ppm_root_window) if args.ppm_root_window else None
+                        ),
+                    )
 
                 for p in pairs:
                     if args.dedupe:
