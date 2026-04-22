@@ -64,6 +64,17 @@ def _text_token_len_agent(agent, text: str) -> int:
     return _text_token_len_tok(agent.tok, text)
 
 
+def _agent_order(mas: Any) -> List[int]:
+    return list(getattr(mas, "agent_order", list(range(mas.n))))
+
+
+def _agent_position(mas: Any) -> Dict[int, int]:
+    if hasattr(mas, "agent_position"):
+        return dict(mas.agent_position)
+    order = _agent_order(mas)
+    return {agent_idx: pos for pos, agent_idx in enumerate(order)}
+
+
 # ===========================
 #  LOGPROB scoring utilities
 # ===========================
@@ -138,29 +149,21 @@ def score_path_logprob(
     *,
     agg: str = "sum",
 ) -> tuple[float, TokenStats]:
-    required_parents = {i: set(mas.parents.get(i, [])) for i in range(mas.n)}
     usage = TokenStats()
     traj_so_far = {}
     s_total = 0.0
     token_total = 0
 
-    for j, text in enumerate(steps):
+    for agent_idx, text in zip(_agent_order(mas), steps):
         inbox, _, _ = _replay_trajectory(mas, question, traj_so_far)
-        have = inbox.get(j, {})
-        ordered_parents = sorted(required_parents[j])
-        inputs = [have[p] for p in ordered_parents if p in have]
-        sys_prompt = getattr(mas.agents[j], "system_prompt", "You are a helpful assistant.")
-        msgs = [
-            {"role": "system", "content": sys_prompt},
-            {"role": "user", "content": "\n\n".join(inputs).strip()},
-        ]
+        msgs = mas.agent_messages(agent_idx, inbox)
 
-        lp, p_len, g_len = compute_logprob_and_token_counts(mas.agents[j], msgs, text)
+        lp, p_len, g_len = compute_logprob_and_token_counts(mas.agents[agent_idx], msgs, text)
         usage.scorer += p_len + g_len
         s_total += lp
         token_total += max(0, g_len)
 
-        traj_so_far[j] = [text]
+        traj_so_far[agent_idx] = [text]
 
     if agg in ("avg_token", "avg", "mean_token"):
         value = s_total / max(1, token_total)
@@ -185,10 +188,10 @@ def score_path_prm_product(
     usage = TokenStats()
     traj = {}
     product = 1.0
-    for j, text in enumerate(steps):
-        traj[j] = [text]
+    for agent_idx, text in zip(_agent_order(mas), steps):
+        traj[agent_idx] = [text]
         s_text = render_state_text(
-            mas, question, traj, step_separator, view=view_mode, agent_idx=j
+            mas, question, traj, step_separator, view=view_mode, agent_idx=agent_idx
         )
         v = float(score_fn(s_text))  # [-1, 1]
         usage.prm_calls += 1
@@ -232,27 +235,19 @@ def sbs_decode2(
 
     usage = TokenStats()
     gen_kwargs = gen_kwargs or {}
-    required_parents = {i: set(mas.parents.get(i, [])) for i in range(mas.n)}
+    required_parents = getattr(
+        mas, "required_parents", {i: set(mas.parents.get(i, [])) for i in range(mas.n)}
+    )
+    agent_order = _agent_order(mas)
     beams: List[Tuple[Dict[int, List[str]], float]] = [({}, 0.0)]
     local_trace: List[Dict[str, Any]] = [] if (trace is not None or return_trace) else None
 
-    for agent_idx in range(mas.n):
+    for agent_idx in agent_order:
         new_beams: List[Tuple[Dict[int, List[str]], float]] = []
 
         for traj, _ in beams:
             inbox, _, _ = _replay_trajectory(mas, question, traj)
-
-            # prompt for this agent
-            have = inbox.get(agent_idx, {})
-            ordered_parents = sorted(required_parents[agent_idx])
-            inputs = [have[p] for p in ordered_parents if p in have]
-            sys_prompt = getattr(
-                mas.agents[agent_idx], "system_prompt", "You are a helpful assistant."
-            )
-            msgs = [
-                {"role": "system", "content": sys_prompt},
-                {"role": "user", "content": "\n\n".join(inputs).strip()},
-            ]
+            msgs = mas.agent_messages(agent_idx, inbox)
 
             # PRE-ENCODE prompt once; reuse for accounting and logprob scoring
             enc = mas.agents[agent_idx].tok.apply_chat_template(
@@ -449,10 +444,10 @@ def make_scored_voter(
                 raw_score, u2 = score_path_logprob(mas_i, q, steps, agg=logprob_agg)
                 w = _safe_exp(raw_score)
             elif score_mode == "orm":
-                traj = {j: [text] for j, text in enumerate(steps)}
+                traj = {agent_idx: [text] for agent_idx, text in zip(_agent_order(mas_i), steps)}
                 # ORM scores the final state; for local view, scope to the last
                 # decided agent (typically the sink producing the final answer).
-                last_idx = (max(traj.keys()) if traj else (mas_i.n - 1)) if steps else None
+                last_idx = next(reversed(traj)) if traj else (_agent_order(mas_i)[-1] if steps else None)
                 state_text = render_state_text(
                     mas_i,
                     q,
@@ -630,31 +625,34 @@ def render_state_text(
     """
     if view == "full":
         parts = [question]
-        for j in range(mas.n):
-            if j in trajectory and trajectory[j]:
-                parts.append(trajectory[j][0] + step_separator)
+        for agent_idx in _agent_order(mas):
+            if agent_idx in trajectory and trajectory[agent_idx]:
+                parts.append(trajectory[agent_idx][0] + step_separator)
             else:
                 break
         return "".join(parts)
 
     if view == "local":
+        order = _agent_order(mas)
+        position = _agent_position(mas)
         if agent_idx is None:
-            decided = [j for j in range(mas.n) if j in trajectory and trajectory[j]]
+            decided = [idx for idx in order if idx in trajectory and trajectory[idx]]
             if not decided:
                 return question + step_separator
             agent_idx = decided[-1]
 
         # Replay ONLY the decisions upstream of agent_idx so its inbox reflects
         # what this agent actually received in the routed DAG.
-        prior = {j: trajectory[j] for j in trajectory if j < agent_idx and trajectory[j]}
+        cutoff = position[agent_idx]
+        prior = {
+            idx: trajectory[idx]
+            for idx in order[:cutoff]
+            if idx in trajectory and trajectory[idx]
+        }
         inbox, _, _ = _replay_trajectory(mas, question, prior)
 
-        ordered_parents = sorted(set(mas.parents.get(agent_idx, [])))
-        have = inbox.get(agent_idx, {})
-        inputs = [have[p] for p in ordered_parents if p in have]
-
         parts: List[str] = []
-        user_content = "\n\n".join(inputs).strip()
+        user_content = mas.agent_user_content(agent_idx, inbox)
         if user_content:
             parts.append(user_content + step_separator)
         if agent_idx in trajectory and trajectory[agent_idx]:
@@ -729,12 +727,12 @@ class MCTSInfer:
         self.logprob_agg = (logprob_agg or "sum").lower()
         self.view_mode = (view_mode or "full").lower()
 
-        self.required_parents = {i: set(self.mas.parents.get(i, [])) for i in range(self.mas.n)}
-        self.parent_order = {i: sorted(self.required_parents[i]) for i in range(self.mas.n)}
-        self.sys_prompts = [
-            getattr(self.mas.agents[i], "system_prompt", "You are a helpful assistant.")
-            for i in range(self.mas.n)
-        ]
+        self.order = _agent_order(self.mas)
+        self.required_parents = getattr(
+            self.mas,
+            "required_parents",
+            {i: set(self.mas.parents.get(i, [])) for i in range(self.mas.n)},
+        )
         self.root = _Node()
         self.usage = TokenStats()
 
@@ -742,7 +740,7 @@ class MCTSInfer:
         return len(node.traj)
 
     def _terminal(self, node: _Node) -> bool:
-        return self._depth(node) >= self.mas.n
+        return self._depth(node) >= len(self.order)
 
     def _uct(self, parent: _Node, child: _Node) -> float:
         Np = max(parent.visits + 1, 1)
@@ -766,17 +764,13 @@ class MCTSInfer:
 
     def _expand(self, node: _Node) -> None:
         d = self._depth(node)
-        if d >= self.mas.n:
+        if d >= len(self.order):
             return
 
+        agent_idx = self.order[d]
         inbox, _, _ = _replay_trajectory(self.mas, self.q, node.traj)
-        have = inbox.get(d, {})
-        inputs = [have[p] for p in self.parent_order[d] if p in have]
-        msgs = [
-            {"role": "system", "content": self.sys_prompts[d]},
-            {"role": "user", "content": "\n\n".join(inputs).strip()},
-        ]
-        enc = self.mas.agents[d].tok.apply_chat_template(
+        msgs = self.mas.agent_messages(agent_idx, inbox)
+        enc = self.mas.agents[agent_idx].tok.apply_chat_template(
             msgs, tokenize=True, add_generation_prompt=True
         )
         p_len = (
@@ -792,7 +786,12 @@ class MCTSInfer:
         )
 
         candidates = propose_agent_candidates(
-            self.mas, d, inbox, self.required_parents, n_candidates=self.max_children, **self.kw
+            self.mas,
+            agent_idx,
+            inbox,
+            self.required_parents,
+            n_candidates=self.max_children,
+            **self.kw,
         )
         # Deduplicate identical candidate actions (same text => same action).
         dedup = []
@@ -810,7 +809,7 @@ class MCTSInfer:
         self.usage.prompt += p_len
         for outs in candidates:
             if outs:
-                self.usage.generated += _text_token_len_agent(self.mas.agents[d], outs[0])
+                self.usage.generated += _text_token_len_agent(self.mas.agents[agent_idx], outs[0])
 
         vals: List[float] = []
         child_trajs: List[Dict[int, List[str]]] = []
@@ -818,12 +817,12 @@ class MCTSInfer:
 
         # Compute values for each candidate
         for outs in candidates:
-            traj2 = {**node.traj, d: outs}
+            traj2 = {**node.traj, agent_idx: outs}
             child_trajs.append(traj2)
             child_texts.append(outs[0] if outs else "")
 
             if self.score_type == "prm":
-                s_text = self._state_text(traj2, agent_idx=d)
+                s_text = self._state_text(traj2, agent_idx=agent_idx)
                 v = 0.0 if self.score_fn is None else float(self.score_fn(s_text))
 
                 if self.score_fn is not None:
@@ -833,7 +832,7 @@ class MCTSInfer:
 
             elif self.score_type == "logprob":
                 v_lp, _, g_len = compute_logprob_and_token_counts(
-                    self.mas.agents[d], None, outs[0], prompt_ids=enc
+                    self.mas.agents[agent_idx], None, outs[0], prompt_ids=enc
                 )
                 self.usage.scorer += p_len + g_len
                 if self.logprob_agg in ("avg_token", "avg", "mean_token"):
@@ -849,14 +848,14 @@ class MCTSInfer:
         # 2) compute priors for PUCT (softmax over v_init); safe even if UCT
         priors = [1.0 / len(candidates)] * len(candidates) if candidates else []
         if self.uct_type == "puct" and candidates:
-            can_logprob = getattr(self.mas.agents[d], "model", None) is not None
+            can_logprob = getattr(self.mas.agents[agent_idx], "model", None) is not None
             if can_logprob:
                 try:
                     logpriors = []
                     for outs in candidates:
                         text = outs[0] if outs else ""
                         lp, sp, sg = compute_logprob_and_token_counts(
-                            self.mas.agents[d], None, text, prompt_ids=enc
+                            self.mas.agents[agent_idx], None, text, prompt_ids=enc
                         )
                         self.usage.scorer += sp + sg
                         logpriors.append(lp / max(1, sg))
@@ -904,7 +903,7 @@ class MCTSInfer:
             v_leaf = path[-1].v_init  # cached score for this node
 
         elif leaf_type == "logprob":
-            steps = [leaf_traj[i][0] for i in range(len(leaf_traj)) if leaf_traj.get(i)]
+            steps = [leaf_traj[agent_idx][0] for agent_idx in self.order if leaf_traj.get(agent_idx)]
             v_leaf, u = score_path_logprob(self.mas, self.q, steps, agg=self.logprob_agg)
             self.usage.add(u)
 

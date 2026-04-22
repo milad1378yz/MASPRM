@@ -1,9 +1,9 @@
-import torch
-import requests
 from typing import Optional
-from transformers import AutoModelForCausalLM, AutoTokenizer
 
+import requests
+import torch
 from openai import OpenAI
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 class Agent:
@@ -34,185 +34,129 @@ class Agent:
         self.temperature = temperature
         self.top_p = top_p
 
-        # --- OpenAI Setup ---
         self.use_openai = use_openai
-        self.openai_model = openai_model
-        if use_openai:
-            if openai_client is not None:
-                self.client = openai_client
-            else:
-                self.client = OpenAI(api_key=openai_api_key, base_url=openai_base_url)
-        else:
-            self.client = None
-
-        # --- RunPod Setup ---
         self.use_runpod = use_runpod
+        self.openai_model = openai_model
         self.runpod_base_url = openai_base_url
         self.runpod_api_key = openai_api_key
         self.runpod_model = openai_model
 
-    # ========= LOCAL (transformers) BACKEND ========= #
+        if use_openai and openai_client is None:
+            openai_client = OpenAI(api_key=openai_api_key, base_url=openai_base_url)
+        self.client = openai_client if use_openai else None
+
+    def format_messages(self, user_content: str):
+        return [
+            {"role": "system", "content": self.system_prompt},
+            {"role": "user", "content": user_content},
+        ]
+
+    def _generation_kwargs(self, **gen_kwargs):
+        return {
+            "temperature": gen_kwargs.get("temperature", self.temperature),
+            "top_p": gen_kwargs.get("top_p", self.top_p),
+            "max_new_tokens": gen_kwargs.get("max_new_tokens", self.max_new_tokens),
+        }
+
+    def _normalize_messages(self, msgs):
+        if not msgs:
+            return [{"role": "system", "content": self.system_prompt}]
+        if msgs[0].get("role") != "system":
+            return [{"role": "system", "content": self.system_prompt}] + msgs
+        return msgs
 
     def _to_inputs(self, msgs):
         enc = self.tok.apply_chat_template(msgs, tokenize=True, add_generation_prompt=True)
 
-        if isinstance(enc, list):  # list[int]
+        if isinstance(enc, list):
             return self.tok.pad({"input_ids": [enc]}, return_tensors="pt")
 
-        if isinstance(enc, torch.Tensor):  # 1D or 2D tensor of ids
+        if isinstance(enc, torch.Tensor):
             if enc.dim() == 1:
-                enc = enc.unsqueeze(0)  # [1, L]
-            attn = torch.ones_like(enc)
-            return {"input_ids": enc, "attention_mask": attn}
+                enc = enc.unsqueeze(0)
+            return {"input_ids": enc, "attention_mask": torch.ones_like(enc)}
 
-        # Fallback: build string and tokenize normally (slower but safe)
-        s = self.tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
-        return self.tok(s, return_tensors="pt", add_special_tokens=False)
+        rendered = self.tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+        return self.tok(rendered, return_tensors="pt", add_special_tokens=False)
 
     @torch.inference_mode()
-    def _generate_local(self, msgs, **gen_kwargs) -> str:
+    def _generate_local_n(self, msgs, n: int, **gen_kwargs):
+        params = self._generation_kwargs(**gen_kwargs)
         inputs = self._to_inputs(msgs)
         inputs = {k: v.to(self.model.device, non_blocking=True) for k, v in inputs.items()}
 
         out = self.model.generate(
             **inputs,
             do_sample=True,
-            top_p=gen_kwargs.get("top_p", self.top_p),
-            temperature=gen_kwargs.get("temperature", self.temperature),
-            max_new_tokens=gen_kwargs.get("max_new_tokens", self.max_new_tokens),
-            use_cache=True,
-            pad_token_id=self.tok.eos_token_id,
-        )
-        prompt_len = inputs["input_ids"].shape[1]
-        text = self.tok.decode(out[0, prompt_len:], skip_special_tokens=True)
-        return text.strip()
-
-    @torch.inference_mode()
-    def _generate_n_local(self, msgs, n: int, **gen_kwargs):
-        inputs = self._to_inputs(msgs)
-        inputs = {k: v.to(self.model.device, non_blocking=True) for k, v in inputs.items()}
-
-        out = self.model.generate(
-            **inputs,
-            do_sample=True,
-            top_p=gen_kwargs.get("top_p", self.top_p),
-            temperature=gen_kwargs.get("temperature", self.temperature),
+            top_p=params["top_p"],
+            temperature=params["temperature"],
             num_return_sequences=n,
-            max_new_tokens=gen_kwargs.get("max_new_tokens", self.max_new_tokens),
+            max_new_tokens=params["max_new_tokens"],
             use_cache=True,
             pad_token_id=self.tok.eos_token_id,
         )
         prompt_len = inputs["input_ids"].shape[1]
         texts = self.tok.batch_decode(out[:, prompt_len:], skip_special_tokens=True)
-        return [t.strip() for t in texts]
+        return [text.strip() for text in texts]
 
-    # ========= OPENAI BACKEND ========= #
+    def _generate_openai_n(self, msgs, n: int, **gen_kwargs):
+        params = self._generation_kwargs(**gen_kwargs)
+        messages = self._normalize_messages(msgs)
 
-    def _openai_messages(self, msgs):
-        """
-        Ensure we always send a system message + user/assistant msgs
-        in OpenAI's format: [{"role": "...", "content": "..."}].
-        """
-        if not msgs:
-            return [{"role": "system", "content": self.system_prompt}]
-
-        # If user didn't explicitly provide a system msg, prepend one
-        if msgs[0].get("role") != "system":
-            msgs = [{"role": "system", "content": self.system_prompt}] + msgs
-        return msgs
-
-    def _generate_openai(self, msgs, **gen_kwargs) -> str:
-        messages = self._openai_messages(msgs)
-
-        resp = self.client.chat.completions.create(
-            model=self.openai_model,
-            messages=messages,
-            temperature=gen_kwargs.get("temperature", self.temperature),
-            top_p=gen_kwargs.get("top_p", self.top_p),
-            max_tokens=gen_kwargs.get("max_new_tokens", self.max_new_tokens),
-            n=1,
-        )
-        return resp.choices[0].message.content.strip()
-
-    def _generate_n_openai(self, msgs, n: int, **gen_kwargs):
-        messages = self._openai_messages(msgs)
         try:
             resp = self.client.chat.completions.create(
                 model=self.openai_model,
                 messages=messages,
-                temperature=gen_kwargs.get("temperature", self.temperature),
-                top_p=gen_kwargs.get("top_p", self.top_p),
-                max_tokens=gen_kwargs.get("max_new_tokens", self.max_new_tokens),
+                temperature=params["temperature"],
+                top_p=params["top_p"],
+                max_tokens=params["max_new_tokens"],
                 n=n,
             )
-            return [c.message.content.strip() for c in resp.choices]
+            return [choice.message.content.strip() for choice in resp.choices]
         except Exception:
-            return [self._generate_openai(msgs, **gen_kwargs) for _ in range(n)]
+            if n <= 1:
+                raise
+            return [self._generate_openai_n(msgs, 1, **gen_kwargs)[0] for _ in range(n)]
 
-    # ========= RUNPOD BACKEND (New) ========= #
-
-    def _generate_runpod(self, msgs, **gen_kwargs) -> str:
-
-        url = self.runpod_base_url
+    def _generate_runpod_once(self, msgs, **gen_kwargs) -> str:
+        params = self._generation_kwargs(**gen_kwargs)
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.runpod_api_key}",
         }
-
-        # Reuse helper to format messages correctly
-        messages = self._openai_messages(msgs)
-
         data = {
             "input": {
                 "openai_route": "/v1/chat/completions",
                 "openai_input": {
                     "model": self.runpod_model,
-                    "messages": messages,
-                    "max_tokens": gen_kwargs.get("max_new_tokens", self.max_new_tokens),
-                    "temperature": gen_kwargs.get("temperature", self.temperature),
-                    "top_p": gen_kwargs.get("top_p", self.top_p),
+                    "messages": self._normalize_messages(msgs),
+                    "max_tokens": params["max_new_tokens"],
+                    "temperature": params["temperature"],
+                    "top_p": params["top_p"],
                 },
             }
         }
 
         try:
-            response = requests.post(url, headers=headers, json=data)
+            response = requests.post(self.runpod_base_url, headers=headers, json=data)
             response.raise_for_status()
             result = response.json()
-
-            # RunPod 'runsync' usually wraps the result in 'output'
-            # Since we hit /v1/chat/completions, 'output' should mimic OpenAI response
             output = result.get("output", {})
             return output[0]["choices"][0]["message"]["content"].strip()
-
         except requests.exceptions.RequestException as e:
             return f"RunPod Error: {e}"
         except (KeyError, IndexError) as e:
             return f"RunPod Parse Error: {e} - Raw: {result}"
 
-    def _generate_n_runpod(self, msgs, n: int, **gen_kwargs):
-        # RunPod sync usually returns one response per request.
-        # We loop here to ensure stability.
-        return [self._generate_runpod(msgs, **gen_kwargs) for _ in range(n)]
-
-    # ========= PUBLIC API ========= #
+    def _generate_runpod_n(self, msgs, n: int, **gen_kwargs):
+        return [self._generate_runpod_once(msgs, **gen_kwargs) for _ in range(n)]
 
     def generate(self, msgs, **gen_kwargs) -> str:
-        """
-        Public method: same signature as before.
-        Routes to local HF model (default) or OpenAI depending on `use_openai`.
-        """
-        if self.use_openai:
-            return self._generate_openai(msgs, **gen_kwargs)
-        elif self.use_runpod:
-            return self._generate_runpod(msgs, **gen_kwargs)
-        else:
-            return self._generate_local(msgs, **gen_kwargs)
+        return self.generate_n(msgs, n=1, **gen_kwargs)[0]
 
     def generate_n(self, msgs, n: int, **gen_kwargs):
         if self.use_openai:
-            return self._generate_n_openai(msgs, n, **gen_kwargs)
-        elif self.use_runpod:
-            return self._generate_n_runpod(msgs, n, **gen_kwargs)
-        else:
-            return self._generate_n_local(msgs, n, **gen_kwargs)
+            return self._generate_openai_n(msgs, n, **gen_kwargs)
+        if self.use_runpod:
+            return self._generate_runpod_n(msgs, n, **gen_kwargs)
+        return self._generate_local_n(msgs, n, **gen_kwargs)

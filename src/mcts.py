@@ -7,13 +7,6 @@ from answer_utils import is_correct
 from mas import MAS
 from tqdm import tqdm
 
-
-def _normalize_to_list(out: Any) -> List[str]:
-    if isinstance(out, list):
-        return [str(x) for x in out]
-    return [str(out)]
-
-
 def propose_agent_candidates(
     mas: MAS,
     agent_idx: int,
@@ -26,32 +19,8 @@ def propose_agent_candidates(
     Sample multiple candidate outputs for agent `agent_idx` given current inbox.
     Returns a list of candidates, where each candidate = List[str] (one per child or broadcast).
     """
-    have = inbox.get(agent_idx, {})
-    ordered_parents = sorted(required_parents[agent_idx])
-    inputs = [have[p] for p in ordered_parents if p in have]
-
-    # Build chat messages (mirror MAS.step)
-    sys_prompt = getattr(mas.agents[agent_idx], "system_prompt", "You are a helpful assistant.")
-    content = "\n\n".join(inputs).strip()
-    msgs = [
-        {"role": "system", "content": sys_prompt},
-        {"role": "user", "content": content},
-    ]
-
-    agent = mas.agents[agent_idx]
-
-    # If Agent supports generate_n, use it; else call generate repeatedly.
-    outs_list: List[Any]
-    if hasattr(agent, "generate_n"):
-        outs_list = agent.generate_n(msgs, n=n_candidates, **gen_kwargs)
-    else:
-        outs_list = [agent.generate(msgs, **gen_kwargs) for _ in range(n_candidates)]
-
-    # Normalize each into List[str]
-    normd: List[List[str]] = []
-    for out in outs_list:
-        normd.append(_normalize_to_list(out))
-    return normd
+    _ = required_parents
+    return mas.sample_candidates(agent_idx, inbox, n_candidates=n_candidates, **gen_kwargs)
 
 
 def _replay_trajectory(mas: MAS, query: str, trajectory: Dict[int, List[str]]):
@@ -116,20 +85,12 @@ class MAS_MCTS:
         self.c = c
         self.n_candidates = n_candidates
         self.gen_kwargs = gen_kwargs or {}
+        self.order = list(self.mas.agent_order)
 
         # Precompute required parents per agent (includes -1 if present)
         self.required_parents: Dict[int, Set[int]] = {
             i: set(self.mas.parents.get(i, [])) for i in range(self.mas.n)
         }
-
-        # (Optional) sanity check: all agent parents must be subset of {INPUT} ∪ {previous agents}
-        for j in range(self.mas.n):
-            invalid = [p for p in self.required_parents[j] if p not in {-1} and p >= j]
-            if invalid:
-                raise ValueError(
-                    f"Agent {j} has forward/invalid parents {invalid}. "
-                    "Ensure edges are topologically ordered (no future parents)."
-                )
 
         self.root = Node(steps=[], trajectory={}, node_text=self.question)
 
@@ -138,7 +99,7 @@ class MAS_MCTS:
         return len(node.trajectory)
 
     def _is_terminal(self, node: Node) -> bool:
-        return self._depth_of(node) >= self.mas.n
+        return self._depth_of(node) >= len(self.order)
 
     def search(
         self,
@@ -195,7 +156,7 @@ class MAS_MCTS:
             # Expand if no children
             if not node.children:
                 depth = self._depth_of(node)  # which agent to decide
-                agent_idx = depth  # 0-based
+                agent_idx = self.order[depth]
                 # Recompute inbox given all earlier agent choices
                 inbox, _, _ = _replay_trajectory(self.mas, self.question, node.trajectory)
 
@@ -213,7 +174,7 @@ class MAS_MCTS:
                 # Propose multiple candidates for this agent
                 n_cand = (
                     self.n_candidates
-                    if agent_idx < (self.mas.n - 1)
+                    if depth < (len(self.order) - 1)
                     else max(1, self.n_candidates // 2)
                 )
                 candidates = propose_agent_candidates(
@@ -237,7 +198,7 @@ class MAS_MCTS:
                     )
 
                     # If this child already completed all agents, make it terminal now
-                    if self._depth_of(child) >= self.mas.n:
+                    if self._depth_of(child) >= len(self.order):
                         inbox2, primary_out2, last2 = _replay_trajectory(
                             self.mas, self.question, child.trajectory
                         )
