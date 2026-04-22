@@ -34,10 +34,6 @@ def main():
     )
     parser.add_argument("--prm_base_model_id", default="Qwen/Qwen2.5-1.5B-Instruct")
     parser.add_argument("--gen_model_id", default="Qwen/Qwen2.5-1.5B-Instruct")
-    parser.add_argument("--use_openai", action="store_true", help="Use OpenAI API for generation")
-
-    parser.add_argument("--openai_base_url", type=str, default="https://router.huggingface.co/v1")
-    parser.add_argument("--openai_api_key", type=str, default=None)
     parser.add_argument(
         "--orm_dir",
         default="checkpoints/Qwen2.5-1.5B-1.5B-ORM-qlora-512-mmlu",
@@ -84,9 +80,6 @@ def main():
         orm_dir=ORM_DIR,
         dtype="float16",
         seed=SEED,
-        use_openai=args.use_openai,
-        openai_base_url=args.openai_base_url,
-        openai_api_key=args.openai_api_key,
     )
 
     # Conditions (descriptive, no closures)
@@ -137,36 +130,35 @@ def main():
         # ),
     ]
 
-    if not args.use_openai:
-        conditions.append(
-            ConditionSpec(
-                "SBS + logprob (avg-token, B1=3, B2=5)",
-                "sbs_logprob",
-                {"B1": 3, "B2": 5, "gen_kwargs": sbs_fast, "logprob_agg": "avg_token"},
-            )
+    conditions.append(
+        ConditionSpec(
+            "SBS + logprob (avg-token, B1=3, B2=5)",
+            "sbs_logprob",
+            {"B1": 3, "B2": 5, "gen_kwargs": sbs_fast, "logprob_agg": "avg_token"},
         )
+    )
 
-        conditions.append(
-            ConditionSpec(
-                "MCTS + logprob (avg-token, N=10, 3 children)",
-                "mcts_logprob",
-                {
-                    "n_simulations": 10,
-                    "max_children": 3,
-                    "c_uct": 2.0,
-                    "mcts_kwargs": mcts_kws,
-                    "logprob_agg": "avg_token",
-                },
-            )
+    conditions.append(
+        ConditionSpec(
+            "MCTS + logprob (avg-token, N=10, 3 children)",
+            "mcts_logprob",
+            {
+                "n_simulations": 10,
+                "max_children": 3,
+                "c_uct": 2.0,
+                "mcts_kwargs": mcts_kws,
+                "logprob_agg": "avg_token",
+            },
         )
+    )
 
-        conditions.append(
-            ConditionSpec(
-                "Greedy + Voter (score-weighted, logprob avg-token)",
-                "voter_logprob",
-                {"k": 5, "gen_kwargs": sbs_fast, "logprob_agg": "avg_token"},
-            )
+    conditions.append(
+        ConditionSpec(
+            "Greedy + Voter (score-weighted, logprob avg-token)",
+            "voter_logprob",
+            {"k": 5, "gen_kwargs": sbs_fast, "logprob_agg": "avg_token"},
         )
+    )
 
     # conditions.append(
     #     ConditionSpec(

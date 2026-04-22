@@ -338,13 +338,6 @@ def build_mas_from_specs(
     tok,
     agent_specs: List[Dict[str, Any]],
     edges: List[List[int]],
-    *,
-    use_openai: bool = False,
-    openai_client=None,
-    openai_model: str = "gpt-4.1-mini",
-    openai_api_key: Optional[str] = None,
-    openai_base_url: Optional[str] = None,
-    use_runpod: bool = False,
 ) -> MAS:
     """
     Build a MAS from config-provided agent specs and edges.
@@ -360,12 +353,6 @@ def build_mas_from_specs(
                 tok,
                 system_prompt=spec.get("system_prompt", ""),
                 max_new_tokens=int(spec.get("max_new_tokens", 512)),
-                use_openai=use_openai,
-                openai_client=openai_client,
-                openai_model=openai_model,
-                openai_api_key=openai_api_key,
-                openai_base_url=openai_base_url,
-                use_runpod=use_runpod,
             )
         )
     return MAS(edges, agents)

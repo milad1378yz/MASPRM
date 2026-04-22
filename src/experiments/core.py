@@ -490,51 +490,19 @@ def make_scored_voter(
 # ===========================
 
 
-REMOTE_TOKENIZER_FALLBACK = "Qwen/Qwen2.5-1.5B-Instruct"
-
-
 @dataclass
 class Runtime:
-    model: Optional[Any]
+    model: Any
     tokenizer: AutoTokenizer
-    model_id: str
-    client: Optional[Any] = None
-    use_openai: bool = False
-    use_runpod: bool = False
-    openai_api_key: Optional[str] = None
-    openai_base_url: Optional[str] = None
 
     def build_mas(self, agent_specs: List[Dict[str, Any]], edges: List[List[int]]) -> MAS:
-        return build_mas_from_specs(
-            self.model,
-            self.tokenizer,
-            agent_specs,
-            edges,
-            use_openai=self.use_openai,
-            openai_client=self.client,
-            openai_model=self.model_id,
-            openai_api_key=self.openai_api_key,
-            openai_base_url=self.openai_base_url,
-            use_runpod=self.use_runpod,
-        )
+        return build_mas_from_specs(self.model, self.tokenizer, agent_specs, edges)
 
 
 def _ensure_pad_token(tokenizer: AutoTokenizer) -> AutoTokenizer:
     if tokenizer.pad_token is None and tokenizer.eos_token is not None:
         tokenizer.pad_token = tokenizer.eos_token
     return tokenizer
-
-
-def load_remote_tokenizer(
-    model_id: str,
-    fallback_model_id: str = REMOTE_TOKENIZER_FALLBACK,
-) -> AutoTokenizer:
-    tok = AutoTokenizer.from_pretrained(
-        model_id if "/" in model_id else fallback_model_id,
-        use_fast=True,
-        trust_remote_code=True,
-    )
-    return _ensure_pad_token(tok)
 
 
 def build_runtime(
@@ -546,41 +514,17 @@ def build_runtime(
     load_in_4bit: bool = False,
     attn_impl: str = "sdpa",
     compile_model: bool = False,
-    use_openai: bool = False,
-    use_runpod: bool = False,
-    openai_client=None,
-    openai_api_key: Optional[str] = None,
-    openai_base_url: Optional[str] = None,
 ) -> Runtime:
-    client = openai_client
-    if use_openai or use_runpod:
-        tok = _ensure_pad_token(tokenizer) if tokenizer is not None else load_remote_tokenizer(model_id)
-        if use_openai and client is None:
-            from openai import OpenAI
-
-            client = OpenAI(api_key=openai_api_key, base_url=openai_base_url)
-        model = None
-    else:
-        model, tok = load_generation_model(
-            model_id,
-            tokenizer=tokenizer,
-            torch_dtype=torch_dtype,
-            device_map=device_map,
-            load_in_4bit=load_in_4bit,
-            attn_impl=attn_impl,
-            compile_model=compile_model,
-        )
-
-    return Runtime(
-        model=model,
-        tokenizer=tok,
-        model_id=model_id,
-        client=client,
-        use_openai=use_openai,
-        use_runpod=use_runpod,
-        openai_api_key=openai_api_key,
-        openai_base_url=openai_base_url,
+    model, tok = load_generation_model(
+        model_id,
+        tokenizer=tokenizer,
+        torch_dtype=torch_dtype,
+        device_map=device_map,
+        load_in_4bit=load_in_4bit,
+        attn_impl=attn_impl,
+        compile_model=compile_model,
     )
+    return Runtime(model=model, tokenizer=tok)
 
 
 def load_prm_scorer(

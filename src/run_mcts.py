@@ -118,9 +118,6 @@ class RayWorker:
         compile_model: bool,
         agent_specs: List[Dict[str, Any]],
         edges: List[List[int]],
-        use_openai: bool = False,
-        openai_api_key: str = None,
-        openai_base_url: str = None,
     ):
         # Silence worker-side tqdm and noisy logs so only the driver bar is shown.
         os.environ["TQDM_DISABLE"] = "1"  # disable all tqdm in this process
@@ -134,9 +131,6 @@ class RayWorker:
             load_in_4bit=load_in_4bit,
             attn_impl=attn_impl,
             compile_model=compile_model,
-            use_openai=use_openai,
-            openai_api_key=openai_api_key,
-            openai_base_url=openai_base_url,
         )
         self.mas = runtime.build_mas(agent_specs, edges)
 
@@ -210,10 +204,6 @@ def main():
     ap.add_argument("--attn_impl", type=str, default="sdpa")
     ap.add_argument("--no_compile", action="store_true", help="Disable torch.compile().")
 
-    ap.add_argument("--use_openai", action="store_true", help="Use OpenAI API for generation")
-    ap.add_argument("--openai_base_url", type=str, default="https://router.huggingface.co/v1")
-    ap.add_argument("--openai_api_key", type=str, default=None)
-
     ap.add_argument("--n_rollouts", type=int, default=64)
 
     # Ray parallelism flags (optional)
@@ -269,7 +259,7 @@ def main():
 
         # Build actors; inside, each actor loads its *own* model and MAS
         workers = [
-            RayWorker.options(num_gpus=args.gpus_per_actor if not args.use_openai else 0).remote(
+            RayWorker.options(num_gpus=args.gpus_per_actor).remote(
                 args.model_id,
                 device_map="cuda",
                 load_in_4bit=args.load_in_4bit,
@@ -277,10 +267,6 @@ def main():
                 compile_model=not args.no_compile,
                 agent_specs=agent_specs,
                 edges=edges,
-                # Pass new args
-                use_openai=args.use_openai,
-                openai_api_key=args.openai_api_key,
-                openai_base_url=args.openai_base_url,
             )
             for _ in range(num_actors)
         ]
@@ -349,9 +335,6 @@ def main():
         load_in_4bit=args.load_in_4bit,
         attn_impl=args.attn_impl,
         compile_model=not args.no_compile,
-        use_openai=args.use_openai,
-        openai_api_key=args.openai_api_key,
-        openai_base_url=args.openai_base_url,
     )
     print("Building MAS...")
     mas = runtime.build_mas(agent_specs, edges)

@@ -54,11 +54,6 @@ class WorkerInit:
     prm_base_model_id: Optional[str] = None
     orm_dir: Optional[str] = None
 
-    # OpenAI config
-    use_openai: bool = False
-    openai_api_key: Optional[str] = None
-    openai_base_url: Optional[str] = None
-
     # dtype options: "float16" | "bfloat16" | "float32"
     dtype: str = "float16"
     seed: int = 0
@@ -167,9 +162,6 @@ def evaluate_conditions_ray(
                 init.gen_model_id,
                 tokenizer=self.prm_tok,
                 torch_dtype=self.dtype,
-                use_openai=init.use_openai,
-                openai_api_key=init.openai_api_key,
-                openai_base_url=init.openai_base_url,
             )
 
             # 4) ORM scorer (optional) — same API as PRM loader
