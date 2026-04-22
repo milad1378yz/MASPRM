@@ -1,6 +1,7 @@
 import os
 import re
 import argparse
+import hashlib
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 
@@ -387,6 +388,11 @@ def _join_steps(prompt: str, steps: List[str], sep: str) -> str:
         if s:
             text += s + " " + sep + " "
     return text
+
+
+def _cache_key(*parts: Any) -> str:
+    payload = "||".join(str(p) for p in parts)
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
 
 
 def _expand_ppm_pairs(base: Dataset, sep: str) -> Dataset:
@@ -784,13 +790,35 @@ def main():
         base = Path(args.output_dir) / "map_cache"
         base.mkdir(parents=True, exist_ok=True)
 
+        train_cache_key = _cache_key(
+            args.data_dir.resolve(),
+            args.seed,
+            args.step_separator,
+            args.max_length,
+            len(tokenizer),
+            getattr(train_dataset, "_fingerprint", "train"),
+        )
+        eval_cache_key = _cache_key(
+            args.data_dir.resolve(),
+            args.seed,
+            args.step_separator,
+            args.max_length,
+            len(tokenizer),
+            getattr(eval_dataset, "_fingerprint", "eval"),
+        )
         train_cache = (
             base
-            / f"ppm_tok_{tokenizer.name_or_path.replace('/','-')}_L{args.max_length}_train.arrow"
+            / (
+                f"ppm_tok_{tokenizer.name_or_path.replace('/','-')}"
+                f"_L{args.max_length}_{train_cache_key}_train.arrow"
+            )
         )
         eval_cache = (
             base
-            / f"ppm_tok_{tokenizer.name_or_path.replace('/','-')}_L{args.max_length}_eval.arrow"
+            / (
+                f"ppm_tok_{tokenizer.name_or_path.replace('/','-')}"
+                f"_L{args.max_length}_{eval_cache_key}_eval.arrow"
+            )
         )
 
         train_dataset = train_dataset.map(

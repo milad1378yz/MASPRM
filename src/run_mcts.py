@@ -30,6 +30,32 @@ os.environ.setdefault(
 )
 
 
+def _tag_value(value: Any) -> str:
+    if isinstance(value, float):
+        value = f"{value:g}"
+    return str(value).replace("/", "_").replace(".", "p")
+
+
+def _result_path(
+    dataset: str,
+    split: str,
+    model_id: str,
+    n_rollouts: int,
+    c: float,
+    n_candidates: int,
+    gen_kwargs: Dict[str, Any],
+) -> Path:
+    model_tag = model_id.replace("/", "_")
+    return Path("results") / (
+        f"{dataset}_res_{split}_{model_tag}"
+        f"_r{n_rollouts}"
+        f"_c{_tag_value(c)}"
+        f"_cand{n_candidates}"
+        f"_t{_tag_value(gen_kwargs.get('temperature', 'na'))}"
+        f"_p{_tag_value(gen_kwargs.get('top_p', 'na'))}"
+    )
+
+
 def node_to_dict(node: Node, max_children: int = 8) -> Dict[str, Any]:
     return {
         "steps": node.steps,
@@ -233,14 +259,28 @@ def main():
     agent_specs = cfg["agents"]
     edges = cfg["edges"]
 
-    result_path = f"results/{args.dataset}_res_{args.split}_{args.model_id.replace('/', '_')}"
+    if args.ray:
+        search_c = 8.0
+    else:
+        search_c = 4.0
+    search_n_candidates = 4
+    search_gen_kwargs = dict(temperature=0.7, top_p=0.95)
+    result_path = _result_path(
+        args.dataset,
+        args.split,
+        args.model_id,
+        args.n_rollouts,
+        search_c,
+        search_n_candidates,
+        search_gen_kwargs,
+    )
 
     #  Optional Ray path
     if args.ray:
         # Prepare pending jobs (skip already-finished)
         jobs = []
         for i, ex in enumerate(data):
-            if Path(f"{result_path}/{i}.json").exists():
+            if (result_path / f"{i}.json").exists():
                 tqdm.write(f"Skipping existing example {i}")
                 continue
             q, g = q_fn(ex), gold_fn(ex)
@@ -272,11 +312,6 @@ def main():
             for _ in range(num_actors)
         ]
 
-        # Common run settings
-        c = 8.0
-        n_candidates = 4
-        gen_kwargs = dict(temperature=0.7, top_p=0.95)
-
         # Dispatch round-robin to actors
         futures = []
         for j, (i, q, g) in enumerate(jobs):
@@ -286,9 +321,9 @@ def main():
                     i,
                     q,
                     g,
-                    c,
-                    n_candidates,
-                    gen_kwargs,
+                    search_c,
+                    search_n_candidates,
+                    search_gen_kwargs,
                     args.n_rollouts,
                     result_path,
                     args.verbose,
@@ -342,7 +377,7 @@ def main():
 
     print("Running MAS-MCTS...")
 
-    remaining_idxs = [i for i in range(len(data)) if not Path(f"{result_path}/{i}.json").exists()]
+    remaining_idxs = [i for i in range(len(data)) if not (result_path / f"{i}.json").exists()]
     pbar_sp = tqdm(
         total=len(remaining_idxs),
         desc="All data (single proc)",
@@ -351,7 +386,9 @@ def main():
         leave=False,
     )
     for i, ex in enumerate(data):
-        if Path(f"{result_path}/{i}.json").exists():
+        json_path = result_path / f"{i}.json"
+        png_path = result_path / f"{i}.png"
+        if json_path.exists():
             with pbar_sp.external_write_mode():
                 print(f"Skipping existing example {i}")
             continue
@@ -362,9 +399,9 @@ def main():
             mas=mas,
             question=question,
             ground_truth_answer=ground_truth_answer,
-            c=4.0,
-            n_candidates=4,
-            gen_kwargs=dict(temperature=0.7, top_p=0.95),
+            c=search_c,
+            n_candidates=search_n_candidates,
+            gen_kwargs=search_gen_kwargs,
         )
 
         root = mcts.search(n_rollouts=args.n_rollouts)
@@ -376,12 +413,12 @@ def main():
 
         os.makedirs(result_path, exist_ok=True)
         json_data = node_to_dict(root)
-        pathlib.Path(f"{result_path}/{i}.json").write_text(json.dumps(json_data, indent=2))
+        pathlib.Path(json_path).write_text(json.dumps(json_data, indent=2))
         G = build_graph(json_data, max_depth=6, max_children=4)
-        draw_tree(G, f"{result_path}/{i}.png", dpi=400, font_size=9)
+        draw_tree(G, png_path, dpi=400, font_size=9)
         if args.verbose:
             with pbar_sp.external_write_mode():
-                print("Saved: ", f"{result_path}/{i}.json")
+                print("Saved: ", json_path)
                 print("-" * 100)
                 print_top_rollouts(root, ground_truth_answer, k=3)
 
