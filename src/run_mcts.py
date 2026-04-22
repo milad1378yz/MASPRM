@@ -8,15 +8,13 @@ import pathlib
 import warnings
 
 import torch
-from transformers import AutoTokenizer
 from transformers.utils import logging as hf_logging
 import yaml
 
 from answer_utils import is_correct
-from mas import build_mas_from_specs
 from mcts import Node, MAS_MCTS
 from dataset_handler import load_hard_dataset
-from experiments.core import load_generation_model
+from experiments.core import build_runtime
 from show_tree import build_graph, draw_tree
 
 import ray
@@ -130,41 +128,17 @@ class RayWorker:
         hf_logging.set_verbosity_error()
         warnings.filterwarnings("ignore", module=".*transformers.*")
 
-        self.use_openai = use_openai
-        if self.use_openai:
-            from openai import OpenAI
-
-            self.client = OpenAI(api_key=openai_api_key, base_url=openai_base_url)
-            self.openai_model = model_id
-
-            # Load tokenizer only for Agent compatibility (optional, but good for safety)
-            self.tok = AutoTokenizer.from_pretrained(
-                model_id if "/" in model_id else "Qwen/Qwen2.5-1.5B-Instruct",
-                use_fast=True,
-                trust_remote_code=True,
-            )
-
-            self.mdl = None
-        else:
-            self.client = None
-            self.mdl, self.tok = load_generation_model(
-                model_id,
-                device_map=device_map,
-                load_in_4bit=load_in_4bit,
-                attn_impl=attn_impl,
-                compile_model=compile_model,
-            )
-
-        # Build MAS once with shared config
-        self.mas = build_mas_from_specs(
-            self.mdl,
-            self.tok,
-            agent_specs,
-            edges,
-            use_openai=self.use_openai,
-            openai_client=self.client,
-            openai_model=model_id,
+        runtime = build_runtime(
+            model_id,
+            device_map=device_map,
+            load_in_4bit=load_in_4bit,
+            attn_impl=attn_impl,
+            compile_model=compile_model,
+            use_openai=use_openai,
+            openai_api_key=openai_api_key,
+            openai_base_url=openai_base_url,
         )
+        self.mas = runtime.build_mas(agent_specs, edges)
 
     def run_one(
         self,
@@ -369,34 +343,18 @@ def main():
 
     #  Single-process path
     print("Loading model...")
-    if args.use_openai:
-        from openai import OpenAI
-
-        client = OpenAI(api_key=args.openai_api_key, base_url=args.openai_base_url)
-        tok = AutoTokenizer.from_pretrained(
-            "Qwen/Qwen2.5-1.5B-Instruct", use_fast=True, trust_remote_code=True
-        )
-        mdl = None
-        print("Building MAS...")
-        mas = build_mas_from_specs(
-            mdl,
-            tok,
-            agent_specs,
-            edges,
-            use_openai=True,
-            openai_client=client,
-            openai_model=args.model_id,
-        )
-    else:
-        mdl, tok = load_generation_model(
-            args.model_id,
-            device_map=args.device_map,
-            load_in_4bit=args.load_in_4bit,
-            attn_impl=args.attn_impl,
-            compile_model=not args.no_compile,
-        )
-        print("Building MAS...")
-        mas = build_mas_from_specs(mdl, tok, agent_specs, edges)
+    runtime = build_runtime(
+        args.model_id,
+        device_map=args.device_map,
+        load_in_4bit=args.load_in_4bit,
+        attn_impl=args.attn_impl,
+        compile_model=not args.no_compile,
+        use_openai=args.use_openai,
+        openai_api_key=args.openai_api_key,
+        openai_base_url=args.openai_base_url,
+    )
+    print("Building MAS...")
+    mas = runtime.build_mas(agent_specs, edges)
 
     print("Running MAS-MCTS...")
 

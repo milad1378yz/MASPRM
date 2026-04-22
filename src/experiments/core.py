@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional, Callable, Dict, List, Tuple, Any
 import os
 import random
@@ -13,8 +13,8 @@ from transformers import BitsAndBytesConfig
 from peft import PeftModel, PeftConfig
 
 from answer_utils import numbers_equal
-from mas import MAS
-from mcts import propose_agent_candidates, _replay_trajectory, _aggregate_final
+from mas import MAS, build_mas_from_specs
+from mcts import BaseMCTS, Node, propose_agent_candidates, _replay_trajectory, _aggregate_final
 from agent import Agent
 
 
@@ -490,6 +490,99 @@ def make_scored_voter(
 # ===========================
 
 
+REMOTE_TOKENIZER_FALLBACK = "Qwen/Qwen2.5-1.5B-Instruct"
+
+
+@dataclass
+class Runtime:
+    model: Optional[Any]
+    tokenizer: AutoTokenizer
+    model_id: str
+    client: Optional[Any] = None
+    use_openai: bool = False
+    use_runpod: bool = False
+    openai_api_key: Optional[str] = None
+    openai_base_url: Optional[str] = None
+
+    def build_mas(self, agent_specs: List[Dict[str, Any]], edges: List[List[int]]) -> MAS:
+        return build_mas_from_specs(
+            self.model,
+            self.tokenizer,
+            agent_specs,
+            edges,
+            use_openai=self.use_openai,
+            openai_client=self.client,
+            openai_model=self.model_id,
+            openai_api_key=self.openai_api_key,
+            openai_base_url=self.openai_base_url,
+            use_runpod=self.use_runpod,
+        )
+
+
+def _ensure_pad_token(tokenizer: AutoTokenizer) -> AutoTokenizer:
+    if tokenizer.pad_token is None and tokenizer.eos_token is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+    return tokenizer
+
+
+def load_remote_tokenizer(
+    model_id: str,
+    fallback_model_id: str = REMOTE_TOKENIZER_FALLBACK,
+) -> AutoTokenizer:
+    tok = AutoTokenizer.from_pretrained(
+        model_id if "/" in model_id else fallback_model_id,
+        use_fast=True,
+        trust_remote_code=True,
+    )
+    return _ensure_pad_token(tok)
+
+
+def build_runtime(
+    model_id: str,
+    *,
+    tokenizer: Optional[AutoTokenizer] = None,
+    torch_dtype: torch.dtype = torch.float16,
+    device_map: Optional[str] = "auto",
+    load_in_4bit: bool = False,
+    attn_impl: str = "sdpa",
+    compile_model: bool = False,
+    use_openai: bool = False,
+    use_runpod: bool = False,
+    openai_client=None,
+    openai_api_key: Optional[str] = None,
+    openai_base_url: Optional[str] = None,
+) -> Runtime:
+    client = openai_client
+    if use_openai or use_runpod:
+        tok = _ensure_pad_token(tokenizer) if tokenizer is not None else load_remote_tokenizer(model_id)
+        if use_openai and client is None:
+            from openai import OpenAI
+
+            client = OpenAI(api_key=openai_api_key, base_url=openai_base_url)
+        model = None
+    else:
+        model, tok = load_generation_model(
+            model_id,
+            tokenizer=tokenizer,
+            torch_dtype=torch_dtype,
+            device_map=device_map,
+            load_in_4bit=load_in_4bit,
+            attn_impl=attn_impl,
+            compile_model=compile_model,
+        )
+
+    return Runtime(
+        model=model,
+        tokenizer=tok,
+        model_id=model_id,
+        client=client,
+        use_openai=use_openai,
+        use_runpod=use_runpod,
+        openai_api_key=openai_api_key,
+        openai_base_url=openai_base_url,
+    )
+
+
 def load_prm_scorer(
     prm_dir: str,
     base_model_id: str = None,
@@ -509,9 +602,9 @@ def load_prm_scorer(
 
     # Tokenizer: prefer saved with adapter; else base
     tok_src = prm_dir if (Path(prm_dir) / "tokenizer.json").exists() else base_model_id
-    tok = AutoTokenizer.from_pretrained(tok_src, use_fast=True, trust_remote_code=True)
-    if tok.pad_token is None and tok.eos_token is not None:
-        tok.pad_token = tok.eos_token
+    tok = _ensure_pad_token(
+        AutoTokenizer.from_pretrained(tok_src, use_fast=True, trust_remote_code=True)
+    )
 
     # Base model with PRM head
     bnb_cfg = BitsAndBytesConfig(
@@ -570,11 +663,8 @@ def load_generation_model(
     Loads a Causal LM for generation. If `tokenizer` provided, embeddings are resized accordingly.
     """
     if tokenizer is None:
-        tokenizer = AutoTokenizer.from_pretrained(
-            base_model_id, use_fast=True, trust_remote_code=True
-        )
-    if tokenizer.pad_token is None and tokenizer.eos_token is not None:
-        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer = AutoTokenizer.from_pretrained(base_model_id, use_fast=True, trust_remote_code=True)
+    tokenizer = _ensure_pad_token(tokenizer)
 
     kwargs: Dict[str, Any] = {
         "torch_dtype": torch_dtype,
@@ -620,8 +710,7 @@ def ensure_separator_token(tokenizer: AutoTokenizer, sep: str) -> int:
     added_vocab = tokenizer.get_added_vocab()
     if sep not in added_vocab:
         added += tokenizer.add_special_tokens({"additional_special_tokens": [sep]})
-        if tokenizer.pad_token is None and tokenizer.eos_token is not None:
-            tokenizer.pad_token = tokenizer.eos_token
+        _ensure_pad_token(tokenizer)
     return added
 
 
@@ -696,22 +785,7 @@ def render_state_text(
 # =========================================================
 
 
-@dataclass
-class _Node:
-    traj: Dict[int, List[str]] = field(default_factory=dict)
-    children: List["_Node"] = field(default_factory=list)
-    visits: int = 0
-    q_sum: float = 0.0
-    v_init: float = 0.0
-    action_text: str = ""
-    prior: float = 0.0
-
-    @property
-    def q_mean(self) -> float:
-        return (self.q_sum + self.v_init) / (self.visits + 1)
-
-
-class MCTSInfer:
+class MCTSInfer(BaseMCTS):
     """
     UCT inference with pluggable scoring:
       - "prm": V(s) from PRM on state text (step prefixes)
@@ -739,7 +813,13 @@ class MCTSInfer:
         leaf_score_fn: Optional[Callable[[str], float]] = None,  # leaf PRM/ORM
         view_mode: str = "full",  # "full" | "local" — scope of state text for PRM/ORM
     ):
-        self.mas = mas
+        super().__init__(
+            mas,
+            question,
+            gen_kwargs=gen_kwargs,
+            root_init_value=0.0,
+            root_init_visits=1,
+        )
         self.q = question
         self.score_fn = score_fn
         self.score_type = score_type
@@ -747,7 +827,6 @@ class MCTSInfer:
         self.orm_tokenizer = orm_tokenizer
         self.max_children = int(max(1, max_children))
         self.c = float(c_uct)
-        self.kw = gen_kwargs or {}
         self.sep = step_separator
         self.leaf_score_fn = leaf_score_fn or score_fn
 
@@ -755,33 +834,25 @@ class MCTSInfer:
         self.leaf = (leaf_score_type or "").lower() or None
         self.logprob_agg = (logprob_agg or "sum").lower()
         self.view_mode = (view_mode or "full").lower()
-
-        self.order = _agent_order(self.mas)
-        self.required_parents = getattr(
-            self.mas,
-            "required_parents",
-            {i: set(self.mas.parents.get(i, [])) for i in range(self.mas.n)},
-        )
-        self.root = _Node()
         self.usage = TokenStats()
 
-    def _depth(self, node: _Node) -> int:
-        return len(node.traj)
+    def _depth(self, node: Node) -> int:
+        return self._depth_of(node)
 
-    def _terminal(self, node: _Node) -> bool:
-        return self._depth(node) >= len(self.order)
+    def _terminal(self, node: Node) -> bool:
+        return self._is_terminal(node)
 
-    def _uct(self, parent: _Node, child: _Node) -> float:
+    def _uct(self, parent: Node, child: Node) -> float:
         Np = max(parent.visits + 1, 1)
         Nc = child.visits + 1
         return child.q_mean + self.c * math.sqrt(math.log(Np) / Nc)
 
-    def _puct(self, parent: _Node, child: _Node) -> float:
+    def _puct(self, parent: Node, child: Node) -> float:
         Np = max(parent.visits, 1)
         Nc = child.visits
         return child.q_mean + self.c * child.prior * math.sqrt(Np) / (1.0 + Nc)
 
-    def _select_score(self, parent: _Node, child: _Node) -> float:
+    def _select_score(self, parent: Node, child: Node) -> float:
         if self.uct_type == "puct":
             return self._puct(parent, child)
         return self._uct(parent, child)
@@ -791,13 +862,12 @@ class MCTSInfer:
             self.mas, self.q, traj, self.sep, view=self.view_mode, agent_idx=agent_idx
         )
 
-    def _expand(self, node: _Node) -> None:
+    def _expand(self, node: Node) -> None:
         d = self._depth(node)
         if d >= len(self.order):
             return
 
-        agent_idx = self.order[d]
-        inbox, _, _ = _replay_trajectory(self.mas, self.q, node.traj)
+        agent_idx, inbox = self._expansion_context(node)
         msgs = self.mas.agent_messages(agent_idx, inbox)
         enc = self.mas.agents[agent_idx].tok.apply_chat_template(
             msgs, tokenize=True, add_generation_prompt=True
@@ -820,7 +890,7 @@ class MCTSInfer:
             inbox,
             self.required_parents,
             n_candidates=self.max_children,
-            **self.kw,
+            **self.gen_kwargs,
         )
         # Deduplicate identical candidate actions (same text => same action).
         dedup = []
@@ -841,13 +911,11 @@ class MCTSInfer:
                 self.usage.generated += _text_token_len_agent(self.mas.agents[agent_idx], outs[0])
 
         vals: List[float] = []
-        child_trajs: List[Dict[int, List[str]]] = []
         child_texts: List[str] = []
 
         # Compute values for each candidate
         for outs in candidates:
-            traj2 = {**node.traj, agent_idx: outs}
-            child_trajs.append(traj2)
+            traj2 = {**node.trajectory, agent_idx: outs}
             child_texts.append(outs[0] if outs else "")
 
             if self.score_type == "prm":
@@ -897,15 +965,14 @@ class MCTSInfer:
                     pass  # keep uniform
 
         # 3) create children with v_init and prior
-        for v, traj2, a_text, p0 in zip(vals, child_trajs, child_texts, priors):
+        for v, outs, a_text, p0 in zip(vals, candidates, child_texts, priors):
             node.children.append(
-                _Node(
-                    traj=traj2,
-                    children=[],
-                    visits=0,
-                    q_sum=0.0,
-                    v_init=v,  # keep as cached eval if you want, but not as a fake visit
-                    action_text=a_text,
+                self._make_child(
+                    node,
+                    agent_idx,
+                    outs,
+                    init_value=v,
+                    init_visits=1,
                     prior=p0,
                 )
             )
@@ -925,11 +992,11 @@ class MCTSInfer:
                 node = max(node.children, key=lambda ch: self._select_score(path[-1], ch))
                 path.append(node)
 
-        leaf_traj = path[-1].traj
+        leaf_traj = path[-1].trajectory
         leaf_type = self.leaf or self.score_type
 
         if leaf_type == "prm":
-            v_leaf = path[-1].v_init  # cached score for this node
+            v_leaf = path[-1].init_value  # cached score for this node
 
         elif leaf_type == "logprob":
             steps = [leaf_traj[agent_idx][0] for agent_idx in self.order if leaf_traj.get(agent_idx)]
@@ -956,7 +1023,7 @@ class MCTSInfer:
         node = self.root
         while not self._terminal(node) and node.children:
             node = max(node.children, key=lambda ch: ch.q_mean)
-            traj = node.traj
+            traj = node.trajectory
 
         inbox, primary_out, last = _replay_trajectory(self.mas, self.q, traj)
         return _aggregate_final(self.mas, primary_out, last), self.usage
@@ -974,8 +1041,8 @@ class MCTSInfer:
         while stack:
             node = stack.pop()
             # Use nodes that can serve as final states (leaf or terminal) and that have a trajectory.
-            if node.traj and self._terminal(node) and node.visits > 0:
-                inbox, primary_out, last = _replay_trajectory(self.mas, self.q, node.traj)
+            if node.trajectory and self._terminal(node) and node.visits > 0:
+                inbox, primary_out, last = _replay_trajectory(self.mas, self.q, node.trajectory)
                 ans = _aggregate_final(self.mas, primary_out, last)
                 candidates.append((node.q_mean, ans))
             stack.extend(node.children)

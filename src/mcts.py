@@ -49,10 +49,110 @@ class Node:
         default_factory=dict, repr=False
     )  # agent -> outs (list[str])
     node_text: Optional[str] = None
+    init_value: float = field(default=0.0, repr=False)
+    init_visits: int = field(default=0, repr=False)
+    prior: float = field(default=0.0, repr=False)
 
     @property
     def q_mean(self) -> float:
-        return self.q_sum / self.visits if self.visits > 0 else 0.0
+        denom = self.visits + self.init_visits
+        if denom <= 0:
+            return 0.0
+        return (self.q_sum + self.init_value) / denom
+
+
+class BaseMCTS:
+    def __init__(
+        self,
+        mas: MAS,
+        question: str,
+        *,
+        gen_kwargs: Optional[Dict[str, Any]] = None,
+        root_init_value: float = 0.0,
+        root_init_visits: int = 0,
+    ):
+        self.mas = mas
+        self.question = question
+        self.gen_kwargs = gen_kwargs or {}
+        self.order = list(self.mas.agent_order)
+        self.required_parents: Dict[int, Set[int]] = {
+            i: set(self.mas.parents.get(i, [])) for i in range(self.mas.n)
+        }
+        self.root = Node(
+            steps=[],
+            trajectory={},
+            node_text=self.question,
+            init_value=root_init_value,
+            init_visits=root_init_visits,
+        )
+
+    def _depth_of(self, node: Node) -> int:
+        return len(node.trajectory)
+
+    def _is_terminal(self, node: Node) -> bool:
+        return self._depth_of(node) >= len(self.order)
+
+    def _expansion_context(self, node: Node) -> tuple[int, Dict[int, Dict[int, str]]]:
+        depth = self._depth_of(node)
+        if depth >= len(self.order):
+            raise RuntimeError("Tried to expand a terminal MCTS node.")
+
+        agent_idx = self.order[depth]
+        inbox, _, _ = _replay_trajectory(self.mas, self.question, node.trajectory)
+
+        req = self.required_parents[agent_idx]
+        have = set(inbox.get(agent_idx, {}).keys())
+        if not req.issubset(have):
+            missing = sorted(req - have)
+            raise RuntimeError(
+                f"Agent {agent_idx} cannot run; missing parents {missing}. "
+                "Check edges and per-depth ordering."
+            )
+        return agent_idx, inbox
+
+    def _sample_candidates(self, node: Node, n_candidates: int) -> tuple[int, List[List[str]]]:
+        agent_idx, inbox = self._expansion_context(node)
+        candidates = propose_agent_candidates(
+            self.mas,
+            agent_idx,
+            inbox,
+            self.required_parents,
+            n_candidates=n_candidates,
+            **self.gen_kwargs,
+        )
+        return agent_idx, candidates
+
+    def _finalize_node(self, node: Node) -> None:
+        if not self._is_terminal(node):
+            return
+        if node.final_answer is None:
+            inbox, primary_out, last = _replay_trajectory(self.mas, self.question, node.trajectory)
+            node.final_answer = _aggregate_final(self.mas, primary_out, last)
+        node.is_terminal = True
+
+    def _make_child(
+        self,
+        parent: Node,
+        agent_idx: int,
+        outs: List[str],
+        *,
+        init_value: float = 0.0,
+        init_visits: int = 0,
+        prior: float = 0.0,
+    ) -> Node:
+        child = Node(
+            steps=parent.steps + ([outs[0]] if outs else [""]),
+            action_text=f"[agent {agent_idx}] {outs[0] if outs else ''}",
+            is_terminal=False,
+            final_answer=None,
+            node_text=(outs[0] if outs else ""),
+            trajectory={**parent.trajectory, agent_idx: outs},
+            init_value=init_value,
+            init_visits=init_visits,
+            prior=prior,
+        )
+        self._finalize_node(child)
+        return child
 
 
 def uct_score(parent: Node, child: Node, c: float) -> float:
@@ -61,7 +161,7 @@ def uct_score(parent: Node, child: Node, c: float) -> float:
     return child.q_mean + c * math.sqrt(math.log(Np) / Nc)
 
 
-class MAS_MCTS:
+class MAS_MCTS(BaseMCTS):
     def __init__(
         self,
         mas: MAS,
@@ -79,27 +179,10 @@ class MAS_MCTS:
         n_candidates: number of per-agent samples to generate at expansion
         gen_kwargs: forwarded to Agent.generate(_n), e.g., temperature, top_p, max_new_tokens
         """
-        self.mas = mas
-        self.question = question
+        super().__init__(mas, question, gen_kwargs=gen_kwargs)
         self.truth = ground_truth_answer
         self.c = c
         self.n_candidates = n_candidates
-        self.gen_kwargs = gen_kwargs or {}
-        self.order = list(self.mas.agent_order)
-
-        # Precompute required parents per agent (includes -1 if present)
-        self.required_parents: Dict[int, Set[int]] = {
-            i: set(self.mas.parents.get(i, [])) for i in range(self.mas.n)
-        }
-
-        self.root = Node(steps=[], trajectory={}, node_text=self.question)
-
-    def _depth_of(self, node: Node) -> int:
-        """How many agents have been decided on the path to this node."""
-        return len(node.trajectory)
-
-    def _is_terminal(self, node: Node) -> bool:
-        return self._depth_of(node) >= len(self.order)
 
     def search(
         self,
@@ -144,68 +227,24 @@ class MAS_MCTS:
 
         while True:
             if self._is_terminal(node):
-                # Compute final answer if not already present
-                if node.final_answer is None:
-                    inbox, primary_out, last = _replay_trajectory(
-                        self.mas, self.question, node.trajectory
-                    )
-                    node.final_answer = _aggregate_final(self.mas, primary_out, last)
-                    node.is_terminal = True
+                self._finalize_node(node)
                 return path
 
             # Expand if no children
             if not node.children:
                 depth = self._depth_of(node)  # which agent to decide
-                agent_idx = self.order[depth]
-                # Recompute inbox given all earlier agent choices
-                inbox, _, _ = _replay_trajectory(self.mas, self.question, node.trajectory)
-
-                # Ensure required inputs are present for agent_idx
-                req = self.required_parents[agent_idx]
-                have = set(inbox.get(agent_idx, {}).keys())
-                if not req.issubset(have):
-                    # If this happens, topology is inconsistent with depth ordering
-                    missing = sorted(req - have)
-                    raise RuntimeError(
-                        f"Agent {agent_idx} cannot run; missing parents {missing}. "
-                        "Check edges and per-depth ordering."
-                    )
-
-                # Propose multiple candidates for this agent
-                n_cand = (
+                agent_idx, candidates = self._sample_candidates(
+                    node,
                     self.n_candidates
                     if depth < (len(self.order) - 1)
-                    else max(1, self.n_candidates // 2)
-                )
-                candidates = propose_agent_candidates(
-                    self.mas,
-                    agent_idx,
-                    inbox,
-                    self.required_parents,
-                    n_candidates=n_cand,
-                    **self.gen_kwargs,
+                    else max(1, self.n_candidates // 2),
                 )
 
-                # Create children, one per candidate
                 for outs in candidates:
-                    child = Node(
-                        steps=node.steps + ([outs[0]] if outs else [""]),
-                        action_text=f"[agent {agent_idx}] {outs[0] if outs else ''}",
-                        is_terminal=False,
-                        final_answer=None,
-                        node_text=(outs[0] if outs else ""),
-                        trajectory={**node.trajectory, agent_idx: outs},
-                    )
+                    node.children.append(self._make_child(node, agent_idx, outs))
 
-                    # If this child already completed all agents, make it terminal now
-                    if self._depth_of(child) >= len(self.order):
-                        inbox2, primary_out2, last2 = _replay_trajectory(
-                            self.mas, self.question, child.trajectory
-                        )
-                        child.final_answer = _aggregate_final(self.mas, primary_out2, last2)
-                        child.is_terminal = True
-
-                    node.children.append(child)
+                if not node.children:
+                    return path
 
                 # Immediately grade all terminal children so none remain unvisited
                 terminals = [ch for ch in node.children if ch.is_terminal]

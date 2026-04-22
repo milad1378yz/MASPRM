@@ -6,26 +6,39 @@ import statistics
 from pathlib import Path
 
 import torch
-from transformers import AutoTokenizer
 from tqdm import tqdm
 import ray
 from ray.util.queue import Queue
-from openai import OpenAI
 
 from answer_utils import is_correct
-from mas import MAS, build_mas_from_specs
-from core import (
-    _seed_everything,
-    TokenStats,
-    sbs_decode2,
-    make_scored_voter,
-    load_prm_scorer,
-    ensure_separator_token,
-    align_model_to_tokenizer,
-    load_generation_model,
-    MCTSInfer,
-    _majority_by_numbers_equal,
-)
+from mas import MAS
+
+try:
+    from .core import (
+        _seed_everything,
+        TokenStats,
+        sbs_decode2,
+        make_scored_voter,
+        load_prm_scorer,
+        ensure_separator_token,
+        align_model_to_tokenizer,
+        build_runtime,
+        MCTSInfer,
+        _majority_by_numbers_equal,
+    )
+except ImportError:
+    from core import (
+        _seed_everything,
+        TokenStats,
+        sbs_decode2,
+        make_scored_voter,
+        load_prm_scorer,
+        ensure_separator_token,
+        align_model_to_tokenizer,
+        build_runtime,
+        MCTSInfer,
+        _majority_by_numbers_equal,
+    )
 
 
 @dataclass
@@ -149,39 +162,15 @@ def evaluate_conditions_ray(
                 print(f"[Worker {self.rank}] Added {added} special tokens for step separator.")
                 if added > 0 and self.prm_model is not None:
                     align_model_to_tokenizer(self.prm_model, self.prm_tok)
-            # 2) Load generation model; reuse PRM tokenizer if present to keep vocab identical
-            self.use_openai = init.use_openai
-            self.openai_client = None
-            self.openai_model_name = (
-                init.gen_model_id
-            )  # Use gen_model_id as the OpenAI model name (e.g. gpt-4)
-
-            if self.use_openai:
-                self.policy_model = None
-                self.policy_tok = AutoTokenizer.from_pretrained(
-                    init.gen_model_id if "/" in init.gen_model_id else "Qwen/Qwen2.5-1.5B-Instruct",
-                    use_fast=True,
-                    trust_remote_code=True,
-                )
-                self.openai_client = OpenAI(
-                    api_key=init.openai_api_key, base_url=init.openai_base_url
-                )
-
-            else:
-                # Original logic
-                self.policy_model, self.policy_tok = load_generation_model(
-                    init.gen_model_id,
-                    tokenizer=None,
-                    torch_dtype=self.dtype,
-                )
-            # # 3) Ensure step token present in tokenizer & resize both heads if added
-            # added = ensure_separator_token(self.prm_tok, self.step_sep)
-            # print(f"[Worker {self.rank}] Added {added} special tokens for step separator.")
-            # # Only align if we actually have a local model
-            # if added > 0 and self.policy_model is not None:
-            #     align_model_to_tokenizer(self.policy_model, self.policy_tok)
-            # if added > 0 and self.prm_model is not None:
-            #     align_model_to_tokenizer(self.prm_model, self.prm_tok)
+            # 2) Load generation runtime; reuse the PRM tokenizer when available.
+            self.runtime = build_runtime(
+                init.gen_model_id,
+                tokenizer=self.prm_tok,
+                torch_dtype=self.dtype,
+                use_openai=init.use_openai,
+                openai_api_key=init.openai_api_key,
+                openai_base_url=init.openai_base_url,
+            )
 
             # 4) ORM scorer (optional) — same API as PRM loader
             self.orm_score_fn = None
@@ -201,15 +190,7 @@ def evaluate_conditions_ray(
 
         # --- build MAS graph for each decode
         def _build_mas(self) -> MAS:
-            return build_mas_from_specs(
-                self.policy_model,
-                self.policy_tok,
-                self.agent_specs,
-                self.edges,
-                use_openai=self.use_openai,
-                openai_client=self.openai_client,
-                openai_model=self.openai_model_name,
-            )
+            return self.runtime.build_mas(self.agent_specs, self.edges)
 
         # --- decoders by spec.kind
         def _decode_by_spec(
