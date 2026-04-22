@@ -12,6 +12,7 @@ from transformers.utils import logging as hf_logging
 import yaml
 
 from answer_utils import is_correct
+from mas import build_mas_from_specs
 from mcts import Node, MAS_MCTS
 from dataset_handler import load_hard_dataset
 from experiments.core import build_runtime
@@ -132,7 +133,7 @@ class RayWorker:
             attn_impl=attn_impl,
             compile_model=compile_model,
         )
-        self.mas = runtime.build_mas(agent_specs, edges)
+        self.mas = build_mas_from_specs(runtime.model, runtime.tokenizer, agent_specs, edges)
 
     def run_one(
         self,
@@ -337,7 +338,7 @@ def main():
         compile_model=not args.no_compile,
     )
     print("Building MAS...")
-    mas = runtime.build_mas(agent_specs, edges)
+    mas = build_mas_from_specs(runtime.model, runtime.tokenizer, agent_specs, edges)
 
     print("Running MAS-MCTS...")
 

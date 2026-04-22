@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Optional, Dict, List, Any
 import os
 import queue
@@ -11,7 +12,7 @@ import ray
 from ray.util.queue import Queue
 
 from answer_utils import is_correct
-from mas import MAS
+from mas import MAS, build_mas_from_specs
 
 try:
     from .core import (
@@ -180,10 +181,6 @@ def evaluate_conditions_ray(
                 if added > 0 and self.orm_model is not None:
                     align_model_to_tokenizer(self.orm_model, self.orm_tok)
 
-        # --- build MAS graph for each decode
-        def _build_mas(self) -> MAS:
-            return self.runtime.build_mas(self.agent_specs, self.edges)
-
         # --- decoders by spec.kind
         def _decode_by_spec(
             self, q: str, spec: ConditionSpec
@@ -210,6 +207,13 @@ def evaluate_conditions_ray(
             # Scope of state text fed to PRM/ORM: "full" = routed transcript,
             # "local" = only what the scored agent itself received + produced.
             view_mode = str(p.get("view_mode", "full")).lower()
+            build_mas = partial(
+                build_mas_from_specs,
+                self.runtime.model,
+                self.runtime.tokenizer,
+                self.agent_specs,
+                self.edges,
+            )
 
             # Helper: single-run decode with trace (policy-only)
             def base_policy_with_trace(mas: MAS, q: str):
@@ -226,7 +230,7 @@ def evaluate_conditions_ray(
                 return pred, usage, tr
 
             # Build MAS for the first run
-            mas0 = self._build_mas()
+            mas0 = build_mas()
 
             #  SBS variants
             if kind == "sbs_none":
@@ -330,7 +334,7 @@ def evaluate_conditions_ray(
                 preds.append(p0)
                 total.add(u0)
                 for _ in range(max(0, k - 1)):
-                    mas_i = self._build_mas()
+                    mas_i = build_mas()
                     pi, ui, _ = base_policy_with_trace(mas_i, q)
                     preds.append(pi)
                     total.add(ui)
@@ -358,7 +362,7 @@ def evaluate_conditions_ray(
 
                 voter = make_scored_voter(
                     base_with_trace,
-                    self._build_mas,
+                    build_mas,
                     score_mode=score_mode,
                     score_fn=(
                         self.prm_score_fn

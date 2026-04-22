@@ -7,33 +7,6 @@ from answer_utils import is_correct
 from mas import MAS
 from tqdm import tqdm
 
-def propose_agent_candidates(
-    mas: MAS,
-    agent_idx: int,
-    inbox: Dict[int, Dict[int, str]],
-    required_parents: Dict[int, Set[int]],
-    n_candidates: int = 2,
-    **gen_kwargs,
-) -> List[List[str]]:
-    """
-    Sample multiple candidate outputs for agent `agent_idx` given current inbox.
-    Returns a list of candidates, where each candidate = List[str] (one per child or broadcast).
-    """
-    _ = required_parents
-    return mas.sample_candidates(agent_idx, inbox, n_candidates=n_candidates, **gen_kwargs)
-
-
-def _replay_trajectory(mas: MAS, query: str, trajectory: Dict[int, List[str]]):
-    """
-    Recompute inbox and primary_out given a trajectory {agent: outs}.
-    Also return `last` (last primary text produced, for fallback).
-    """
-    return mas._replay(query, set(trajectory), trajectory)
-
-
-def _aggregate_final(mas: MAS, primary_out: Dict[int, str], last: str) -> str:
-    return mas._aggregate_final(primary_out, last)
-
 
 @dataclass
 class Node:
@@ -98,7 +71,7 @@ class BaseMCTS:
             raise RuntimeError("Tried to expand a terminal MCTS node.")
 
         agent_idx = self.order[depth]
-        inbox, _, _ = _replay_trajectory(self.mas, self.question, node.trajectory)
+        inbox, _, _ = self.mas._replay(self.question, set(node.trajectory), node.trajectory)
 
         req = self.required_parents[agent_idx]
         have = set(inbox.get(agent_idx, {}).keys())
@@ -112,11 +85,9 @@ class BaseMCTS:
 
     def _sample_candidates(self, node: Node, n_candidates: int) -> tuple[int, List[List[str]]]:
         agent_idx, inbox = self._expansion_context(node)
-        candidates = propose_agent_candidates(
-            self.mas,
+        candidates = self.mas.sample_candidates(
             agent_idx,
             inbox,
-            self.required_parents,
             n_candidates=n_candidates,
             **self.gen_kwargs,
         )
@@ -126,8 +97,12 @@ class BaseMCTS:
         if not self._is_terminal(node):
             return
         if node.final_answer is None:
-            inbox, primary_out, last = _replay_trajectory(self.mas, self.question, node.trajectory)
-            node.final_answer = _aggregate_final(self.mas, primary_out, last)
+            inbox, primary_out, last = self.mas._replay(
+                self.question,
+                set(node.trajectory),
+                node.trajectory,
+            )
+            node.final_answer = self.mas._aggregate_final(primary_out, last)
         node.is_terminal = True
 
     def _make_child(

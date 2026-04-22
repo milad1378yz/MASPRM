@@ -13,8 +13,8 @@ from transformers import BitsAndBytesConfig
 from peft import PeftModel, PeftConfig
 
 from answer_utils import numbers_equal
-from mas import MAS, build_mas_from_specs
-from mcts import BaseMCTS, Node, propose_agent_candidates, _replay_trajectory, _aggregate_final
+from mas import MAS
+from mcts import BaseMCTS, Node
 from agent import Agent
 
 
@@ -58,10 +58,6 @@ class TokenStats:
 
 def _text_token_len_tok(tok, text: str) -> int:
     return int(tok(text, return_tensors="pt", add_special_tokens=False)["input_ids"].shape[1])
-
-
-def _text_token_len_agent(agent, text: str) -> int:
-    return _text_token_len_tok(agent.tok, text)
 
 
 def _agent_order(mas: Any) -> List[int]:
@@ -155,7 +151,7 @@ def score_path_logprob(
     token_total = 0
 
     for agent_idx, text in zip(_agent_order(mas), steps):
-        inbox, _, _ = _replay_trajectory(mas, question, traj_so_far)
+        inbox, _, _ = mas._replay(question, set(traj_so_far), traj_so_far)
         msgs = mas.agent_messages(agent_idx, inbox)
 
         lp, p_len, g_len = compute_logprob_and_token_counts(mas.agents[agent_idx], msgs, text)
@@ -246,7 +242,7 @@ def sbs_decode2(
         new_beams: List[Tuple[Dict[int, List[str]], float]] = []
 
         for traj, _ in beams:
-            inbox, _, _ = _replay_trajectory(mas, question, traj)
+            inbox, _, _ = mas._replay(question, set(traj), traj)
             msgs = mas.agent_messages(agent_idx, inbox)
 
             # PRE-ENCODE prompt once; reuse for accounting and logprob scoring
@@ -266,16 +262,14 @@ def sbs_decode2(
             )
 
             # Generate candidates
-            cands = propose_agent_candidates(
-                mas, agent_idx, inbox, required_parents, n_candidates=B2, **gen_kwargs
-            )
+            cands = mas.sample_candidates(agent_idx, inbox, n_candidates=B2, **gen_kwargs)
             usage.agent_runs += B2
 
             # Account policy tokens (prompt + generated)
             usage.prompt += p_len
             for outs in cands:
                 if outs:
-                    usage.generated += _text_token_len_agent(mas.agents[agent_idx], outs[0])
+                    usage.generated += _text_token_len_tok(mas.agents[agent_idx].tok, outs[0])
 
             scored_cands = cands[:1] if score_type == "none" else cands
             cand_infos: List[Tuple[List[str], float]] = []
@@ -345,12 +339,12 @@ def sbs_decode2(
     if final_answers_out is not None:
         final_answers_out.clear()
         for traj, _ in beams:
-            inbox_i, primary_out_i, last_i = _replay_trajectory(mas, question, traj)
-            final_answers_out.append(_aggregate_final(mas, primary_out_i, last_i))
+            inbox_i, primary_out_i, last_i = mas._replay(question, set(traj), traj)
+            final_answers_out.append(mas._aggregate_final(primary_out_i, last_i))
 
     best_traj, _ = beams[0]
-    inbox, primary_out, last = _replay_trajectory(mas, question, best_traj)
-    final_answer = _aggregate_final(mas, primary_out, last)
+    inbox, primary_out, last = mas._replay(question, set(best_traj), best_traj)
+    final_answer = mas._aggregate_final(primary_out, last)
 
     if trace is not None:
         trace.extend(local_trace or [])
@@ -494,9 +488,6 @@ def make_scored_voter(
 class Runtime:
     model: Any
     tokenizer: AutoTokenizer
-
-    def build_mas(self, agent_specs: List[Dict[str, Any]], edges: List[List[int]]) -> MAS:
-        return build_mas_from_specs(self.model, self.tokenizer, agent_specs, edges)
 
 
 def _ensure_pad_token(tokenizer: AutoTokenizer) -> AutoTokenizer:
@@ -711,7 +702,7 @@ def render_state_text(
             for idx in order[:cutoff]
             if idx in trajectory and trajectory[idx]
         }
-        inbox, _, _ = _replay_trajectory(mas, question, prior)
+        inbox, _, _ = mas._replay(question, set(prior), prior)
 
         parts: List[str] = []
         user_content = mas.agent_user_content(agent_idx, inbox)
@@ -780,12 +771,6 @@ class MCTSInfer(BaseMCTS):
         self.view_mode = (view_mode or "full").lower()
         self.usage = TokenStats()
 
-    def _depth(self, node: Node) -> int:
-        return self._depth_of(node)
-
-    def _terminal(self, node: Node) -> bool:
-        return self._is_terminal(node)
-
     def _uct(self, parent: Node, child: Node) -> float:
         Np = max(parent.visits + 1, 1)
         Nc = child.visits + 1
@@ -801,13 +786,8 @@ class MCTSInfer(BaseMCTS):
             return self._puct(parent, child)
         return self._uct(parent, child)
 
-    def _state_text(self, traj: Dict[int, List[str]], agent_idx: Optional[int] = None) -> str:
-        return render_state_text(
-            self.mas, self.q, traj, self.sep, view=self.view_mode, agent_idx=agent_idx
-        )
-
     def _expand(self, node: Node) -> None:
-        d = self._depth(node)
+        d = self._depth_of(node)
         if d >= len(self.order):
             return
 
@@ -828,11 +808,9 @@ class MCTSInfer(BaseMCTS):
             )
         )
 
-        candidates = propose_agent_candidates(
-            self.mas,
+        candidates = self.mas.sample_candidates(
             agent_idx,
             inbox,
-            self.required_parents,
             n_candidates=self.max_children,
             **self.gen_kwargs,
         )
@@ -852,7 +830,7 @@ class MCTSInfer(BaseMCTS):
         self.usage.prompt += p_len
         for outs in candidates:
             if outs:
-                self.usage.generated += _text_token_len_agent(self.mas.agents[agent_idx], outs[0])
+                self.usage.generated += _text_token_len_tok(self.mas.agents[agent_idx].tok, outs[0])
 
         vals: List[float] = []
         child_texts: List[str] = []
@@ -863,7 +841,14 @@ class MCTSInfer(BaseMCTS):
             child_texts.append(outs[0] if outs else "")
 
             if self.score_type == "prm":
-                s_text = self._state_text(traj2, agent_idx=agent_idx)
+                s_text = render_state_text(
+                    self.mas,
+                    self.q,
+                    traj2,
+                    self.sep,
+                    view=self.view_mode,
+                    agent_idx=agent_idx,
+                )
                 v = 0.0 if self.score_fn is None else float(self.score_fn(s_text))
 
                 if self.score_fn is not None:
@@ -925,7 +910,7 @@ class MCTSInfer(BaseMCTS):
         node = self.root
         path = [node]
 
-        while not self._terminal(node):
+        while not self._is_terminal(node):
             if not node.children:
                 self._expand(node)
                 if not node.children:
@@ -949,7 +934,14 @@ class MCTSInfer(BaseMCTS):
 
         else:  # "orm"
             leaf_last = max(leaf_traj.keys()) if leaf_traj else (self.mas.n - 1)
-            state_text = self._state_text(leaf_traj, agent_idx=leaf_last)
+            state_text = render_state_text(
+                self.mas,
+                self.q,
+                leaf_traj,
+                self.sep,
+                view=self.view_mode,
+                agent_idx=leaf_last,
+            )
             v_leaf, u = score_orm_end(
                 self.leaf_score_fn, state_text, tokenizer=self.orm_tokenizer
             )  # use leaf scorer on the same format seen during training
@@ -965,12 +957,12 @@ class MCTSInfer(BaseMCTS):
             self.rollout()
         traj = {}
         node = self.root
-        while not self._terminal(node) and node.children:
+        while not self._is_terminal(node) and node.children:
             node = max(node.children, key=lambda ch: ch.q_mean)
             traj = node.trajectory
 
-        inbox, primary_out, last = _replay_trajectory(self.mas, self.q, traj)
-        return _aggregate_final(self.mas, primary_out, last), self.usage
+        inbox, primary_out, last = self.mas._replay(self.q, set(traj), traj)
+        return self.mas._aggregate_final(primary_out, last), self.usage
 
     def get_topk_answers(self, k: int = 5) -> List[str]:
         """
@@ -985,9 +977,13 @@ class MCTSInfer(BaseMCTS):
         while stack:
             node = stack.pop()
             # Use nodes that can serve as final states (leaf or terminal) and that have a trajectory.
-            if node.trajectory and self._terminal(node) and node.visits > 0:
-                inbox, primary_out, last = _replay_trajectory(self.mas, self.q, node.trajectory)
-                ans = _aggregate_final(self.mas, primary_out, last)
+            if node.trajectory and self._is_terminal(node) and node.visits > 0:
+                inbox, primary_out, last = self.mas._replay(
+                    self.q,
+                    set(node.trajectory),
+                    node.trajectory,
+                )
+                ans = self.mas._aggregate_final(primary_out, last)
                 candidates.append((node.q_mean, ans))
             stack.extend(node.children)
 
