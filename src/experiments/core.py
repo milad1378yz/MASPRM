@@ -560,6 +560,11 @@ def load_generation_model(
     base_model_id: str,
     tokenizer: Optional[AutoTokenizer] = None,
     torch_dtype: torch.dtype = torch.float16,
+    *,
+    device_map: Optional[str] = "auto",
+    load_in_4bit: bool = False,
+    attn_impl: str = "sdpa",
+    compile_model: bool = False,
 ):
     """
     Loads a Causal LM for generation. If `tokenizer` provided, embeddings are resized accordingly.
@@ -568,18 +573,42 @@ def load_generation_model(
         tokenizer = AutoTokenizer.from_pretrained(
             base_model_id, use_fast=True, trust_remote_code=True
         )
-        if tokenizer.pad_token is None and tokenizer.eos_token is not None:
-            tokenizer.pad_token = tokenizer.eos_token
+    if tokenizer.pad_token is None and tokenizer.eos_token is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    kwargs: Dict[str, Any] = {
+        "torch_dtype": torch_dtype,
+        "trust_remote_code": True,
+    }
+    if device_map is not None:
+        kwargs["device_map"] = device_map
+    if attn_impl:
+        kwargs["attn_implementation"] = attn_impl
+    if load_in_4bit:
+        compute_dtype = (
+            torch_dtype if torch_dtype in (torch.float16, torch.bfloat16) else torch.float16
+        )
+        kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=compute_dtype,
+            bnb_4bit_use_double_quant=True,
+        )
+        kwargs["torch_dtype"] = compute_dtype
 
     model = AutoModelForCausalLM.from_pretrained(
         base_model_id,
-        torch_dtype=torch_dtype,
-        device_map="auto",
-        trust_remote_code=True,
+        **kwargs,
     )
     if len(tokenizer) != model.get_input_embeddings().weight.size(0):
         model.resize_token_embeddings(len(tokenizer))
     model.eval()
+
+    if compile_model:
+        try:
+            model = torch.compile(model, mode="reduce-overhead", fullgraph=False)
+        except Exception as exc:
+            print(f"[warn] torch.compile failed: {exc}. Continuing without compile().")
+
     return model, tokenizer
 
 

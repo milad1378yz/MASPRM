@@ -8,7 +8,7 @@ import pathlib
 import warnings
 
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer
 from transformers.utils import logging as hf_logging
 import yaml
 
@@ -16,6 +16,7 @@ from answer_utils import is_correct
 from mas import build_mas_from_specs
 from mcts import Node, MAS_MCTS
 from dataset_handler import load_hard_dataset
+from experiments.core import load_generation_model
 from show_tree import build_graph, draw_tree
 
 import ray
@@ -28,47 +29,6 @@ os.environ.setdefault(
     "PYTORCH_CUDA_ALLOC_CONF",
     "max_split_size_mb:128",
 )
-
-
-def load_policy(
-    model_id: str,
-    device_map: str,
-    load_in_4bit: bool = False,
-    attn_impl: str = "sdpa",
-    compile_model: bool = True,
-):
-    """
-    Loads tokenizer and model with either fp16/fp32 or 4-bit quantization.
-    device_map is now provided by argparse for flexibility.
-    """
-    kwargs = dict(device_map=device_map)
-    kwargs["attn_implementation"] = attn_impl
-    if load_in_4bit:
-        from transformers import BitsAndBytesConfig
-
-        kwargs["quantization_config"] = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.float16,
-            bnb_4bit_use_double_quant=True,
-        )
-        kwargs["torch_dtype"] = torch.float16
-    else:
-        kwargs["torch_dtype"] = torch.float16 if torch.cuda.is_available() else torch.float32
-
-    tok = AutoTokenizer.from_pretrained(model_id, use_fast=True)
-    mdl = AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
-
-    # tok = AutoTokenizer.from_pretrained(model_id, use_fast=True, local_files_only=True)
-    # mdl = AutoModelForCausalLM.from_pretrained(model_id, local_files_only=True, **kwargs)
-
-    mdl.eval()
-    if compile_model:
-        try:
-            mdl = torch.compile(mdl, mode="reduce-overhead", fullgraph=False)
-        except Exception as e:
-            print(f"[warn] torch.compile failed: {e}. Continuing without compile().")
-
-    return tok, mdl
 
 
 def node_to_dict(node: Node, max_children: int = 8) -> Dict[str, Any]:
@@ -187,7 +147,7 @@ class RayWorker:
             self.mdl = None
         else:
             self.client = None
-            self.tok, self.mdl = load_policy(
+            self.mdl, self.tok = load_generation_model(
                 model_id,
                 device_map=device_map,
                 load_in_4bit=load_in_4bit,
@@ -428,9 +388,9 @@ def main():
             openai_model=args.model_id,
         )
     else:
-        tok, mdl = load_policy(
+        mdl, tok = load_generation_model(
             args.model_id,
-            args.device_map,
+            device_map=args.device_map,
             load_in_4bit=args.load_in_4bit,
             attn_impl=args.attn_impl,
             compile_model=not args.no_compile,

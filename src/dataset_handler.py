@@ -3,6 +3,8 @@ import re
 from fractions import Fraction
 import random
 
+from answer_utils import _to_number
+
 
 def load_hard_dataset(name, split, n, seed):
     if name == "competition_math":
@@ -32,9 +34,7 @@ def load_hard_dataset(name, split, n, seed):
     elif name == "gsm8k":
         ds = load_dataset("gsm8k", "main")
         data = ds[split].shuffle(seed=seed).select(range(n)) if n else ds[split]
-        gold_fn = lambda ex: _to_number(
-            re.findall(r"####\s*([-\$]?\s*\d[\d,]*(?:\.\d+)?(?:\s+\w+)?)", ex["answer"])[0]
-        )
+        gold_fn = lambda ex: gold_from_gsm8k(ex["answer"])
         q_fn = lambda ex: ex["question"]
 
     elif name == "svamp":
@@ -274,26 +274,6 @@ def gold_mmlu(ex):
 
 def _norm(s):
     return re.sub(r"\s+", " ", str(s)).strip().lower()
-
-
-def _to_number(s):
-    if s is None:
-        return None
-    s = s.strip()
-    s = s.replace(",", "")
-    s = re.sub(r"^\$", "", s)
-    s = re.sub(r"\s+(dollars?|tickets?|units?|boxes?|people|students?)$", "", s, flags=re.I)
-    if re.fullmatch(r"-?\d+/\d+", s):
-        return float(Fraction(s))
-    if s.endswith("%"):
-        try:
-            return float(s[:-1]) / 100.0
-        except:
-            return None
-    try:
-        return float(s)
-    except:
-        return None
 
 
 def _gpqa_perm(ex):
