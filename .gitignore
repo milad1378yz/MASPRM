@@ -7,3 +7,5 @@ results/
 *.zip
 checkpoints/
 cache/
+
+logs/

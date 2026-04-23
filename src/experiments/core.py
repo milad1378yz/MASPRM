@@ -564,13 +564,20 @@ def load_prm_scorer(
     Loads a token-classification base + LoRA PRM adapter.
     Score = tanh(last-token-logit) in [-1, 1].
     """
+    adapter_dir = Path(prm_dir)
+    if not (adapter_dir / "adapter_config.json").exists():
+        ckpts = sorted(adapter_dir.glob("checkpoint-*"), key=lambda p: p.stat().st_mtime)
+        if ckpts and (ckpts[-1] / "adapter_config.json").exists():
+            adapter_dir = ckpts[-1]
+    adapter_dir = adapter_dir.resolve()
+
     # Resolve base model if not supplied
     if base_model_id is None:
-        cfg = PeftConfig.from_pretrained(prm_dir)
+        cfg = PeftConfig.from_pretrained(str(adapter_dir))
         base_model_id = getattr(cfg, "base_model_name_or_path", None) or "Qwen/Qwen2.5-7B-Instruct"
 
     # Tokenizer: prefer saved with adapter; else base
-    tok_src = prm_dir if (Path(prm_dir) / "tokenizer.json").exists() else base_model_id
+    tok_src = str(adapter_dir) if (adapter_dir / "tokenizer.json").exists() else base_model_id
     tok = _ensure_pad_token(
         AutoTokenizer.from_pretrained(tok_src, use_fast=True, trust_remote_code=True)
     )
@@ -596,7 +603,7 @@ def load_prm_scorer(
         base.resize_token_embeddings(len(tok))
 
     # Attach LoRA adapter
-    model = PeftModel.from_pretrained(base, prm_dir)
+    model = PeftModel.from_pretrained(base, str(adapter_dir))
     model.eval()
     device = next(model.parameters()).device
 

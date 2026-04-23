@@ -1,6 +1,8 @@
 from dataclasses import dataclass, field
 from functools import partial
 from typing import Optional, Dict, List, Any
+import hashlib
+import json
 import os
 import queue
 import statistics
@@ -72,8 +74,8 @@ def evaluate_conditions_ray(
     name_dataset: str,
 ) -> Dict[str, Dict[str, float]]:
     """
-    Create a Ray worker pool ONCE (models initialized in each worker),
-    then evaluate multiple conditions in series while reusing that pool.
+    Evaluate conditions with Ray workers. Workers are created per condition so
+    each pool only loads the models that condition actually needs.
 
     Returns: {name: {"accuracy": float, "tok_mean": float, "tok_std": float}}
     """
@@ -441,16 +443,28 @@ def evaluate_conditions_ray(
                 # Always signal completion so the driver doesn’t hang.
                 out_q.put(None)
 
-    # --- Create worker pool ONCE (reused across conditions)
-    workers = [
-        EvalWorker.remote(worker_init, worker_init.dtype, rank=i) for i in range(num_workers)
-    ]
-
-    # --- Evaluate all conditions, reusing the pool
     results: Dict[str, Dict[str, float]] = {}
     LOG_EVERY = int(os.environ.get("LOG_EVERY", "10"))  # progress write interval (examples)
     N_TOTAL = len(data)
     for spec in conditions:
+        needs_prm = spec.kind in {"sbs_prm", "mcts_prm", "voter_prm"} or (
+            str(spec.params.get("leaf_score_type", "")).lower() == "prm"
+        )
+        needs_orm = spec.kind in {"mcts_orm", "voter_orm"} or (
+            str(spec.params.get("leaf_score_type", "")).lower() == "orm"
+        )
+        spec_worker_init = WorkerInit(
+            agent_specs=worker_init.agent_specs,
+            edges=worker_init.edges,
+            step_separator=worker_init.step_separator,
+            gen_model_id=worker_init.gen_model_id,
+            prm_dir=worker_init.prm_dir if needs_prm else None,
+            prm_base_model_id=worker_init.prm_base_model_id if needs_prm else None,
+            orm_dir=worker_init.orm_dir if needs_orm else None,
+            dtype=worker_init.dtype,
+            seed=worker_init.seed,
+        )
+
         # Prepare conditional path parts
         prm = (
             f"_{Path(worker_init.prm_dir).name}"
@@ -463,13 +477,18 @@ def evaluate_conditions_ray(
             else ""
         )
 
-        # Prepare model ID and truncated params
+        # Prepare model ID and a short stable fingerprint so distinct settings
+        # (e.g. view_mode=full vs local) do not collide in the skip log path.
         model = worker_init.gen_model_id.split("/")[-1]
         params = "_".join(f"{k}-{v}" for k, v in spec.params.items())[:20]
+        params_fingerprint = hashlib.md5(
+            json.dumps(spec.params, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()[:8]
 
         # Assemble final path
         results_path = (
-            f"logs/{name_dataset}_{spec.name}{params}{prm}{orm}_{model}_{worker_init.seed}.txt"
+            f"logs/{name_dataset}_{spec.name}{params}_{params_fingerprint}"
+            f"{prm}{orm}_{model}_{worker_init.seed}.txt"
         )
         os.makedirs("logs", exist_ok=True)
         # If file already contains a COMPLETED marker, skip this condition
@@ -485,6 +504,9 @@ def evaluate_conditions_ray(
         with open(results_path, "a") as f:
             f.write(f"=== START {spec.name} | dataset={name_dataset} | N={N_TOTAL} ===\n")
 
+        workers = [
+            EvalWorker.remote(spec_worker_init, worker_init.dtype, rank=i) for i in range(num_workers)
+        ]
         in_q = Queue()
         out_q = Queue()
         consume_refs = [w.consume.remote(spec, in_q, out_q) for w in workers]
@@ -500,6 +522,7 @@ def evaluate_conditions_ray(
         pass_counts = [0] * MAX_PASS_K  # pass@k over candidate sets
         totals: List[int] = []
         finished = 0
+        worker_crashed = False
         prm_calls_total = 0
         agent_runs_total = 0
         pbar = tqdm(total=len(data), desc=f"Evaluating: {spec.name}")
@@ -517,6 +540,7 @@ def evaluate_conditions_ray(
                             ray.get(ref)  # This will raise the worker's exception if it crashed
                         except Exception as e:
                             print(f"\n[CRITICAL] A worker crashed! Error: {e}")
+                            worker_crashed = True
                             finished += 1
                             consume_refs.remove(ref)
                 continue
@@ -575,14 +599,45 @@ def evaluate_conditions_ray(
 
         pbar.close()
 
-        # Ensure tasks done (actors persist for next spec)
-        ray.get(consume_refs)
+        # Ensure outstanding tasks are resolved before tearing down this pool.
+        if consume_refs:
+            ray.get(consume_refs)
+        for w in workers:
+            ray.kill(w, no_restart=True)
 
-        n = max(1, len(data))
-        acc = correct / n
-        pass_at = [c / n for c in pass_counts]
+        processed = len(totals)
         mean = float(statistics.mean(totals)) if totals else 0.0
         std = float(statistics.pstdev(totals)) if len(totals) > 1 else 0.0
+
+        if worker_crashed or processed != len(data):
+            with open(results_path, "a") as f:
+                f.write(
+                    f"FAILED: processed {processed}/{len(data)} examples; "
+                    f"worker_crashed={worker_crashed}\n"
+                )
+                f.write(f"Tokens so far: {mean:.1f} ± {std:.1f}\n")
+                f.write(f"Total PRM calls so far: {prm_calls_total}\n")
+                f.write(f"Total Agent runs so far: {agent_runs_total}\n")
+            results[spec.name] = {
+                "accuracy": float("nan"),
+                "tok_mean": mean,
+                "tok_std": std,
+                "prm_calls_total": int(prm_calls_total),
+                "agent_runs_total": int(agent_runs_total),
+                "prm_calls_mean": float("nan"),
+                "agent_runs_mean": float("nan"),
+            }
+            for i in range(1, MAX_PASS_K + 1):
+                results[spec.name][f"pass_at_{i}"] = float("nan")
+            print(
+                f"[result] {spec.name}: FAILED "
+                f"({processed}/{len(data)} examples processed)"
+            )
+            continue
+
+        n = len(data)
+        acc = correct / n
+        pass_at = [c / n for c in pass_counts]
 
         results[spec.name] = {
             "accuracy": acc,
@@ -613,8 +668,5 @@ def evaluate_conditions_ray(
             f"[result] {spec.name}: acc={acc:.4f} ({pass_str})  "
             f"tokens={mean:.1f}±{std:.1f} ({len(totals)} examples)"
         )
-
-    # Optionally keep workers alive (faster for follow-ups). If you want to free VRAM at end:
-    # for w in workers: ray.kill(w, no_restart=True)
 
     return results

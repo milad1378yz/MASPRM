@@ -35,6 +35,12 @@ def main():
     parser.add_argument("--prm_base_model_id", default="Qwen/Qwen2.5-1.5B-Instruct")
     parser.add_argument("--gen_model_id", default="Qwen/Qwen2.5-1.5B-Instruct")
     parser.add_argument(
+        "--view_mode",
+        choices=["full", "local"],
+        default="full",
+        help="State scope for PRM/ORM scoring: routed transcript ('full') or agent-local view.",
+    )
+    parser.add_argument(
         "--orm_dir",
         default="checkpoints/Qwen2.5-1.5B-1.5B-ORM-qlora-512-mmlu",
     )
@@ -64,11 +70,14 @@ def main():
 
     STEP_SEP = "</step>"
 
-    prm_dir = args.prm_dir
+    prm_dir = str(Path(args.prm_dir).resolve()) if args.prm_dir else args.prm_dir
     prm_base_model_id = args.prm_base_model_id
     gen_model_id = args.gen_model_id
+    view_mode = args.view_mode
     # Optional ORM scorer (same API as PRM loader)
-    ORM_DIR = args.orm_dir or None  # allow empty string to disable
+    ORM_DIR = (
+        str(Path(args.orm_dir).resolve()) if args.orm_dir else None
+    )  # allow empty string to disable
 
     worker_init = WorkerInit(
         agent_specs=agent_specs,
@@ -88,27 +97,32 @@ def main():
     mcts_kws = {"temperature": 0.6, "top_p": 0.95, "max_new_tokens": 1024}
 
     conditions: List[ConditionSpec] = [
-        ConditionSpec(
-            "Greedy (policy only, no PRM)", "sbs_none", {"B1": 1, "B2": 1, "gen_kwargs": sbs_fast}
-        ),
-        ConditionSpec(
-            "Greedy + Voter (policy only, no PRM)", "voter_plain", {"k": 5, "gen_kwargs": sbs_fast}
-        ),
-        ConditionSpec(
-            "Greedy + Voter (score-weighted, PRM-steps)",
-            "voter_prm",
-            {"k": 5, "gen_kwargs": sbs_fast},
-        ),
+        # ConditionSpec(
+        #     "Greedy (policy only, no PRM)", "sbs_none", {"B1": 1, "B2": 1, "gen_kwargs": sbs_fast}
+        # ),
+        # ConditionSpec(
+        #     "Greedy + Voter (policy only, no PRM)", "voter_plain", {"k": 5, "gen_kwargs": sbs_fast}
+        # ),
+        # ConditionSpec(
+        #     "Greedy + Voter (score-weighted, PRM-steps)",
+        #     "voter_prm",
+        #     {"k": 5, "gen_kwargs": sbs_fast},
+        # ),
         # ConditionSpec(
         #     "Greedy + Voter (score-weighted, logprob)",
         #     "voter_logprob",
         #     {"k": 5, "gen_kwargs": sbs_fast},
         # ),
+        # ConditionSpec(
+        #     "SBS + PRM (B1=1, B2=5)", "sbs_prm", {"B1": 1, "B2": 5, "gen_kwargs": sbs_fast}
+        # ),
         ConditionSpec(
-            "SBS + PRM (B1=1, B2=5)", "sbs_prm", {"B1": 1, "B2": 5, "gen_kwargs": sbs_fast}
+            "SBS + PRM (B1=3, B2=5)",
+            "sbs_prm",
+            {"B1": 3, "B2": 5, "gen_kwargs": sbs_fast, "view_mode": view_mode},
         ),
         ConditionSpec(
-            "SBS + PRM (B1=3, B2=5)", "sbs_prm", {"B1": 3, "B2": 5, "gen_kwargs": sbs_fast}
+            "SBS + logprob (B1=1, B2=5)", "sbs_logprob", {"B1": 1, "B2": 5, "gen_kwargs": sbs_fast}
         ),
         # ConditionSpec(
         #     "SBS + logprob (B1=1, B2=5)", "sbs_logprob", {"B1": 1, "B2": 5, "gen_kwargs": sbs_fast}
@@ -121,7 +135,13 @@ def main():
         ConditionSpec(
             "MCTS + PRM (N=10, 3 children)",
             "mcts_prm",
-            {"n_simulations": 10, "max_children": 3, "c_uct": 2.0, "mcts_kwargs": mcts_kws},
+            {
+                "n_simulations": 10,
+                "max_children": 3,
+                "c_uct": 2.0,
+                "mcts_kwargs": mcts_kws,
+                "view_mode": view_mode,
+            },
         ),
         # ConditionSpec(
         #     "MCTS + logprob (N=16, 2 children)",
@@ -130,35 +150,35 @@ def main():
         # ),
     ]
 
-    conditions.append(
-        ConditionSpec(
-            "SBS + logprob (avg-token, B1=3, B2=5)",
-            "sbs_logprob",
-            {"B1": 3, "B2": 5, "gen_kwargs": sbs_fast, "logprob_agg": "avg_token"},
-        )
-    )
+    # conditions.append(
+    #     ConditionSpec(
+    #         "SBS + logprob (avg-token, B1=3, B2=5)",
+    #         "sbs_logprob",
+    #         {"B1": 3, "B2": 5, "gen_kwargs": sbs_fast, "logprob_agg": "avg_token"},
+    #     )
+    # )
 
-    conditions.append(
-        ConditionSpec(
-            "MCTS + logprob (avg-token, N=10, 3 children)",
-            "mcts_logprob",
-            {
-                "n_simulations": 10,
-                "max_children": 3,
-                "c_uct": 2.0,
-                "mcts_kwargs": mcts_kws,
-                "logprob_agg": "avg_token",
-            },
-        )
-    )
+    # conditions.append(
+    #     ConditionSpec(
+    #         "MCTS + logprob (avg-token, N=10, 3 children)",
+    #         "mcts_logprob",
+    #         {
+    #             "n_simulations": 10,
+    #             "max_children": 3,
+    #             "c_uct": 2.0,
+    #             "mcts_kwargs": mcts_kws,
+    #             "logprob_agg": "avg_token",
+    #         },
+    #     )
+    # )
 
-    conditions.append(
-        ConditionSpec(
-            "Greedy + Voter (score-weighted, logprob avg-token)",
-            "voter_logprob",
-            {"k": 5, "gen_kwargs": sbs_fast, "logprob_agg": "avg_token"},
-        )
-    )
+    # conditions.append(
+    #     ConditionSpec(
+    #         "Greedy + Voter (score-weighted, logprob avg-token)",
+    #         "voter_logprob",
+    #         {"k": 5, "gen_kwargs": sbs_fast, "logprob_agg": "avg_token"},
+    #     )
+    # )
 
     # conditions.append(
     #     ConditionSpec(
@@ -179,14 +199,20 @@ def main():
             ConditionSpec(
                 "MCTS + ORM (N=10, 3 children)",
                 "mcts_orm",
-                {"n_simulations": 10, "max_children": 3, "c_uct": 2.0, "mcts_kwargs": mcts_kws},
+                {
+                    "n_simulations": 10,
+                    "max_children": 3,
+                    "c_uct": 2.0,
+                    "mcts_kwargs": mcts_kws,
+                    "view_mode": view_mode,
+                },
             )
         )
         conditions.append(
             ConditionSpec(
                 "Greedy + Voter (score-weighted, ORM end)",
                 "voter_orm",
-                {"k": 5, "gen_kwargs": sbs_fast},
+                {"k": 5, "gen_kwargs": sbs_fast, "view_mode": view_mode},
             )
         )
         # conditions.append(
