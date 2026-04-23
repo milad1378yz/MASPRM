@@ -28,7 +28,13 @@ from transformers import (
     BitsAndBytesConfig,
     Trainer,
 )
-from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
+from peft import (
+    LoraConfig,
+    TaskType,
+    get_peft_model,
+    prepare_model_for_kbit_training,
+    set_peft_model_state_dict,
+)
 from safetensors.torch import load_file
 
 from trl import PRMConfig, PRMTrainer
@@ -975,7 +981,20 @@ def main():
         for ckpt_file in ckpt_files:
             if os.path.exists(ckpt_file):
                 state = load_file(ckpt_file)
-                missing, unexpected = trainer.model.load_state_dict(state, strict=False)
+                if ckpt_file.endswith("adapter_model.safetensors"):
+                    if not use_lora:
+                        rank_zero_print(
+                            "Found adapter checkpoint but LoRA is disabled; skipping adapter weights."
+                        )
+                        continue
+                    load_result = set_peft_model_state_dict(
+                        trainer.model, state, adapter_name="default"
+                    )
+                else:
+                    load_result = trainer.model.load_state_dict(state, strict=False)
+
+                missing = getattr(load_result, "missing_keys", [])
+                unexpected = getattr(load_result, "unexpected_keys", [])
                 rank_zero_print(f"Loaded weights from: {ckpt_file}")
                 if missing:
                     rank_zero_print(f"Missing keys (first 5): {missing[:5]}")
