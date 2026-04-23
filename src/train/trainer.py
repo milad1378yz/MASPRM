@@ -91,7 +91,7 @@ def arg_parser():
         help="If using a sentinel like '<extra_0>', add it to tokenizer.",
     )
     # Loss (PRM/ORM only)
-    ap.add_argument("--loss", choices=["mse", "huber", "bce"], default="huber")
+    ap.add_argument("--loss", choices=["mse", "huber", "bce"], default="bce")
     ap.add_argument("--huber-beta", type=float, default=0.1)
     # LoRA
     ap.add_argument("--lora-r", type=int, default=256)
@@ -713,11 +713,9 @@ def main():
         ampere_or_newer = False
         attn_impl = "sdpa"  # Default for CPU
 
-    # LoRA path: 4-bit  FP16 compute as before. Full FT path: never BF16 unless Ampere.
-    if use_lora:
-        chosen_dtype = torch.float16
-    else:
-        chosen_dtype = torch.bfloat16 if ampere_or_newer else torch.float16
+    # Prefer BF16 on Ampere+ (including the LoRA path) to avoid FP16 grad-norm
+    # overflow spikes. Only fall back to FP16 on Volta/Turing.
+    chosen_dtype = torch.bfloat16 if ampere_or_newer else torch.float16
 
     device_map = "auto" if use_lora else None
 
@@ -816,19 +814,13 @@ def main():
             len(tokenizer),
             getattr(eval_dataset, "_fingerprint", "eval"),
         )
-        train_cache = (
-            base
-            / (
-                f"ppm_tok_{tokenizer.name_or_path.replace('/','-')}"
-                f"_L{args.max_length}_{train_cache_key}_train.arrow"
-            )
+        train_cache = base / (
+            f"ppm_tok_{tokenizer.name_or_path.replace('/','-')}"
+            f"_L{args.max_length}_{train_cache_key}_train.arrow"
         )
-        eval_cache = (
-            base
-            / (
-                f"ppm_tok_{tokenizer.name_or_path.replace('/','-')}"
-                f"_L{args.max_length}_{eval_cache_key}_eval.arrow"
-            )
+        eval_cache = base / (
+            f"ppm_tok_{tokenizer.name_or_path.replace('/','-')}"
+            f"_L{args.max_length}_{eval_cache_key}_eval.arrow"
         )
 
         train_dataset = train_dataset.map(
