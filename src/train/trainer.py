@@ -381,12 +381,16 @@ def compute_regression_metrics(eval_pred):
 
 # PPM (pairwise preference) utilities
 def _join_steps(prompt: str, steps: List[str], sep: str) -> str:
-    """Build a single text where each step ends with the separator token."""
-    text = prompt.rstrip() + "\n"
+    """Build a single text where each step ends with the separator token.
+
+    Must match `render_state_text` in experiments/core.py so a PPM checkpoint
+    loaded through `load_prm_scorer` sees the same string shape at inference
+    as it did at training (prompt + step + sep, no added newlines/spaces).
+    """
+    text = prompt
     for s in steps:
-        s = s.strip()
         if s:
-            text += s + " " + sep + " "
+            text += s + sep
     return text
 
 

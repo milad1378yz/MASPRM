@@ -747,8 +747,11 @@ def render_state_text(
             if agent_idx in trajectory and trajectory[agent_idx]
             else ""
         )
+        # Training records are {prompt=user_content, completions=[output], labels=[q]},
+        # which TRL tokenizes as tok(user_content)+tok(output)+[sep] with no delimiter
+        # in between. Match that here — do not inject "\n\n".
         if user_content and output:
-            return user_content + "\n\n" + output + step_separator
+            return user_content + output + step_separator
         if output:
             return output + step_separator
         if user_content:
