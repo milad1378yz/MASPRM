@@ -39,15 +39,24 @@ def _tag_value(value: Any) -> str:
 def _result_path(
     dataset: str,
     split: str,
+    config_path: Path,
     model_id: str,
     n_rollouts: int,
     c: float,
     n_candidates: int,
     gen_kwargs: Dict[str, Any],
 ) -> Path:
+    dataset_tag = _tag_value(dataset)
+    config_tag = _tag_value(config_path.stem)
+    if config_tag != dataset_tag:
+        dataset_tag = (
+            config_tag
+            if config_tag.startswith(f"{dataset_tag}_")
+            else f"{dataset_tag}_{config_tag}"
+        )
     model_tag = model_id.replace("/", "_")
     return Path("results") / (
-        f"{dataset}_res_{split}_{model_tag}"
+        f"{dataset_tag}_res_{split}_{model_tag}"
         f"_r{n_rollouts}"
         f"_c{_tag_value(c)}"
         f"_cand{n_candidates}"
@@ -275,6 +284,7 @@ def main():
     result_path = _result_path(
         args.dataset,
         args.split,
+        cfg_path,
         args.model_id,
         args.n_rollouts,
         search_c,
