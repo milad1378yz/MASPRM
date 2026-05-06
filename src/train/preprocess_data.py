@@ -112,6 +112,43 @@ def _iter_paths_exact_nodes(
             stack.append((ch, path + [ch]))
 
 
+def _iter_paths_to_terminals(
+    root: Dict[str, Any], *, max_depth: Optional[int] = None
+) -> Iterable[List[Dict[str, Any]]]:
+    """
+    Variable-length path iterator. Yields every root->leaf path whose leaf
+    has ``is_terminal=True``. Used for dynamic-scheduler MAS configs where
+    different branches terminate at different depths (e.g., DyLAN-style
+    judge-gated refinement: AGREE branches terminate early, DISAGREE branches
+    run to a deeper FinalJudge node).
+    """
+    stack: List[tuple[Dict[str, Any], List[Dict[str, Any]]]] = [(root, [root])]
+    while stack:
+        nd, path = stack.pop()
+        if (max_depth is not None) and (len(path) - 1 > max_depth):
+            continue
+        children = nd.get("children") or []
+        if not children:
+            if bool(nd.get("is_terminal", False)):
+                yield path
+            continue
+        for ch in reversed(children):
+            stack.append((ch, path + [ch]))
+
+
+def _path_iter(
+    root: Dict[str, Any], target_nodes: Optional[int]
+) -> Iterable[List[Dict[str, Any]]]:
+    """Pick the right path iterator based on whether the MAS has fixed depth.
+
+    ``target_nodes is None`` (or ``<= 0``) -> variable-depth mode.
+    Positive int -> legacy exact-length filter (back-compat for static DAGs).
+    """
+    if target_nodes is None or int(target_nodes) <= 0:
+        return _iter_paths_to_terminals(root)
+    return _iter_paths_exact_nodes(root, int(target_nodes))
+
+
 def _extract_prompt(root: Dict[str, Any], fallback: str) -> str:
     txt = root.get("node_text")
     if isinstance(txt, str) and txt.strip():
@@ -145,10 +182,15 @@ def _records_from_tree(
     data: Dict[str, Any],
     *,
     filename_hint: str,
-    target_nodes: int = 5,  # root + 4 actions
+    target_nodes: Optional[int] = 5,  # root + 4 actions; None/0 -> variable depth
 ) -> Tuple[List[Dict[str, Any]], int, int]:
-    """
-    Original PRM-sample extraction (kept intact for backward compatibility).
+    """PRM-sample extraction.
+
+    ``target_nodes`` is treated as an *exact path length* when positive
+    (back-compat with the original static-DAG pipeline). Pass ``None`` or
+    ``0`` to accept any root->leaf path whose leaf is terminal — required
+    for dynamic-scheduler MAS configs where different branches end at
+    different depths.
     """
     prompt = _extract_prompt(data, fallback=filename_hint)
 
@@ -160,8 +202,9 @@ def _records_from_tree(
     out: List[Dict[str, Any]] = []
     n_pos = 0  # number of terminal leaves with reward +1
     n_neg = 0  # number of terminal leaves with reward -1
+    fixed_len = (target_nodes is not None) and int(target_nodes) > 0
 
-    for path in _iter_paths_exact_nodes(data, target_nodes=target_nodes):
+    for path in _path_iter(data, target_nodes):
         leaf = path[-1]
 
         # Only accept terminal leaves with q == ±1
@@ -176,9 +219,11 @@ def _records_from_tree(
             continue
         actions, labels = res
 
-        # Exactly target_nodes-1 actions/labels expected
-        if len(actions) != (target_nodes - 1) or len(labels) != (target_nodes - 1):
-            continue
+        # Length sanity-check only applies in fixed-depth (legacy) mode.
+        if fixed_len:
+            expected = int(target_nodes) - 1
+            if len(actions) != expected or len(labels) != expected:
+                continue
 
         # Count sign of the terminal reward (leaf)
         if float(leaf_q) > 0:
@@ -196,7 +241,7 @@ def _records_from_tree_local(
     *,
     mas: Any,
     filename_hint: str,
-    target_nodes: int = 5,
+    target_nodes: Optional[int] = 5,
 ) -> Tuple[List[Dict[str, Any]], int, int]:
     """Local-view PRM records: one record per (path, step).
 
@@ -215,8 +260,9 @@ def _records_from_tree_local(
     out: List[Dict[str, Any]] = []
     n_pos = 0
     n_neg = 0
+    fixed_len = (target_nodes is not None) and int(target_nodes) > 0
 
-    for path in _iter_paths_exact_nodes(data, target_nodes=target_nodes):
+    for path in _path_iter(data, target_nodes):
         leaf = path[-1]
         if not bool(leaf.get("is_terminal", False)):
             continue
@@ -241,7 +287,9 @@ def _records_from_tree_local(
                 ok = False
                 break
             step_info.append((aidx, txt, max(-1.0, min(1.0, float(q)))))
-        if not ok or len(step_info) != (target_nodes - 1):
+        if not ok:
+            continue
+        if fixed_len and len(step_info) != (int(target_nodes) - 1):
             continue
 
         if float(leaf_q) > 0:
@@ -283,22 +331,27 @@ def _ppm_pairs_from_tree(
     data: Dict[str, Any],
     *,
     filename_hint: str,
-    target_nodes: int,
+    target_nodes: Optional[int],
     pos_topk: int = 4,
     neg_topk: int = 4,
     max_pairs: int = 8,
     require_root_window: Optional[Tuple[float, float]] = None,
 ) -> Tuple[List[Dict[str, Any]], int, int]:
     """
-    rStar-Math style step-wise PPM (corrected):
+    rStar-Math style step-wise PPM.
 
-      • For EACH prefix node at depth d (0 <= d < target_nodes-1),
-        form pairs of next actions chosen from disjoint top-K and bottom-K
-        *unique-by-text* children ranked by Q.
-      • Pairs share the same preceding steps (path[1:d+1]) and differ at
-        EXACTLY one step (the current child).
-      • For the FINAL step (d == target_nodes-2), only terminal children
-        are considered.
+      • For EACH prefix node, form pairs of next actions chosen from disjoint
+        top-K and bottom-K *unique-by-text* children ranked by Q.
+      • Pairs share the same preceding steps and differ at EXACTLY one step
+        (the current child).
+      • At the *final step* of any branch (i.e., a prefix whose children are
+        all terminal leaves), only terminal children are considered. In a
+        static DAG with target_nodes=N this happens once at depth N-2; in a
+        dynamic-scheduler DAG this can happen at *different* depths along
+        different branches (e.g., AGREE branches end at the Judge while
+        DISAGREE branches end at the FinalJudge).
+      • ``target_nodes`` positive int -> legacy fixed-depth mode (gates by
+        depth). ``None`` or ``0`` -> variable-depth mode.
       • max_pairs limits the TOTAL pairs per tree.
 
     Returns: (records, num_positive_candidates, num_negative_candidates).
@@ -320,6 +373,8 @@ def _ppm_pairs_from_tree(
     seen_pairs: set[Tuple[Tuple[str, ...], Tuple[str, ...]]] = set()
 
     pairs_made_total = 0
+    fixed_len = (target_nodes is not None) and int(target_nodes) > 0
+    tn = int(target_nodes) if fixed_len else 0
 
     MIN_MARGIN = 1e-9  # require pos_q > neg_q + MIN_MARGIN
 
@@ -330,18 +385,26 @@ def _ppm_pairs_from_tree(
         depth = len(path) - 1  # root=0
 
         # Enqueue deeper nodes (so we can consider their prefixes too)
-        if depth < target_nodes - 1:
+        if (not fixed_len) or (depth < tn - 1):
             for ch in reversed(nd.get("children") or []):
                 stack.append((ch, path + [ch]))
 
         # Only form pairs if there IS a next step to choose
-        if depth >= target_nodes - 1:
+        if fixed_len and (depth >= tn - 1):
             continue
 
         # Children usable at this step
         children = nd.get("children") or []
-        # For final step, restrict to terminal children only
-        if depth == target_nodes - 2:
+        if not children:
+            continue
+        # "Final step" check. In fixed-depth mode this is purely positional
+        # (depth == target_nodes - 2). In variable-depth mode it is structural:
+        # all children of this prefix are terminal leaves.
+        is_final_step = (
+            (depth == tn - 2) if fixed_len
+            else all(bool(c.get("is_terminal", False)) for c in children)
+        )
+        if is_final_step:
             children = [c for c in children if bool(c.get("is_terminal", False))]
         if not children:
             continue
@@ -435,7 +498,7 @@ def _ppm_pairs_from_tree(
                         "pos_q": float(pq),
                         "neg_q": float(nq),
                         "q_gap": float(pq - nq),
-                        "final_step_only_terminal": (depth == target_nodes - 2),
+                        "final_step_only_terminal": is_final_step,
                     },
                 }
                 out.append(rec)
@@ -449,7 +512,7 @@ def _ppm_pairs_from_tree_local(
     *,
     mas: Any,
     filename_hint: str,
-    target_nodes: int,
+    target_nodes: Optional[int],
     pos_topk: int = 4,
     neg_topk: int = 4,
     max_pairs: int = 8,
@@ -473,6 +536,8 @@ def _ppm_pairs_from_tree_local(
     seen_pairs: set = set()
     pairs_made_total = 0
     MIN_MARGIN = 1e-9
+    fixed_len = (target_nodes is not None) and int(target_nodes) > 0
+    tn = int(target_nodes) if fixed_len else 0
 
     # DFS stack carries (node, node_path, agent_idx_path). agent_idx_path
     # mirrors node_path[1:] (root excluded) and lets us build prefix_forced
@@ -482,18 +547,26 @@ def _ppm_pairs_from_tree_local(
         nd, path, agent_prefix = stack.pop()
         depth = len(path) - 1
 
-        if depth < target_nodes - 1:
+        if (not fixed_len) or (depth < tn - 1):
             for ch in reversed(nd.get("children") or []):
                 child_aidx = _parse_agent_idx(ch.get("action_text"))
                 if child_aidx is None:
                     continue
                 stack.append((ch, path + [ch], agent_prefix + [child_aidx]))
 
-        if depth >= target_nodes - 1:
+        if fixed_len and (depth >= tn - 1):
             continue
 
         children = nd.get("children") or []
-        if depth == target_nodes - 2:
+        if not children:
+            continue
+        # See _ppm_pairs_from_tree: in fixed-depth mode "final step" is by
+        # depth, in variable-depth mode it is "all children are terminal".
+        is_final_step = (
+            (depth == tn - 2) if fixed_len
+            else all(bool(c.get("is_terminal", False)) for c in children)
+        )
+        if is_final_step:
             children = [c for c in children if bool(c.get("is_terminal", False))]
         if not children:
             continue
@@ -585,7 +658,7 @@ def _ppm_pairs_from_tree_local(
                             "pos_q": float(pq),
                             "neg_q": float(nq),
                             "q_gap": float(pq - nq),
-                            "final_step_only_terminal": (depth == target_nodes - 2),
+                            "final_step_only_terminal": is_final_step,
                             "view": "local",
                         },
                     }
@@ -612,7 +685,16 @@ def main():
         help="Directory or file with MAS-MCTS trees",
     )
     ap.add_argument(
-        "--target-nodes", type=int, default=5, help="Exact path length in nodes (root+steps)"
+        "--target-nodes",
+        type=int,
+        default=5,
+        help=(
+            "Exact path length in nodes (root + actions). Pass <=0 to enable "
+            "variable-depth mode, which accepts any root->leaf path whose leaf "
+            "is terminal — required for dynamic-scheduler MAS configs (e.g., "
+            "DyLAN-style judge-gated refinement) where AGREE branches end "
+            "earlier than DISAGREE branches."
+        ),
     )
     ap.add_argument(
         "--dedupe", action="store_true", default=True, help="Remove exact duplicate samples"
@@ -657,6 +739,11 @@ def main():
     )
 
     args = ap.parse_args()
+    # `target_nodes <= 0` is the user-facing way to opt into variable-depth
+    # mode; downstream helpers expect ``None`` for that case.
+    target_nodes_arg: Optional[int] = (
+        int(args.target_nodes) if int(args.target_nodes) > 0 else None
+    )
     view_tag = "" if args.view == "full" else f"_{args.view}"
     prm_output_path = args.input.with_name(f"prm_samples{view_tag}_{args.input.stem}.jsonl")
     prm_output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -710,11 +797,11 @@ def main():
                     t,
                     mas=mas_local,
                     filename_hint=f.stem,
-                    target_nodes=args.target_nodes,
+                    target_nodes=target_nodes_arg,
                 )
             else:
                 recs, cpos, cneg = _records_from_tree(
-                    t, filename_hint=f.stem, target_nodes=args.target_nodes
+                    t, filename_hint=f.stem, target_nodes=target_nodes_arg
                 )
             prm_n_pos += cpos
             prm_n_neg += cneg
@@ -739,7 +826,7 @@ def main():
                         t,
                         mas=mas_local,
                         filename_hint=f.stem,
-                        target_nodes=args.target_nodes,
+                        target_nodes=target_nodes_arg,
                         pos_topk=args.ppm_pos_topk,
                         neg_topk=args.ppm_neg_topk,
                         max_pairs=args.ppm_max_pairs,
@@ -751,7 +838,7 @@ def main():
                     pairs = _ppm_pairs_from_tree(
                         t,
                         filename_hint=f.stem,
-                        target_nodes=args.target_nodes,
+                        target_nodes=target_nodes_arg,
                         pos_topk=args.ppm_pos_topk,
                         neg_topk=args.ppm_neg_topk,
                         max_pairs=args.ppm_max_pairs,

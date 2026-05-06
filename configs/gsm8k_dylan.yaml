@@ -1,0 +1,162 @@
+# DyLAN-style dynamic-scheduler MAS for GSM8K, expressed as an acyclic DAG
+# with conditional edges so it slots directly into the existing MAS / MCTS /
+# PRM training pipeline (no new orchestrator code required).
+#
+# Reference: Liu et al., "Dynamic LLM-Agent Network: An LLM-agent
+# Collaboration Framework with Agent Team Optimization", ICML 2024
+# (arXiv:2310.02170). DyLAN is built around three ideas: a pool of
+# diverse solver agents, multi-round inter-agent communication, and a
+# *dynamic scheduler* that decides — based on consensus — whether a
+# refinement round should run at all. The static DAG below preserves
+# the diversity + judge-gated-refinement shape of DyLAN; the per-round
+# importance-score pruning (which is genuinely cyclic) is folded into
+# the conditional edge that opens the refinement layer.
+#
+# Topology:
+#
+#   Q ─► SolverA ─┐
+#   Q ─► SolverB ─┼─► Judge ──(DISAGREE)──► RefinerA ─┐
+#   Q ─► SolverC ─┘   │  (CORRECT path:               ├─► FinalJudge
+#                     │   refiners and FinalJudge      │
+#                     │   are skipped; Judge is the   │
+#                     │   effective sink)              │
+#                     ├──────────────────► RefinerB ──┤
+#                     └──────────────────► RefinerC ──┘
+#
+# Each refiner also sees the Q and its own original draft so it can
+# locally repair its own reasoning, in the spirit of DyLAN's per-agent
+# refinement step.
+#
+# Runtime behavior:
+#   - The Judge emits one of:
+#       VERDICT: AGREE
+#       Final Answer: <number>
+#     or:
+#       VERDICT: DISAGREE
+#       <one short critique paragraph>
+#   - The conditional edges (3 -> 4, 5, 6) only fire when the Judge text
+#     matches /verdict:\s*disagree/i. Otherwise each refiner loses a
+#     required parent (the Judge) and skips. With all refiners skipped,
+#     FinalJudge also loses its required parents and skips, so the
+#     Judge's "Final Answer: <number>" line is the trajectory's terminal
+#     output (via _last_primary_out fallback in mas.py).
+#   - When the refinement round runs, FinalJudge is the only sink that
+#     actually fires, and its "Final Answer: <number>" is the output.
+#
+# This shape is also useful for PRM training: MCTS expanding this graph
+# naturally produces variable-depth rollouts (4 or 8 decisions),
+# branching most informatively at the Judge node which drives the
+# dynamic schedule.
+
+agents:
+  - name: SolverA_MathAnalyst
+    system_prompt: |
+      You are a careful Math Analyst. Read the problem, list the relevant
+      quantities and relationships, then solve step by step, showing
+      arithmetic. End with a single line in the exact format:
+      Final Answer: <number>
+    max_new_tokens: 512
+
+  - name: SolverB_AlgebraSolver
+    system_prompt: |
+      You are an Algebra Solver. Set up explicit variables and equations,
+      then solve them step by step, showing arithmetic. End with a single
+      line in the exact format:
+      Final Answer: <number>
+    max_new_tokens: 512
+
+  - name: SolverC_ArithmeticReasoner
+    system_prompt: |
+      You are an Arithmetic Reasoner. Translate the problem into a
+      sequence of concrete arithmetic operations and execute each one,
+      showing your work. End with a single line in the exact format:
+      Final Answer: <number>
+    max_new_tokens: 512
+
+  - name: Judge
+    system_prompt: |
+      You are the Judge. You receive the original question and three
+      candidate solutions from peer solvers. Independently re-derive the
+      answer and compare it against the candidates.
+
+      If at least two of the three candidates agree with your re-derived
+      answer AND the reasoning is sound, output EXACTLY:
+      VERDICT: AGREE
+      Final Answer: <number>
+
+      Otherwise, output EXACTLY:
+      VERDICT: DISAGREE
+      <one short paragraph identifying where the candidates went wrong;
+      do NOT give a final number on the second line>
+    max_new_tokens: 384
+
+  - name: RefinerA
+    system_prompt: |
+      You are Refiner A. You receive the original question, your own
+      previous draft, and the Judge's critique. Produce a corrected
+      solution that addresses the critique, showing arithmetic. End with
+      a single line in the exact format:
+      Final Answer: <number>
+    max_new_tokens: 512
+
+  - name: RefinerB
+    system_prompt: |
+      You are Refiner B. You receive the original question, your own
+      previous draft, and the Judge's critique. Produce a corrected
+      solution that addresses the critique, showing arithmetic. End with
+      a single line in the exact format:
+      Final Answer: <number>
+    max_new_tokens: 512
+
+  - name: RefinerC
+    system_prompt: |
+      You are Refiner C. You receive the original question, your own
+      previous draft, and the Judge's critique. Produce a corrected
+      solution that addresses the critique, showing arithmetic. End with
+      a single line in the exact format:
+      Final Answer: <number>
+    max_new_tokens: 512
+
+  - name: FinalJudge
+    system_prompt: |
+      You are the Final Judge. You receive the original question and
+      three refined solutions. Decide on the correct numeric answer
+      (re-derive if needed) and output EXACTLY one line:
+      Final Answer: <number>
+    max_new_tokens: 256
+
+# Edges: [src, dst] or [src, dst, condition]. -1 is the external question.
+# Indices: 0 SolverA, 1 SolverB, 2 SolverC, 3 Judge,
+#          4 RefinerA, 5 RefinerB, 6 RefinerC, 7 FinalJudge.
+edges:
+  # Q -> solvers
+  - [-1, 0]
+  - [-1, 1]
+  - [-1, 2]
+
+  # Q + all solvers -> Judge
+  - [-1, 3]
+  - [ 0, 3]
+  - [ 1, 3]
+  - [ 2, 3]
+
+  # Refiner A: needs Q, own draft (Solver A), and a DISAGREE verdict.
+  - [-1, 4]
+  - [ 0, 4]
+  - [ 3, 4, "regex:(?i)verdict:\\s*disagree"]
+
+  # Refiner B: needs Q, own draft (Solver B), and a DISAGREE verdict.
+  - [-1, 5]
+  - [ 1, 5]
+  - [ 3, 5, "regex:(?i)verdict:\\s*disagree"]
+
+  # Refiner C: needs Q, own draft (Solver C), and a DISAGREE verdict.
+  - [-1, 6]
+  - [ 2, 6]
+  - [ 3, 6, "regex:(?i)verdict:\\s*disagree"]
+
+  # Q + all refiners -> FinalJudge
+  - [-1, 7]
+  - [ 4, 7]
+  - [ 5, 7]
+  - [ 6, 7]

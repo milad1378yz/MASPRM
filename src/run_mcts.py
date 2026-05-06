@@ -233,6 +233,13 @@ def main():
 
     ap.add_argument("--n_rollouts", type=int, default=64)
 
+    ap.add_argument(
+        "--mas_config",
+        type=str,
+        default=None,
+        help="Optional path to a MAS YAML config. Defaults to configs/<dataset>.yaml.",
+    )
+
     # Ray parallelism flags (optional)
     ap.add_argument("--ray", action="store_true", help="Parallelize across GPUs using Ray actors.")
     ap.add_argument(
@@ -254,7 +261,7 @@ def main():
     data, q_fn, gold_fn = load_hard_dataset(args.dataset, args.split, args.n, args.seed)
 
     # Load MAS graph (agents + edges) from YAML
-    cfg_path = Path("configs") / f"{args.dataset}.yaml"
+    cfg_path = Path(args.mas_config) if args.mas_config else Path("configs") / f"{args.dataset}.yaml"
     cfg = yaml.safe_load(cfg_path.read_text())
     agent_specs = cfg["agents"]
     edges = cfg["edges"]

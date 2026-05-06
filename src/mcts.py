@@ -198,15 +198,15 @@ class MAS_MCTS(BaseMCTS):
                 self._finalize_node(node)
                 return path
 
-            # Expand if no children
+            # Expand if no children. With conditional edges, the trajectory
+            # depth is not fixed at `len(self.order)`: an AGREE branch may
+                # terminate at depth 4 while a DISAGREE branch goes to depth 8.
+            # We therefore use the full `n_candidates` budget at every
+            # expansion rather than halving at "the last layer" — that
+            # heuristic only made sense when every trajectory had the same
+            # length.
             if not node.children:
-                depth = self._depth_of(node)  # which agent to decide
-                agent_idx, candidates = self._sample_candidates(
-                    node,
-                    self.n_candidates
-                    if depth < (len(self.order) - 1)
-                    else max(1, self.n_candidates // 2),
-                )
+                agent_idx, candidates = self._sample_candidates(node, self.n_candidates)
 
                 for outs in candidates:
                     node.children.append(self._make_child(node, agent_idx, outs))

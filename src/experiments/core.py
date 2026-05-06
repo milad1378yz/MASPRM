@@ -840,10 +840,10 @@ class MCTSInfer(BaseMCTS):
         return self._uct(parent, child)
 
     def _expand(self, node: Node) -> None:
-        d = self._depth_of(node)
-        if d >= len(self.order):
+        # With conditional edges, terminality is determined by `next_runnable`
+        # rather than depth (different branches may have different lengths).
+        if self._is_terminal(node):
             return
-
         agent_idx, inbox = self._expansion_context(node)
         msgs = self.mas.agent_messages(agent_idx, inbox)
         enc = self.mas.agents[agent_idx].tok.apply_chat_template(

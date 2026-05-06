@@ -44,6 +44,11 @@ def main():
         "--orm_dir",
         default="checkpoints/Qwen2.5-1.5B-1.5B-ORM-qlora-512-mmlu",
     )
+    parser.add_argument(
+        "--mas_config",
+        default=None,
+        help="Optional path to a MAS YAML config. Defaults to configs/<dataset>.yaml.",
+    )
     args = parser.parse_args()
 
     # Dataset
@@ -63,7 +68,7 @@ def main():
 
     # MAS graph config
 
-    cfg_path = Path("configs") / f"{DATASET_NAME}.yaml"
+    cfg_path = Path(args.mas_config) if args.mas_config else Path("configs") / f"{DATASET_NAME}.yaml"
     cfg = yaml.safe_load(cfg_path.read_text())
     agent_specs: List[Dict[str, Any]] = cfg["agents"]
     edges: List[List[int]] = cfg["edges"]
