@@ -680,6 +680,21 @@ def evaluate_conditions_ray(
     result_name_by_kind: Dict[str, str] = {}
     LOG_EVERY = int(os.environ.get("LOG_EVERY", "10"))  # progress write interval (examples)
     N_TOTAL = len(data)
+    base_manifest = {
+        "dataset": name_dataset,
+        "data_count": N_TOTAL,
+        "data_sha256": _stable_hash(data),
+        "agent_specs": worker_init.agent_specs,
+        "edges": worker_init.edges,
+        "handoff_config": worker_init.handoff_config,
+        "step_separator": worker_init.step_separator,
+        "gen_model_id": worker_init.gen_model_id,
+        "prm": _checkpoint_identity(worker_init.prm_dir),
+        "prm_base_model_id": worker_init.prm_base_model_id,
+        "orm": _checkpoint_identity(worker_init.orm_dir),
+        "dtype": worker_init.dtype,
+        "seed": worker_init.seed,
+    }
     handoff_kinds = {
         "handoff_fixed",
         "handoff_random",
@@ -727,9 +742,16 @@ def evaluate_conditions_ray(
         # (e.g. view_mode=full vs local) do not collide in the skip log path.
         model = worker_init.gen_model_id.split("/")[-1]
         params = "_".join(f"{k}-{v}" for k, v in spec.params.items())[:20]
-        params_fingerprint = hashlib.md5(
-            json.dumps(spec.params, sort_keys=True, default=str).encode("utf-8")
-        ).hexdigest()[:8]
+        condition_manifest = {
+            **base_manifest,
+            "condition": {
+                "name": spec.name,
+                "kind": spec.kind,
+                "params": spec.params,
+            },
+        }
+        manifest_hash = _stable_hash(condition_manifest)
+        params_fingerprint = manifest_hash[:12]
 
         # Assemble final path
         results_path = (
@@ -737,9 +759,20 @@ def evaluate_conditions_ray(
             f"{prm}{orm}_{model}_{worker_init.seed}.txt"
         )
         records_path = str(Path(results_path).with_suffix(".jsonl"))
+        manifest_path = str(Path(results_path).with_suffix(".manifest.json"))
+        summary_path = str(Path(results_path).with_suffix(".summary.json"))
         result_path_by_kind[spec.kind] = results_path
         result_name_by_kind[spec.kind] = spec.name
         os.makedirs("logs", exist_ok=True)
+        Path(manifest_path).write_text(
+            json.dumps(
+                {"manifest_hash": manifest_hash, "manifest": condition_manifest},
+                indent=2,
+                ensure_ascii=False,
+                default=str,
+            )
+            + "\n"
+        )
         # If file already contains a COMPLETED marker, skip this condition
         if Path(results_path).exists():
             try:
@@ -747,11 +780,21 @@ def evaluate_conditions_ray(
             except Exception:
                 txt = ""
             if "COMPLETED" in txt:
-                print(f"[skip] Found completed log for '{spec.name}' at {results_path}. Skipping.")
-                continue
+                if Path(summary_path).exists() and Path(records_path).exists():
+                    results[spec.name] = json.loads(Path(summary_path).read_text())
+                    cached_correct, cached_prefixes = _cached_correctness(records_path)
+                    correct_by_kind[spec.kind] = cached_correct
+                    if any(cached_prefixes[threshold] for threshold in cached_prefixes):
+                        prefix_correct_by_kind[spec.kind] = cached_prefixes
+                    print(f"[skip] Loaded completed '{spec.name}' from {results_path}.")
+                    continue
+                print(f"[rerun] Completed text log for '{spec.name}' lacks cache sidecars.")
         # Write a start header (append if rerunning)
         with open(results_path, "a") as f:
-            f.write(f"=== START {spec.name} | dataset={name_dataset} | N={N_TOTAL} ===\n")
+            f.write(
+                f"=== START {spec.name} | dataset={name_dataset} | N={N_TOTAL} "
+                f"| manifest={manifest_hash} ===\n"
+            )
         Path(records_path).write_text("")
 
         if spec.kind not in handoff_kinds and handoff_workers is not None:
@@ -861,6 +904,7 @@ def evaluate_conditions_ray(
             record = {
                 "index": int(idx),
                 "condition": spec.kind,
+                "manifest_hash": manifest_hash,
                 "prediction": str(pred),
                 "gold": str(gold),
                 "correct": bool(top_correct),
