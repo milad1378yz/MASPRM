@@ -1,3 +1,4 @@
+from collections import Counter
 from dataclasses import dataclass, field
 from functools import partial
 from typing import Optional, Dict, List, Any
@@ -680,6 +681,19 @@ def evaluate_conditions_ray(
     result_name_by_kind: Dict[str, str] = {}
     LOG_EVERY = int(os.environ.get("LOG_EVERY", "10"))  # progress write interval (examples)
     N_TOTAL = len(data)
+    source_root = Path(__file__).resolve().parent.parent
+    implementation_sha256 = hashlib.sha256(
+        b"".join(
+            path.read_bytes()
+            for path in (
+                Path(__file__).resolve(),
+                Path(__file__).with_name("core.py").resolve(),
+                source_root / "handoff_mas.py",
+                source_root / "agent.py",
+                source_root / "answer_utils.py",
+            )
+        )
+    ).hexdigest()
     base_manifest = {
         "dataset": name_dataset,
         "data_count": N_TOTAL,
@@ -694,6 +708,7 @@ def evaluate_conditions_ray(
         "orm": _checkpoint_identity(worker_init.orm_dir),
         "dtype": worker_init.dtype,
         "seed": worker_init.seed,
+        "implementation_sha256": implementation_sha256,
     }
     handoff_kinds = {
         "handoff_fixed",
@@ -837,6 +852,7 @@ def evaluate_conditions_ray(
         unique_edges: List[int] = []
         revisit_rates: List[float] = []
         route_entropies: List[float] = []
+        route_counts_by_speaker: Dict[str, Counter] = {}
         context_token_values: List[int] = []
         context_truncations = 0
         parse_failures_total = 0
@@ -892,6 +908,11 @@ def evaluate_conditions_ray(
                 unique_edges.append(int(metadata.get("unique_directed_role_edges", 0)))
                 revisit_rates.append(float(metadata.get("role_revisit_rate", 0.0)))
                 route_entropies.append(float(metadata.get("route_entropy_bits", 0.0)))
+                for turn in metadata.get("turns", []):
+                    speaker = str(turn.get("speaker", ""))
+                    recipient = str(turn.get("recipient", ""))
+                    if speaker and recipient and recipient != "FINAL":
+                        route_counts_by_speaker.setdefault(speaker, Counter())[recipient] += 1
                 context_token_values.extend(
                     int(value) for value in metadata.get("prm_context_tokens", [])
                 )
@@ -1013,6 +1034,20 @@ def evaluate_conditions_ray(
         if handoff_examples:
             sorted_context = sorted(context_token_values)
             p95_idx = max(0, math.ceil(0.95 * len(sorted_context)) - 1) if sorted_context else 0
+            routed_edge_total = sum(
+                sum(recipient_counts.values())
+                for recipient_counts in route_counts_by_speaker.values()
+            )
+            conditional_route_entropy = 0.0
+            for recipient_counts in route_counts_by_speaker.values():
+                speaker_total = sum(recipient_counts.values())
+                speaker_entropy = 0.0
+                for count in recipient_counts.values():
+                    probability = count / speaker_total
+                    speaker_entropy -= probability * math.log2(probability)
+                conditional_route_entropy += (
+                    speaker_total / max(1, routed_edge_total)
+                ) * speaker_entropy
             handoff_summary = {
                 f"hit_at_{threshold}": prefix_correct[threshold] / handoff_examples
                 for threshold in prefix_correct
@@ -1024,7 +1059,10 @@ def evaluate_conditions_ray(
                     "unique_agents_mean": float(statistics.mean(unique_agents)),
                     "unique_directed_role_edges_mean": float(statistics.mean(unique_edges)),
                     "role_revisit_rate_mean": float(statistics.mean(revisit_rates)),
-                    "route_entropy_bits_mean": float(statistics.mean(route_entropies)),
+                    "route_entropy_bits": conditional_route_entropy,
+                    "within_trajectory_edge_entropy_bits_mean": float(
+                        statistics.mean(route_entropies)
+                    ),
                     "prm_context_token_median": (
                         float(statistics.median(sorted_context)) if sorted_context else 0.0
                     ),
@@ -1044,6 +1082,10 @@ def evaluate_conditions_ray(
                 }
             )
             results[spec.name].update(handoff_summary)
+
+        Path(summary_path).write_text(
+            json.dumps(results[spec.name], indent=2, sort_keys=True) + "\n"
+        )
 
         # Append final summary and mark as completed
         with open(results_path, "a") as f:
@@ -1073,7 +1115,8 @@ def evaluate_conditions_ray(
                     f"Role revisit rate (mean): {results[spec.name]['role_revisit_rate_mean']:.4f}\n"
                 )
                 f.write(
-                    f"Route entropy bits (mean): {results[spec.name]['route_entropy_bits_mean']:.4f}\n"
+                    "Route entropy H(recipient|speaker), bits: "
+                    f"{results[spec.name]['route_entropy_bits']:.4f}\n"
                 )
                 f.write(
                     "PRM context tokens (median/p95): "
@@ -1135,5 +1178,8 @@ def evaluate_conditions_ray(
                             f"prm-only={int(comparison['mcnemar_prm_only_correct'])}, "
                             f"p={comparison['mcnemar_exact_p']:.6f}\n"
                         )
+                Path(comparison_path).with_suffix(".summary.json").write_text(
+                    json.dumps(results[prm_name], indent=2, sort_keys=True) + "\n"
+                )
 
     return results

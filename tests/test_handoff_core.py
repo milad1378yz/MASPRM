@@ -122,7 +122,10 @@ class _LogprobModel(torch.nn.Module):
         batch, length = input_ids.shape
         vocab = torch.arange(8, device=input_ids.device, dtype=torch.float32)
         positions = torch.arange(length, device=input_ids.device, dtype=torch.float32)
-        logits = positions.view(1, length, 1) * 0.1 + vocab.view(1, 1, 8) * 0.2
+        logits = (
+            positions.view(1, length, 1) * vocab.view(1, 1, 8) * 0.05
+            + vocab.view(1, 1, 8) * 0.2
+        )
         logits = logits.expand(batch, -1, -1) + self.anchor
         if isinstance(logits_to_keep, torch.Tensor):
             logits = logits[:, logits_to_keep, :]
