@@ -64,9 +64,7 @@ def _merge_nested_dicts(
     left: Optional[Dict[int, Dict[int, str]]],
     right: Optional[Dict[int, Dict[int, str]]],
 ) -> Dict[int, Dict[int, str]]:
-    merged: Dict[int, Dict[int, str]] = {
-        int(k): dict(v) for k, v in (left or {}).items()
-    }
+    merged: Dict[int, Dict[int, str]] = {int(k): dict(v) for k, v in (left or {}).items()}
     for key, value in (right or {}).items():
         key = int(key)
         child_updates = dict(value)
@@ -79,9 +77,7 @@ def _merge_nested_dicts(
     return merged
 
 
-def _merge_dicts(
-    left: Optional[Dict[int, Any]], right: Optional[Dict[int, Any]]
-) -> Dict[int, Any]:
+def _merge_dicts(left: Optional[Dict[int, Any]], right: Optional[Dict[int, Any]]) -> Dict[int, Any]:
     merged = dict(left or {})
     merged.update(right or {})
     return merged
@@ -127,14 +123,10 @@ class MAS:
                 elif len(edge) == 3:
                     src, dst, cond_spec = int(edge[0]), int(edge[1]), edge[2]
                 else:
-                    raise ValueError(
-                        f"Edge must be [src, dst] or [src, dst, condition]: {edge!r}"
-                    )
+                    raise ValueError(f"Edge must be [src, dst] or [src, dst, condition]: {edge!r}")
             parsed_edges.append((src, dst))
             edge_conditions[(src, dst)] = _parse_condition(cond_spec)
-            edge_condition_specs[(src, dst)] = (
-                cond_spec if isinstance(cond_spec, str) else None
-            )
+            edge_condition_specs[(src, dst)] = cond_spec if isinstance(cond_spec, str) else None
 
         self.edges = parsed_edges
         self.edge_conditions = edge_conditions
@@ -163,9 +155,7 @@ class MAS:
 
         self.edge_index = {e: i for i, e in enumerate(self.edges)}
         self.agent_order = self._topological_order()
-        self.agent_position = {
-            agent_idx: pos for pos, agent_idx in enumerate(self.agent_order)
-        }
+        self.agent_position = {agent_idx: pos for pos, agent_idx in enumerate(self.agent_order)}
         self.sinks = [i for i in range(self.n) if len(self.children.get(i, [])) == 0]
         self.required_parents: Dict[int, Set[int]] = {
             i: set(self.parents.get(i, [])) for i in range(self.n)
@@ -225,9 +215,7 @@ class MAS:
             return []
         return [str(out)]
 
-    def agent_input_map(
-        self, idx: int, inbox: Dict[int, Dict[int, str]]
-    ) -> Dict[int, str]:
+    def agent_input_map(self, idx: int, inbox: Dict[int, Dict[int, str]]) -> Dict[int, str]:
         have = inbox.get(idx, {})
         return {
             parent_idx: have[parent_idx]
@@ -252,9 +240,7 @@ class MAS:
             {"role": "user", "content": user_content},
         ]
 
-    def run_agent(
-        self, idx: int, inbox: Dict[int, Dict[int, str]], **gen_kwargs
-    ) -> List[str]:
+    def run_agent(self, idx: int, inbox: Dict[int, Dict[int, str]], **gen_kwargs) -> List[str]:
         out = self.agents[idx].generate(self.agent_messages(idx, inbox), **gen_kwargs)
         return self._normalize_outs(out)
 
@@ -270,9 +256,7 @@ class MAS:
         if hasattr(agent, "generate_n"):
             outs_list = agent.generate_n(msgs, n=n_candidates, **gen_kwargs)
         else:
-            outs_list = [
-                agent.generate(msgs, **gen_kwargs) for _ in range(n_candidates)
-            ]
+            outs_list = [agent.generate(msgs, **gen_kwargs) for _ in range(n_candidates)]
         return [self._normalize_outs(out) for out in outs_list]
 
     def _deliver_outputs(
@@ -336,9 +320,7 @@ class MAS:
             "inbox": {},
             "agent_io": {},
             "primary_out": {},
-            "active_agents": (
-                None if active_agents is None else {int(i) for i in active_agents}
-            ),
+            "active_agents": (None if active_agents is None else {int(i) for i in active_agents}),
             "forced_outputs": {
                 int(agent_idx): self._normalize_outs(outs)
                 for agent_idx, outs in (forced_outputs or {}).items()
@@ -391,15 +373,12 @@ class MAS:
         graph = StateGraph(_MASState)
         graph.add_node(self._INPUT_NODE, self._input_node)
         for agent_idx in range(self.n):
-            graph.add_node(
-                self._agent_node_name(agent_idx), self._agent_node(agent_idx)
-            )
+            graph.add_node(self._agent_node_name(agent_idx), self._agent_node(agent_idx))
 
         graph.add_edge(START, self._INPUT_NODE)
         for agent_idx in self.agent_order:
             parents = [
-                self._graph_node_name(parent_idx)
-                for parent_idx in self.parent_order[agent_idx]
+                self._graph_node_name(parent_idx) for parent_idx in self.parent_order[agent_idx]
             ]
             if not parents:
                 continue
@@ -439,9 +418,7 @@ class MAS:
         if len(finals) == 1:
             return finals[0]
         if len(finals) > 1:
-            ordered = [
-                f"[agent {i}] {primary_out[i]}" for i in self.sinks if i in primary_out
-            ]
+            ordered = [f"[agent {i}] {primary_out[i]}" for i in self.sinks if i in primary_out]
             return "\n\n".join(ordered)
         return last
 
