@@ -27,10 +27,16 @@ METHODS = (
     "mcts_prm",
     "mcts_logprob",
     "mcts_orm",
+    "mcts_judge",
     "voter_plain",
     "voter_prm",
     "voter_logprob",
     "voter_orm",
+    "pooled_sc",
+    "pooled_logprob",
+    "pooled_orm",
+    "pooled_prm",
+    "pooled_judge",
     "handoff_fixed",
     "handoff_random",
     "handoff_policy",
@@ -88,6 +94,22 @@ def build_condition_specs(args: argparse.Namespace) -> List[ConditionSpec]:
             )
             continue
 
+        if method.startswith("pooled_"):
+            pooled_names = {
+                "pooled_sc": f"SC@{args.voter_k} majority vote (shared pool)",
+                "pooled_logprob": "Policy likelihood (shared pool)",
+                "pooled_orm": "ORM (shared pool)",
+                "pooled_prm": "MASPRM (shared pool)",
+                "pooled_judge": "LLM-MCA-style Judge (shared pool)",
+            }
+            params = {"k": args.voter_k, "gen_kwargs": sbs_kwargs}
+            if method in {"pooled_prm", "pooled_orm"}:
+                params["view_mode"] = args.view_mode
+            if method == "pooled_logprob" and args.logprob_agg != "sum":
+                params["logprob_agg"] = args.logprob_agg
+            conditions.append(ConditionSpec(pooled_names[method], method, params))
+            continue
+
         family, scorer = method.split("_", 1)
         if family == "sbs":
             params = {"B1": args.b1, "B2": args.b2, "gen_kwargs": sbs_kwargs}
@@ -106,6 +128,7 @@ def build_condition_specs(args: argparse.Namespace) -> List[ConditionSpec]:
                 "prm": "PPM",
                 "logprob": "logprob",
                 "orm": "ORM",
+                "judge": "Judge (stepwise action ranking)",
             }[scorer]
             name = f"{'DyLAN ' if method == 'mcts_prm' else ''}{search_name} + {scorer_name}"
             if args.uct_type != "uct":
@@ -161,6 +184,16 @@ def main():
     )
     parser.add_argument("--gen_model_id", default="Qwen/Qwen2.5-1.5B-Instruct")
     parser.add_argument(
+        "--judge_model_id",
+        default="Qwen/Qwen2.5-7B-Instruct",
+        help="Zero-shot judge LM for mcts_judge / pooled_judge (never sees gold).",
+    )
+    parser.add_argument(
+        "--judge_load_in_4bit",
+        action="store_true",
+        help="Load the judge LM with 4-bit quantization.",
+    )
+    parser.add_argument(
         "--view_mode",
         choices=["full", "local"],
         default="full",
@@ -188,7 +221,9 @@ def main():
         ),
     )
     method_args = parser.add_argument_group("method hyperparameters")
-    method_args.add_argument("--b1", type=int, default=3, help="SBS retained beam width.")
+    method_args.add_argument(
+        "--b1", type=int, default=3, help="SBS retained beam width."
+    )
     method_args.add_argument(
         "--b2", type=int, default=5, help="SBS candidates sampled per expansion."
     )
@@ -238,6 +273,10 @@ def main():
     args = parser.parse_args()
 
     uses_handoff = any(method.startswith("handoff_") for method in args.methods)
+    uses_pooled = any(method.startswith("pooled_") for method in args.methods)
+    uses_judge = any(
+        method in {"mcts_judge", "pooled_judge"} for method in args.methods
+    )
     if uses_handoff and any(
         not method.startswith("handoff_") for method in args.methods
     ):
@@ -246,7 +285,9 @@ def main():
             "separate invocations"
         )
     if args.dataset is None:
-        args.dataset = "competition_math" if uses_handoff else "mmlu"
+        args.dataset = (
+            "gsm8k" if (uses_handoff or uses_pooled or uses_judge) else "mmlu"
+        )
     if uses_handoff and args.sample_n is None:
         args.sample_n = 200
 
@@ -278,7 +319,7 @@ def main():
     conditions = build_condition_specs(args)
 
     needs_orm = any(
-        condition.kind in {"mcts_orm", "voter_orm"}
+        condition.kind in {"mcts_orm", "voter_orm", "pooled_orm"}
         or condition.params.get("leaf_score_type") == "orm"
         for condition in conditions
     )
@@ -287,11 +328,16 @@ def main():
             "--handoff_prm_dir is required for handoff_prm; the requested MASPRM-7B "
             "checkpoint is not available at the repository's 1.5B default"
         )
-    static_prm_methods = {"sbs_prm", "mcts_prm", "voter_prm"}
-    if any(method in static_prm_methods for method in args.methods) and not args.prm_dir:
+    static_prm_methods = {"sbs_prm", "mcts_prm", "voter_prm", "pooled_prm"}
+    if (
+        any(method in static_prm_methods for method in args.methods)
+        and not args.prm_dir
+    ):
         parser.error("--prm_dir is required by the selected static PRM methods")
     if needs_orm and not args.orm_dir:
         parser.error("--orm_dir is required by the selected methods")
+    if uses_judge and not args.judge_model_id:
+        parser.error("--judge_model_id is required by mcts_judge / pooled_judge")
 
     # Dataset
     DATASET_NAME = args.dataset
@@ -305,12 +351,19 @@ def main():
         SPLIT,
         n=SAMPLE_N,
         seed=SEED,
-        levels=(args.math_levels if uses_handoff and DATASET_NAME == "competition_math" else None),
+        levels=(
+            args.math_levels
+            if uses_handoff and DATASET_NAME == "competition_math"
+            else None
+        ),
         stratify_by=(
             args.math_stratify_by
             if uses_handoff and DATASET_NAME == "competition_math"
             else None
         ),
+        # Restrict the stratified MATH pool to items the evaluator can grade
+        # BEFORE sampling, so the handoff run gets its full quota.
+        require_parseable_gold=(uses_handoff and DATASET_NAME == "competition_math"),
     )
     data: List[Dict[str, str]] = []
     for ex in raw_ds:
@@ -331,7 +384,7 @@ def main():
         Path(args.mas_config)
         if args.mas_config
         else (
-            Path("configs/math_handoff8.yaml")
+            Path("configs/gsm8k_handoff8.yaml")
             if uses_handoff
             else Path("configs") / f"{DATASET_NAME}.yaml"
         )
@@ -341,12 +394,18 @@ def main():
     edges: List[List[int]] = cfg.get("edges", [])
     handoff_config = dict(cfg.get("handoff", {})) if uses_handoff else None
     if uses_handoff and not handoff_config:
-        parser.error("Handoff methods require a top-level 'handoff' section in --mas_config")
+        parser.error(
+            "Handoff methods require a top-level 'handoff' section in --mas_config"
+        )
     if handoff_config:
         for condition in conditions:
             if condition.kind.startswith("handoff_"):
-                condition.params.setdefault("initial_speaker", handoff_config.get("initial_role"))
-                condition.params.setdefault("fixed_schedule", handoff_config.get("fixed_schedule"))
+                condition.params.setdefault(
+                    "initial_speaker", handoff_config.get("initial_role")
+                )
+                condition.params.setdefault(
+                    "fixed_schedule", handoff_config.get("fixed_schedule")
+                )
 
     STEP_SEP = "</step>"
 
@@ -376,6 +435,8 @@ def main():
         prm_dir=prm_dir,
         prm_base_model_id=prm_base_model_id,
         orm_dir=ORM_DIR,
+        judge_model_id=(args.judge_model_id if uses_judge else None),
+        judge_load_in_4bit=args.judge_load_in_4bit,
         prm_max_length=2048,
         dtype="float16",
         seed=SEED,
@@ -423,7 +484,9 @@ def main():
     }
     if handoff_results:
         print("\nDynamic-handoff prefix results")
-        print(f"{'Condition':<{name_width}}  {'Hit@4':>7}  {'Hit@8':>7}  {'Hit@12':>7}  {'Depth':>7}")
+        print(
+            f"{'Condition':<{name_width}}  {'Hit@4':>7}  {'Hit@8':>7}  {'Hit@12':>7}  {'Depth':>7}"
+        )
         for cond_name, values in handoff_results.items():
             print(
                 f"{cond_name:<{name_width}}  "
@@ -449,6 +512,39 @@ def main():
                     f"{comparison[prefix + 'paired_bootstrap_ci_high']:.3f}], "
                     f"McNemar p={comparison[prefix + 'mcnemar_exact_p']:.4g}"
                 )
+
+    pooled_rows = {
+        name: values for name, values in results.items() if "oracle_hit_at_k" in values
+    }
+    if pooled_rows:
+        print("\nShared-pool selection results")
+        print(
+            f"{'Condition':<{name_width}}  {'Oracle':>7}  {'Sel|solv':>8}  "
+            f"{'AUC':>6}  {'Lat(s)':>7}"
+        )
+        for cond_name, values in pooled_rows.items():
+            print(
+                f"{cond_name:<{name_width}}  "
+                f"{values['oracle_hit_at_k']:>7.3f}  "
+                f"{values['selection_accuracy_given_solvable']:>8.3f}  "
+                f"{values['candidate_auc']:>6.3f}  "
+                f"{values.get('latency_mean_s', 0.0):>7.3f}"
+            )
+    for cond_name, values in results.items():
+        if "judge_parse_failure_rate" in values:
+            print(
+                f"{cond_name}: judge calls/example="
+                f"{values.get('judge_calls_mean', 0.0):.2f}, "
+                f"parse-failure rate={values['judge_parse_failure_rate']:.4f}"
+            )
+        if "vs_masprm_paired_accuracy_delta" in values:
+            print(
+                f"{cond_name}: MASPRM − this: "
+                f"Δ={values['vs_masprm_paired_accuracy_delta']:.3f}, "
+                f"95% CI [{values['vs_masprm_paired_bootstrap_ci_low']:.3f}, "
+                f"{values['vs_masprm_paired_bootstrap_ci_high']:.3f}], "
+                f"McNemar p={values['vs_masprm_mcnemar_exact_p']:.4g}"
+            )
 
 
 if __name__ == "__main__":

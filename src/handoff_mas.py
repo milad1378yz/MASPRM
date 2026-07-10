@@ -187,19 +187,24 @@ class HandoffMAS:
 
     def __init__(self, agents: Sequence[Agent], role_names: Sequence[str]):
         if len(agents) != len(role_names) or not agents:
-            raise ValueError("agents and role_names must have the same non-zero length.")
+            raise ValueError(
+                "agents and role_names must have the same non-zero length."
+            )
 
         self.agents = list(agents)
         self.role_names = [str(name).strip() for name in role_names]
         if any(not name for name in self.role_names):
             raise ValueError("Every handoff role must have a non-empty name.")
 
-        self._role_indices = {_role_key(name): idx for idx, name in enumerate(self.role_names)}
+        self._role_indices = {
+            _role_key(name): idx for idx, name in enumerate(self.role_names)
+        }
         if len(self._role_indices) != len(self.role_names):
             raise ValueError("Handoff role names must be unique (case-insensitive).")
         if _role_key(FINAL_RECIPIENT) in self._role_indices:
             raise ValueError(
-                f"{FINAL_RECIPIENT!r} is reserved for termination and cannot " "name a role."
+                f"{FINAL_RECIPIENT!r} is reserved for termination and cannot "
+                "name a role."
             )
 
         self.n = len(self.agents)
@@ -216,7 +221,9 @@ class HandoffMAS:
             raise ValueError(f"Unknown handoff role: {role!r}.")
         return self._role_indices[key]
 
-    def visible_turns(self, role: str, turns: Sequence[RoutedTurn]) -> Tuple[RoutedTurn, ...]:
+    def visible_turns(
+        self, role: str, turns: Sequence[RoutedTurn]
+    ) -> Tuple[RoutedTurn, ...]:
         """A role's private view: every turn it spoke or received, in order."""
         key = _role_key(role)
         return tuple(
@@ -363,7 +370,8 @@ class HandoffMAS:
             turn = params.selector(context)
             if _role_key(turn.speaker) != _role_key(speaker):
                 raise ValueError(
-                    f"Selected action speaker {turn.speaker!r} does not match " f"{speaker!r}."
+                    f"Selected action speaker {turn.speaker!r} does not match "
+                    f"{speaker!r}."
                 )
 
             is_final = _role_key(turn.recipient) == _role_key(FINAL_RECIPIENT)

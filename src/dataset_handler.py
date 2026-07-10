@@ -45,7 +45,9 @@ def _math_level_key(value):
     return int(match.group(0)) if match else None
 
 
-def load_hard_dataset(name, split, n, seed, *, levels=None, stratify_by=None):
+def load_hard_dataset(
+    name, split, n, seed, *, levels=None, stratify_by=None, require_parseable_gold=False
+):
     if name == "competition_math":
         ds = load_dataset("qwedsacf/competition_math")
         shuffled = ds["train"].shuffle(seed=seed)
@@ -63,7 +65,11 @@ def load_hard_dataset(name, split, n, seed, *, levels=None, stratify_by=None):
 
         if levels:
             allowed_levels = {int(level) for level in levels}
-            data = data.filter(lambda ex: _math_level_key(ex.get("level")) in allowed_levels)
+            data = data.filter(
+                lambda ex: _math_level_key(ex.get("level")) in allowed_levels
+            )
+        if require_parseable_gold:
+            data = data.filter(lambda ex: gold_competition_math(ex) is not None)
         if stratify_by:
             data = _select_stratified(data, n, stratify_by, seed)
         elif n:
@@ -157,8 +163,11 @@ def load_hard_dataset(name, split, n, seed, *, levels=None, stratify_by=None):
             "Unsupported dataset. Choose from: competition_math, aqua_rat, svamp, gsm8k, mmlu, gpqa, logiqa"
         )
 
-    if name != "competition_math" and (levels or stratify_by):
-        raise ValueError("levels and stratify_by are supported only for competition_math.")
+    if name != "competition_math" and (levels or stratify_by or require_parseable_gold):
+        raise ValueError(
+            "levels, stratify_by, and require_parseable_gold are supported only "
+            "for competition_math."
+        )
 
     return data, q_fn, gold_fn
 
