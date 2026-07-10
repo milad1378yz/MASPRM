@@ -1,6 +1,8 @@
-from dataclasses import dataclass
+import operator
 import re
+from dataclasses import dataclass
 from typing import (
+    Annotated,
     Any,
     Callable,
     Dict,
@@ -12,13 +14,14 @@ from typing import (
     Union,
 )
 
+from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command
 
 from agent import Agent
 
 FINAL_RECIPIENT = "FINAL"
-_DISPATCH_NODE = "handoff_dispatch"
+_RUN_CONFIG_KEY = "handoff_run"
 _FIELD_RE = re.compile(r"(?im)^\s*(SPEAKER|RECIPIENT|MESSAGE|CURRENT_ANSWER)\s*:\s*")
 
 
@@ -89,16 +92,20 @@ class HandoffRun:
 ActionSelector = Callable[[HandoffContext], RoutedTurn]
 
 
-class _HandoffState(TypedDict):
-    question: str
-    turns: List[RoutedTurn]
-    local_histories: Dict[str, List[RoutedTurn]]
-    next_speaker: int
+@dataclass(frozen=True)
+class _RunParams:
+    """Run-scoped dependencies passed through LangGraph's `configurable`."""
+
+    selector: ActionSelector
     min_turns: int
     max_turns: int
     allow_self: bool
-    selector: ActionSelector
-    done: bool
+
+
+class _HandoffState(TypedDict):
+    question: str
+    turns: Annotated[List[RoutedTurn], operator.add]
+    next_speaker: int
     stop_reason: str
 
 
@@ -172,26 +179,28 @@ class HandoffMAS:
     """A compiled cyclic LangGraph for private, repeated role handoffs.
 
     Candidate generation and selection happen inside one role-node call. The
-    graph appends only the selected action, maintains each role's local view,
-    and routes directly to the chosen recipient without replaying prior turns.
+    graph state is the ordered transcript plus routing data; each node appends
+    exactly the selected action through a reducer and hands control directly
+    to the chosen recipient. Private per-role views are derived from the
+    transcript, so there is no second copy of history to keep consistent.
     """
 
     def __init__(self, agents: Sequence[Agent], role_names: Sequence[str]):
         if len(agents) != len(role_names) or not agents:
-            raise ValueError(
-                "agents and role_names must have the same non-zero length."
-            )
+            raise ValueError("agents and role_names must have the same non-zero length.")
 
         self.agents = list(agents)
         self.role_names = [str(name).strip() for name in role_names]
         if any(not name for name in self.role_names):
             raise ValueError("Every handoff role must have a non-empty name.")
 
-        self._role_indices = {
-            _role_key(name): idx for idx, name in enumerate(self.role_names)
-        }
+        self._role_indices = {_role_key(name): idx for idx, name in enumerate(self.role_names)}
         if len(self._role_indices) != len(self.role_names):
             raise ValueError("Handoff role names must be unique (case-insensitive).")
+        if _role_key(FINAL_RECIPIENT) in self._role_indices:
+            raise ValueError(
+                f"{FINAL_RECIPIENT!r} is reserved for termination and cannot " "name a role."
+            )
 
         self.n = len(self.agents)
         self._node_names = [f"handoff_role_{idx}" for idx in range(self.n)]
@@ -206,6 +215,15 @@ class HandoffMAS:
         if key not in self._role_indices:
             raise ValueError(f"Unknown handoff role: {role!r}.")
         return self._role_indices[key]
+
+    def visible_turns(self, role: str, turns: Sequence[RoutedTurn]) -> Tuple[RoutedTurn, ...]:
+        """A role's private view: every turn it spoke or received, in order."""
+        key = _role_key(role)
+        return tuple(
+            turn
+            for turn in turns
+            if _role_key(turn.speaker) == key or _role_key(turn.recipient) == key
+        )
 
     def allowed_recipients(
         self,
@@ -302,18 +320,21 @@ class HandoffMAS:
         initial_state: _HandoffState = {
             "question": str(question),
             "turns": [],
-            "local_histories": {name: [] for name in self.role_names},
             "next_speaker": self.role_index(initial_speaker),
-            "min_turns": min_turns,
-            "max_turns": max_turns,
-            "allow_self": bool(allow_self),
-            "selector": selector,
-            "done": False,
             "stop_reason": "",
         }
+        params = _RunParams(
+            selector=selector,
+            min_turns=min_turns,
+            max_turns=max_turns,
+            allow_self=bool(allow_self),
+        )
         state = self._graph.invoke(
             initial_state,
-            config={"recursion_limit": max_turns + 3},
+            config={
+                "recursion_limit": max_turns + 2,
+                "configurable": {_RUN_CONFIG_KEY: params},
+            },
         )
         return HandoffRun(
             question=state["question"],
@@ -321,32 +342,28 @@ class HandoffMAS:
             stop_reason=state["stop_reason"] or "max_turns",
         )
 
-    def _dispatch(self, state: _HandoffState):
-        return Command(goto=self._node_names[state["next_speaker"]])
+    def _entry_speaker(self, state: _HandoffState) -> str:
+        return self._node_names[state["next_speaker"]]
 
     def _role_node(self, speaker_idx: int):
-        def run(state: _HandoffState):
-            if state["done"]:
-                return Command(goto=END)
-            if state["next_speaker"] != speaker_idx:
-                raise RuntimeError(
-                    "LangGraph routed to a role that is not the active speaker."
-                )
+        speaker = self.role_names[speaker_idx]
 
-            speaker = self.role_names[speaker_idx]
+        def run(state: _HandoffState, config: RunnableConfig) -> Command:
+            params: _RunParams = config["configurable"][_RUN_CONFIG_KEY]
+            turns = tuple(state["turns"])
             context = HandoffContext(
                 question=state["question"],
-                turns=tuple(state["turns"]),
-                visible_turns=tuple(state["local_histories"][speaker]),
+                turns=turns,
+                visible_turns=self.visible_turns(speaker, turns),
                 speaker_idx=speaker_idx,
                 speaker=speaker,
-                min_turns=state["min_turns"],
-                max_turns=state["max_turns"],
+                min_turns=params.min_turns,
+                max_turns=params.max_turns,
             )
-            turn = state["selector"](context)
+            turn = params.selector(context)
             if _role_key(turn.speaker) != _role_key(speaker):
                 raise ValueError(
-                    f"Selected action speaker {turn.speaker!r} does not match {speaker!r}."
+                    f"Selected action speaker {turn.speaker!r} does not match " f"{speaker!r}."
                 )
 
             is_final = _role_key(turn.recipient) == _role_key(FINAL_RECIPIENT)
@@ -356,30 +373,16 @@ class HandoffMAS:
             next_speaker = speaker_idx
             if not is_final:
                 next_speaker = self.role_index(turn.recipient)
-                if not state["allow_self"] and next_speaker == speaker_idx:
+                if not params.allow_self and next_speaker == speaker_idx:
                     raise ValueError("Self handoffs are disabled.")
 
-            turns = [*state["turns"], turn]
-            histories = {
-                role: list(role_turns)
-                for role, role_turns in state["local_histories"].items()
-            }
-            histories[speaker].append(turn)
-            if not is_final and next_speaker != speaker_idx:
-                histories[self.role_names[next_speaker]].append(turn)
-
-            reached_limit = len(turns) >= state["max_turns"]
-            done = is_final or reached_limit
-            stop_reason = (
-                "final" if is_final else ("max_turns" if reached_limit else "")
-            )
-            update = {
-                "turns": turns,
-                "local_histories": histories,
+            done = is_final or context.turn_number >= params.max_turns
+            update: Dict[str, Any] = {
+                "turns": [turn],
                 "next_speaker": next_speaker,
-                "done": done,
-                "stop_reason": stop_reason,
             }
+            if done:
+                update["stop_reason"] = "final" if is_final else "max_turns"
             return Command(
                 update=update,
                 goto=END if done else self._node_names[next_speaker],
@@ -389,12 +392,6 @@ class HandoffMAS:
 
     def _build_graph(self):
         graph = StateGraph(_HandoffState)
-        graph.add_node(
-            _DISPATCH_NODE,
-            self._dispatch,
-            destinations=tuple(self._node_names),
-        )
-        graph.add_edge(START, _DISPATCH_NODE)
         destinations = tuple([*self._node_names, END])
         for idx, node_name in enumerate(self._node_names):
             graph.add_node(
@@ -402,6 +399,7 @@ class HandoffMAS:
                 self._role_node(idx),
                 destinations=destinations,
             )
+        graph.add_conditional_edges(START, self._entry_speaker, self._node_names)
         return graph.compile(name="handoff_mas")
 
 

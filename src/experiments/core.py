@@ -73,6 +73,23 @@ def _text_token_len_tok(tok, text: str) -> int:
     )
 
 
+def _encode_prompt_ids(tokenizer: Any, messages: Any) -> List[int]:
+    """Chat-template prompt ids (generation prompt included) as a flat list."""
+    encoded = tokenizer.apply_chat_template(
+        messages, tokenize=True, add_generation_prompt=True
+    )
+    if isinstance(encoded, torch.Tensor):
+        return encoded.flatten().tolist()
+    if isinstance(encoded, list):
+        if encoded and isinstance(encoded[0], list):
+            return list(encoded[0])
+        return [int(token_id) for token_id in encoded]
+    rendered = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    return tokenizer(rendered, add_special_tokens=False)["input_ids"]
+
+
 def _agent_order(mas: Any) -> List[int]:
     return list(getattr(mas, "agent_order", list(range(mas.n))))
 
@@ -108,29 +125,15 @@ def compute_logprob_and_token_counts(
 
     # Resolve prompt_ids (B=1)
     if prompt_ids is None:
-        enc = tok.apply_chat_template(msgs, tokenize=True, add_generation_prompt=True)
-        if isinstance(enc, list):
-            prompt_ids = torch.tensor(enc, dtype=torch.long).unsqueeze(0).to(device)
-        elif isinstance(enc, torch.Tensor):
-            prompt_ids = (enc.unsqueeze(0) if enc.dim() == 1 else enc).to(device)
-        else:
-            s = tok.apply_chat_template(
-                msgs, tokenize=False, add_generation_prompt=True
-            )
-            prompt_ids = tok(s, return_tensors="pt", add_special_tokens=False)[
-                "input_ids"
-            ].to(device)
+        prompt_ids = _encode_prompt_ids(tok, msgs)
+    if isinstance(prompt_ids, torch.Tensor):
+        prompt_ids = (
+            prompt_ids.unsqueeze(0) if prompt_ids.dim() == 1 else prompt_ids
+        ).to(device)
+    elif isinstance(prompt_ids, list):
+        prompt_ids = torch.tensor(prompt_ids, dtype=torch.long).unsqueeze(0).to(device)
     else:
-        if isinstance(prompt_ids, list):
-            prompt_ids = (
-                torch.tensor(prompt_ids, dtype=torch.long).unsqueeze(0).to(device)
-            )
-        elif isinstance(prompt_ids, torch.Tensor):
-            prompt_ids = (
-                prompt_ids.unsqueeze(0) if prompt_ids.dim() == 1 else prompt_ids
-            ).to(device)
-        else:
-            raise TypeError("prompt_ids must be list[int] or torch.Tensor")
+        raise TypeError("prompt_ids must be list[int] or torch.Tensor")
 
     comp_ids = tok(completion, return_tensors="pt", add_special_tokens=False)[
         "input_ids"
@@ -160,6 +163,8 @@ def compute_batch_logprob_and_token_counts(
     agent: Agent,
     msgs,
     completions: Sequence[str],
+    *,
+    prompt_ids: Optional[Sequence[int]] = None,  # reuse a pre-encoded prompt
 ) -> tuple[List[float], int, List[int]]:
     """Score same-prompt completions in one teacher-forced model call."""
     if not completions:
@@ -168,16 +173,12 @@ def compute_batch_logprob_and_token_counts(
     tok = agent.tok
     model = agent.model
     device = next(model.parameters()).device
-    prompt = tok.apply_chat_template(msgs, tokenize=True, add_generation_prompt=True)
-    if isinstance(prompt, torch.Tensor):
-        prompt_ids = prompt.flatten().tolist()
-    elif isinstance(prompt, list):
-        prompt_ids = list(prompt)
+    if prompt_ids is None:
+        prompt_ids = _encode_prompt_ids(tok, msgs)
+    elif isinstance(prompt_ids, torch.Tensor):
+        prompt_ids = prompt_ids.flatten().tolist()
     else:
-        rendered = tok.apply_chat_template(
-            msgs, tokenize=False, add_generation_prompt=True
-        )
-        prompt_ids = tok(rendered, add_special_tokens=False)["input_ids"]
+        prompt_ids = list(prompt_ids)
 
     completion_ids = [
         tok(str(text), add_special_tokens=False)["input_ids"] for text in completions
@@ -382,20 +383,8 @@ def sbs_decode2(
             msgs = mas.agent_messages(agent_idx, inbox)
 
             # PRE-ENCODE prompt once; reuse for accounting and logprob scoring
-            enc = mas.agents[agent_idx].tok.apply_chat_template(
-                msgs, tokenize=True, add_generation_prompt=True
-            )
-            p_len = (
-                len(enc)
-                if isinstance(enc, list)
-                else (
-                    int(
-                        enc.numel()
-                        if isinstance(enc, torch.Tensor) and enc.dim() == 1
-                        else enc.shape[1]
-                    )
-                )
-            )
+            enc = _encode_prompt_ids(mas.agents[agent_idx].tok, msgs)
+            p_len = len(enc)
 
             # Generate candidates
             cands = mas.sample_candidates(
@@ -684,24 +673,6 @@ class HandoffDecodeResult:
         }
 
 
-def _prompt_token_length(tokenizer: Any, messages: Any) -> int:
-    encoded = tokenizer.apply_chat_template(
-        messages,
-        tokenize=True,
-        add_generation_prompt=True,
-    )
-    if isinstance(encoded, list):
-        return len(encoded)
-    if isinstance(encoded, torch.Tensor):
-        return int(encoded.numel())
-    rendered = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
-    )
-    return len(_token_ids(tokenizer, rendered))
-
-
 def _fallback_routed_turn(
     raw: str,
     context: HandoffContext,
@@ -772,7 +743,9 @@ def handoff_sbs_decode(
     ``route_mode`` is ``fixed``, ``random``, or ``agent``. Fixed and random
     routing force the same recipient across a turn's candidate pool; agent
     routing lets each proposal choose its own recipient. Candidate generation
-    and PRM/logprob scoring are batched once per turn.
+    and PRM/logprob scoring are batched once per turn; duplicate proposals
+    are collapsed before scoring, and a turn with a single distinct valid
+    action skips the scorer entirely.
     """
     if route_mode not in {"fixed", "random", "agent"}:
         raise ValueError(f"Unknown handoff route mode: {route_mode!r}.")
@@ -792,6 +765,13 @@ def handoff_sbs_decode(
         schedule = schedule[:max_turns]
         for role in schedule:
             mas.role_index(role)
+        if not allow_self:
+            for previous, current in zip(schedule, schedule[1:]):
+                if mas.role_index(previous) == mas.role_index(current):
+                    raise ValueError(
+                        "fixed_schedule repeats a role on consecutive turns; "
+                        "pass allow_self=True to permit that."
+                    )
         initial_speaker = schedule[0]
 
     usage = TokenStats()
@@ -840,12 +820,19 @@ def handoff_sbs_decode(
         proposals += len(raw_candidates)
         usage.agent_runs += 1
         tokenizer = mas.agents[context.speaker_idx].tok
-        usage.prompt += _prompt_token_length(tokenizer, messages)
+        prompt_ids = _encode_prompt_ids(tokenizer, messages)
+        usage.prompt += len(prompt_ids)
+
+        # Identical proposals are one action: parse and score each distinct
+        # text once, while accounting (proposals, generated tokens, parse
+        # failures) stays per raw sample.
+        distinct_counts: Dict[str, int] = {}
         for raw in raw_candidates:
-            usage.generated += _text_token_len_tok(tokenizer, raw)
+            distinct_counts[raw] = distinct_counts.get(raw, 0) + 1
 
         valid_turns: List[RoutedTurn] = []
-        for raw in raw_candidates:
+        for raw, count in distinct_counts.items():
+            usage.generated += count * _text_token_len_tok(tokenizer, raw)
             try:
                 valid_turns.append(
                     parse_routed_turn(
@@ -857,7 +844,7 @@ def handoff_sbs_decode(
                     )
                 )
             except ValueError:
-                parse_failures += 1
+                parse_failures += count
 
         if not valid_turns:
             fallback_recipient = forced_recipient
@@ -873,6 +860,10 @@ def handoff_sbs_decode(
                     fallback_recipient,
                 )
             ]
+
+        # A single distinct action needs no scorer call to be selected.
+        if len(valid_turns) == 1 or score_type == "none":
+            return valid_turns[0]
 
         if score_type == "prm":
             rendered_candidates = [
@@ -899,12 +890,13 @@ def handoff_sbs_decode(
                 context_tokens.append(rendered.token_count)
                 original_context_tokens.append(rendered.original_token_count)
                 prm_truncations += int(rendered.truncated)
-        elif score_type == "logprob":
+        else:  # "logprob"
             values, prompt_len, generated_lengths = (
                 compute_batch_logprob_and_token_counts(
                     mas.agents[context.speaker_idx],
                     messages,
                     [turn.raw or turn.render() for turn in valid_turns],
+                    prompt_ids=prompt_ids,
                 )
             )
             usage.scorer += sum(prompt_len + length for length in generated_lengths)
@@ -917,8 +909,6 @@ def handoff_sbs_decode(
                 pass
             else:
                 raise ValueError(f"Unknown logprob aggregation: {logprob_agg!r}.")
-        else:
-            values = [0.0] * len(valid_turns)
 
         best_idx = max(range(len(valid_turns)), key=lambda idx: values[idx])
         return valid_turns[best_idx]
@@ -1121,6 +1111,35 @@ def build_runtime(
     return Runtime(model=model, tokenizer=tok)
 
 
+def _last_scored_positions(
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    sep_ids: Sequence[int],
+) -> torch.Tensor:
+    """Per row, the position whose logit the scorer reads: the last token of
+    the last fully-attended separator occurrence, else the last attended
+    position. Vectorized replacement for a per-token Python scan."""
+    positions = torch.arange(input_ids.shape[1], device=input_ids.device)
+    mask = attention_mask.to(torch.bool)
+    idx = torch.where(mask, positions, positions.new_full((), -1)).max(dim=1).values
+    idx = idx.clamp(min=0)
+
+    n = len(sep_ids)
+    if n and input_ids.shape[1] >= n:
+        sep = torch.tensor(list(sep_ids), device=input_ids.device).to(input_ids.dtype)
+        token_windows = input_ids.unfold(1, n, 1)
+        mask_windows = mask.unfold(1, n, 1)
+        hits = (token_windows == sep).all(dim=-1) & mask_windows.all(dim=-1)
+        window_ends = positions[n - 1 :].unsqueeze(0)
+        last_sep_end = (
+            torch.where(hits, window_ends, window_ends.new_full((), -1))
+            .max(dim=1)
+            .values
+        )
+        idx = torch.where(last_sep_end >= 0, last_sep_end, idx)
+    return idx
+
+
 def load_prm_scorer(
     prm_dir: str,
     base_model_id: str = None,
@@ -1195,19 +1214,15 @@ def load_prm_scorer(
         )
         inputs = {k: v.to(device) for k, v in inputs.items()}
         out = model(**inputs, use_cache=False)  # logits: (batch, T, 1)
+        # Encode the separator per call: `ensure_separator_token` may extend
+        # the tokenizer after this loader returns.
         sep_ids = tok.encode(step_separator, add_special_tokens=False)
-        values: List[float] = []
-        for row in range(inputs["input_ids"].shape[0]):
-            valid_positions = inputs["attention_mask"][row].nonzero(as_tuple=True)[0]
-            idx = int(valid_positions[-1].item())
-            valid_ids = inputs["input_ids"][row, valid_positions].tolist()
-            if sep_ids:
-                for start in range(0, len(valid_ids) - len(sep_ids) + 1):
-                    if valid_ids[start : start + len(sep_ids)] == sep_ids:
-                        idx = int(valid_positions[start + len(sep_ids) - 1].item())
-            z = out.logits[row, idx, 0].float()
-            values.append(float(torch.tanh(z).item()))
-        return values
+        idx = _last_scored_positions(
+            inputs["input_ids"], inputs["attention_mask"], sep_ids
+        ).to(out.logits.device)
+        rows = torch.arange(idx.shape[0], device=out.logits.device)
+        z = out.logits[rows, idx, 0].float()
+        return [float(value) for value in torch.tanh(z).tolist()]
 
     @torch.inference_mode()
     def score(text: str) -> float:
@@ -1444,20 +1459,8 @@ class MCTSInfer(BaseMCTS):
             return
         agent_idx, inbox = self._expansion_context(node)
         msgs = self.mas.agent_messages(agent_idx, inbox)
-        enc = self.mas.agents[agent_idx].tok.apply_chat_template(
-            msgs, tokenize=True, add_generation_prompt=True
-        )
-        p_len = (
-            len(enc)
-            if isinstance(enc, list)
-            else (
-                int(
-                    enc.numel()
-                    if isinstance(enc, torch.Tensor) and enc.dim() == 1
-                    else enc.shape[1]
-                )
-            )
-        )
+        enc = _encode_prompt_ids(self.mas.agents[agent_idx].tok, msgs)
+        p_len = len(enc)
 
         candidates = self.mas.sample_candidates(
             agent_idx,
