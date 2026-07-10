@@ -490,6 +490,7 @@ def build_mas_from_specs(
             Agent(
                 model,
                 tok,
+                name=spec.get("name"),
                 system_prompt=spec.get("system_prompt", ""),
                 max_new_tokens=int(spec.get("max_new_tokens", 512)),
             )

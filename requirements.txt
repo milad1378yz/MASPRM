@@ -1,5 +1,5 @@
 datasets==4.0.0
-langgraph
+langgraph==1.1.9
 matplotlib==3.10.7
 networkx==3.4.2
 numpy==2.2.6
