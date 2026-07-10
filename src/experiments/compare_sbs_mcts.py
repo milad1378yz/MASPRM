@@ -231,15 +231,11 @@ def main():
         ),
     )
     method_args = parser.add_argument_group("method hyperparameters")
-    method_args.add_argument(
-        "--b1", type=int, default=3, help="SBS retained beam width."
-    )
+    method_args.add_argument("--b1", type=int, default=3, help="SBS retained beam width.")
     method_args.add_argument(
         "--b2", type=int, default=5, help="SBS candidates sampled per expansion."
     )
-    method_args.add_argument(
-        "--voter_k", type=int, default=5, help="Number of voter candidates."
-    )
+    method_args.add_argument("--voter_k", type=int, default=5, help="Number of voter candidates.")
     method_args.add_argument(
         "--n_simulations", type=int, default=10, help="MCTS simulation budget."
     )
@@ -284,20 +280,14 @@ def main():
 
     uses_handoff = any(method.startswith("handoff_") for method in args.methods)
     uses_pooled = any(method.startswith("pooled_") for method in args.methods)
-    uses_judge = any(
-        method in {"mcts_judge", "pooled_judge"} for method in args.methods
-    )
-    if uses_handoff and any(
-        not method.startswith("handoff_") for method in args.methods
-    ):
+    uses_judge = any(method in {"mcts_judge", "pooled_judge"} for method in args.methods)
+    if uses_handoff and any(not method.startswith("handoff_") for method in args.methods):
         parser.error(
             "handoff and static methods require different MAS configs; run them in "
             "separate invocations"
         )
     if args.dataset is None:
-        args.dataset = (
-            "gsm8k" if (uses_handoff or uses_pooled or uses_judge) else "mmlu"
-        )
+        args.dataset = "gsm8k" if (uses_handoff or uses_pooled or uses_judge) else "mmlu"
     if uses_handoff and args.sample_n is None:
         args.sample_n = 200
 
@@ -339,10 +329,7 @@ def main():
             "checkpoint is not available at the repository's 1.5B default"
         )
     static_prm_methods = {"sbs_prm", "mcts_prm", "voter_prm", "pooled_prm"}
-    if (
-        any(method in static_prm_methods for method in args.methods)
-        and not args.prm_dir
-    ):
+    if any(method in static_prm_methods for method in args.methods) and not args.prm_dir:
         parser.error("--prm_dir is required by the selected static PRM methods")
     if needs_orm and not args.orm_dir:
         parser.error("--orm_dir is required by the selected methods")
@@ -361,15 +348,9 @@ def main():
         SPLIT,
         n=(None if args.exclude_questions_file else SAMPLE_N),
         seed=SEED,
-        levels=(
-            args.math_levels
-            if uses_handoff and DATASET_NAME == "competition_math"
-            else None
-        ),
+        levels=(args.math_levels if uses_handoff and DATASET_NAME == "competition_math" else None),
         stratify_by=(
-            args.math_stratify_by
-            if uses_handoff and DATASET_NAME == "competition_math"
-            else None
+            args.math_stratify_by if uses_handoff and DATASET_NAME == "competition_math" else None
         ),
         # Restrict the stratified MATH pool to items the evaluator can grade
         # BEFORE sampling, so the handoff run gets its full quota.
@@ -435,31 +416,19 @@ def main():
     edges: List[List[int]] = cfg.get("edges", [])
     handoff_config = dict(cfg.get("handoff", {})) if uses_handoff else None
     if uses_handoff and not handoff_config:
-        parser.error(
-            "Handoff methods require a top-level 'handoff' section in --mas_config"
-        )
+        parser.error("Handoff methods require a top-level 'handoff' section in --mas_config")
     if handoff_config:
         for condition in conditions:
             if condition.kind.startswith("handoff_"):
-                condition.params.setdefault(
-                    "initial_speaker", handoff_config.get("initial_role")
-                )
-                condition.params.setdefault(
-                    "fixed_schedule", handoff_config.get("fixed_schedule")
-                )
+                condition.params.setdefault("initial_speaker", handoff_config.get("initial_role"))
+                condition.params.setdefault("fixed_schedule", handoff_config.get("fixed_schedule"))
 
     STEP_SEP = "</step>"
 
-    selected_prm_dir = (
-        args.handoff_prm_dir if "handoff_prm" in args.methods else args.prm_dir
-    )
-    prm_dir = (
-        str(Path(selected_prm_dir).resolve()) if selected_prm_dir else selected_prm_dir
-    )
+    selected_prm_dir = args.handoff_prm_dir if "handoff_prm" in args.methods else args.prm_dir
+    prm_dir = str(Path(selected_prm_dir).resolve()) if selected_prm_dir else selected_prm_dir
     prm_base_model_id = (
-        args.handoff_prm_base_model_id
-        if "handoff_prm" in args.methods
-        else args.prm_base_model_id
+        args.handoff_prm_base_model_id if "handoff_prm" in args.methods else args.prm_base_model_id
     )
     gen_model_id = args.gen_model_id
     # Optional ORM scorer (same API as PRM loader)
@@ -478,7 +447,7 @@ def main():
         orm_dir=ORM_DIR,
         judge_model_id=(args.judge_model_id if uses_judge else None),
         judge_load_in_4bit=args.judge_load_in_4bit,
-        prm_max_length=2048,
+        prm_max_length=args.prm_context_length,
         dtype="float16",
         seed=SEED,
     )
@@ -520,9 +489,7 @@ def main():
         print(f"{cond_name:<{name_width}}  {pass_cols}   {tmean:>8.1f}±{tstd:<8.1f}")
     print("#" * 80)
 
-    handoff_results = {
-        name: values for name, values in results.items() if "hit_at_4" in values
-    }
+    handoff_results = {name: values for name, values in results.items() if "hit_at_4" in values}
     if handoff_results:
         print("\nDynamic-handoff prefix results")
         print(
@@ -536,11 +503,7 @@ def main():
                 f"{values['realized_depth_mean']:>7.2f}"
             )
         comparison = next(
-            (
-                values
-                for values in handoff_results.values()
-                if "paired_accuracy_delta" in values
-            ),
+            (values for values in handoff_results.values() if "paired_accuracy_delta" in values),
             None,
         )
         if comparison:
@@ -554,9 +517,7 @@ def main():
                     f"McNemar p={comparison[prefix + 'mcnemar_exact_p']:.4g}"
                 )
 
-    pooled_rows = {
-        name: values for name, values in results.items() if "oracle_hit_at_k" in values
-    }
+    pooled_rows = {name: values for name, values in results.items() if "oracle_hit_at_k" in values}
     if pooled_rows:
         print("\nShared-pool selection results")
         print(

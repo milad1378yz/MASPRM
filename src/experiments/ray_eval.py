@@ -114,9 +114,7 @@ def _binary_auc(scores: List[float], labels: List[bool]) -> float:
             ranks[order[t]] = average_rank
         i = j + 1
     rank_sum_positive = sum(r for r, label in zip(ranks, labels) if label)
-    return (rank_sum_positive - positives * (positives + 1) / 2) / (
-        positives * negatives
-    )
+    return (rank_sum_positive - positives * (positives + 1) / 2) / (positives * negatives)
 
 
 def _paired_condition_comparison(
@@ -147,17 +145,13 @@ def _paired_condition_comparison(
     low_idx = max(0, math.floor(0.025 * (len(boot) - 1)))
     high_idx = min(len(boot) - 1, math.ceil(0.975 * (len(boot) - 1)))
 
-    policy_only = sum(
-        bool(policy_correct[idx]) and not bool(prm_correct[idx]) for idx in common
-    )
-    prm_only = sum(
-        bool(prm_correct[idx]) and not bool(policy_correct[idx]) for idx in common
-    )
+    policy_only = sum(bool(policy_correct[idx]) and not bool(prm_correct[idx]) for idx in common)
+    prm_only = sum(bool(prm_correct[idx]) and not bool(policy_correct[idx]) for idx in common)
     discordant = policy_only + prm_only
     if discordant:
-        tail = sum(
-            math.comb(discordant, k) for k in range(0, min(policy_only, prm_only) + 1)
-        ) / (2**discordant)
+        tail = sum(math.comb(discordant, k) for k in range(0, min(policy_only, prm_only) + 1)) / (
+            2**discordant
+        )
         mcnemar_p = min(1.0, 2.0 * tail)
     else:
         mcnemar_p = 1.0
@@ -217,6 +211,46 @@ def _cached_correctness(records_path: str):
             if answer is not None:
                 prefixes[threshold][idx] = bool(is_correct(answer, gold))
     return correct, prefixes
+
+
+def _completed_cache_is_valid(
+    results_path: str,
+    summary_path: str,
+    records_path: str,
+    *,
+    manifest_hash: str,
+    expected_count: int,
+) -> bool:
+    """Require a complete, manifest-matched record set before skipping a run."""
+    try:
+        result_lines = Path(results_path).read_text().splitlines()
+        summary = json.loads(Path(summary_path).read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(summary, dict) or not any(
+        line.strip() == "COMPLETED" for line in result_lines
+    ):
+        return False
+
+    seen = set()
+    try:
+        with Path(records_path).open() as records_file:
+            for line in records_file:
+                if not line.strip():
+                    continue
+                record = json.loads(line)
+                idx = int(record["index"])
+                if (
+                    idx in seen
+                    or idx < 0
+                    or idx >= int(expected_count)
+                    or record.get("manifest_hash") != manifest_hash
+                ):
+                    return False
+                seen.add(idx)
+    except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError):
+        return False
+    return seen == set(range(int(expected_count)))
 
 
 def evaluate_conditions_ray(
@@ -298,9 +332,7 @@ def evaluate_conditions_ray(
 
                 # modify the PRM tokenizer/model with the separator
                 added = ensure_separator_token(self.prm_tok, self.step_sep)
-                print(
-                    f"[Worker {self.rank}] Added {added} special tokens for step separator."
-                )
+                print(f"[Worker {self.rank}] Added {added} special tokens for step separator.")
                 if added > 0 and self.prm_model is not None:
                     align_model_to_tokenizer(self.prm_model, self.prm_tok)
             # 2) Load the generation runtime.
@@ -333,9 +365,7 @@ def evaluate_conditions_ray(
                     torch_dtype=self.dtype,
                     load_in_4bit=bool(init.judge_load_in_4bit),
                 )
-                self.judge = make_llm_judge_voter(
-                    judge_runtime.model, judge_runtime.tokenizer
-                )
+                self.judge = make_llm_judge_voter(judge_runtime.model, judge_runtime.tokenizer)
                 self.judge_ranker = make_llm_action_ranker(
                     judge_runtime.model, judge_runtime.tokenizer
                 )
@@ -352,9 +382,7 @@ def evaluate_conditions_ray(
                     step_separator=self.step_sep,
                 )
                 added = ensure_separator_token(self.orm_tok, self.step_sep)
-                print(
-                    f"[Worker {self.rank}] Added {added} special tokens for ORM separator."
-                )
+                print(f"[Worker {self.rank}] Added {added} special tokens for ORM separator.")
                 if added > 0 and self.orm_model is not None:
                     align_model_to_tokenizer(self.orm_model, self.orm_tok)
 
@@ -427,9 +455,7 @@ def evaluate_conditions_ray(
                     logprob_agg=str(p.get("logprob_agg", "avg_token")),
                     step_separator=self.step_sep,
                     max_context_tokens=int(p.get("prm_context_length", 16384)),
-                    seed=int(
-                        example_seed if example_seed is not None else p.get("seed", 42)
-                    ),
+                    seed=int(example_seed if example_seed is not None else p.get("seed", 42)),
                     allow_self=bool(p.get("allow_self", False)),
                     random_can_finalize=bool(p.get("random_can_finalize", True)),
                 )
@@ -478,9 +504,7 @@ def evaluate_conditions_ray(
                 for mas_i in mas_list:
                     pred_i, u_i, tr = base_policy_with_trace(mas_i, q)
                     total.add(u_i)
-                    tr_run = [
-                        e for e in (tr or []) if e.get("chosen_text") not in (None, "")
-                    ]
+                    tr_run = [e for e in (tr or []) if e.get("chosen_text") not in (None, "")]
                     runs.append(
                         {
                             "steps": [str(e["chosen_text"]) for e in tr_run],
@@ -504,9 +528,7 @@ def evaluate_conditions_ray(
                 entry = extra or {}
                 runs = list(entry.get("runs") or [])
                 if not runs:
-                    raise ValueError(
-                        "Pooled condition received no cached candidate pool entry."
-                    )
+                    raise ValueError("Pooled condition received no cached candidate pool entry.")
                 answers = [str(run.get("answer", "")) for run in runs]
                 start_time = time.perf_counter()
                 judge_meta: Dict[str, Any] = {}
@@ -676,9 +698,7 @@ def evaluate_conditions_ray(
                     logprob_agg=p.get("logprob_agg", "sum"),
                     leaf_score_fn=leaf_fn,
                     view_mode=view_mode,
-                    action_ranker=(
-                        self.judge_ranker if score_type == "judge" else None
-                    ),
+                    action_ranker=(self.judge_ranker if score_type == "judge" else None),
                 )
                 start_time = time.perf_counter()
                 pred, usage = infer.decode(n_simulations=n_sims)
@@ -768,9 +788,7 @@ def evaluate_conditions_ray(
                 if isinstance(res, tuple) and len(res) == 3:
                     pred, usage, raw_answers = res
                     candidates = (
-                        list(raw_answers[:pass_k])
-                        if isinstance(raw_answers, list)
-                        else [pred]
+                        list(raw_answers[:pass_k]) if isinstance(raw_answers, list) else [pred]
                     )
                 elif isinstance(res, tuple) and len(res) == 2:
                     pred, usage = res
@@ -813,9 +831,7 @@ def evaluate_conditions_ray(
                     _seed_everything(int(ex_seed))
                     metadata: Dict[str, Any] = {}
                     try:
-                        res = self._decode_by_spec(
-                            q, spec, example_seed=int(ex_seed), extra=extra
-                        )
+                        res = self._decode_by_spec(q, spec, example_seed=int(ex_seed), extra=extra)
                         # normalize length (be paranoid)
                         if isinstance(res, tuple):
                             if len(res) == 6:
@@ -878,9 +894,7 @@ def evaluate_conditions_ray(
     prefix_correct_by_kind: Dict[str, Dict[int, Dict[int, bool]]] = {}
     result_path_by_kind: Dict[str, str] = {}
     result_name_by_kind: Dict[str, str] = {}
-    LOG_EVERY = int(
-        os.environ.get("LOG_EVERY", "10")
-    )  # progress write interval (examples)
+    LOG_EVERY = int(os.environ.get("LOG_EVERY", "10"))  # progress write interval (examples)
     N_TOTAL = len(data)
     source_root = Path(__file__).resolve().parent.parent
     implementation_sha256 = hashlib.sha256(
@@ -945,23 +959,18 @@ def evaluate_conditions_ray(
         pool_dir = Path("cache/pools")
         pool_dir.mkdir(parents=True, exist_ok=True)
         model_tail = worker_init.gen_model_id.split("/")[-1]
-        pool_path = (
-            pool_dir / f"sc{pool_k}_{name_dataset}_{model_tail}_{pool_hash[:12]}.jsonl"
-        )
+        pool_path = pool_dir / f"sc{pool_k}_{name_dataset}_{model_tail}_{pool_hash[:12]}.jsonl"
         if pool_path.exists():
             lines = pool_path.read_text().splitlines()
             header = json.loads(lines[0]) if lines else {}
             if header.get("pool_hash") != pool_hash:
-                raise RuntimeError(
-                    f"Candidate pool {pool_path} does not match this configuration."
-                )
+                raise RuntimeError(f"Candidate pool {pool_path} does not match this configuration.")
             for line in lines[1:]:
                 if line.strip():
                     entry = json.loads(line)
                     pool_entries[int(entry["index"])] = entry
             print(
-                f"[pool] Loaded {len(pool_entries)} cached SC@{pool_k} pools "
-                f"from {pool_path}."
+                f"[pool] Loaded {len(pool_entries)} cached SC@{pool_k} pools " f"from {pool_path}."
             )
         else:
             print(f"[pool] Building SC@{pool_k} candidate pools -> {pool_path}")
@@ -980,8 +989,7 @@ def evaluate_conditions_ray(
                 seed=worker_init.seed,
             )
             workers = [
-                EvalWorker.remote(build_init, worker_init.dtype, rank=i)
-                for i in range(num_workers)
+                EvalWorker.remote(build_init, worker_init.dtype, rank=i) for i in range(num_workers)
             ]
             in_q = Queue()
             out_q = Queue()
@@ -1051,8 +1059,7 @@ def evaluate_conditions_ray(
                 )
             ]
             payload.extend(
-                json.dumps(pool_entries[idx], ensure_ascii=False)
-                for idx in sorted(pool_entries)
+                json.dumps(pool_entries[idx], ensure_ascii=False) for idx in sorted(pool_entries)
             )
             pool_path.write_text("\n".join(payload) + "\n")
             print(f"[pool] Wrote {len(pool_entries)} pools to {pool_path}.")
@@ -1089,15 +1096,11 @@ def evaluate_conditions_ray(
             step_separator=worker_init.step_separator,
             gen_model_id=worker_init.gen_model_id,
             prm_dir=worker_init.prm_dir if worker_needs_prm else None,
-            prm_base_model_id=(
-                worker_init.prm_base_model_id if worker_needs_prm else None
-            ),
+            prm_base_model_id=(worker_init.prm_base_model_id if worker_needs_prm else None),
             orm_dir=worker_init.orm_dir if needs_orm else None,
             judge_model_id=worker_init.judge_model_id if needs_judge else None,
             judge_load_in_4bit=worker_init.judge_load_in_4bit,
-            prm_max_length=int(
-                spec.params.get("prm_context_length", worker_init.prm_max_length)
-            ),
+            prm_max_length=int(spec.params.get("prm_context_length", worker_init.prm_max_length)),
             dtype=worker_init.dtype,
             seed=worker_init.seed,
         )
@@ -1108,11 +1111,7 @@ def evaluate_conditions_ray(
             if worker_init.prm_dir and condition_needs_prm
             else ""
         )
-        orm = (
-            f"_{Path(worker_init.orm_dir).name}"
-            if worker_init.orm_dir and needs_orm
-            else ""
-        )
+        orm = f"_{Path(worker_init.orm_dir).name}" if worker_init.orm_dir and needs_orm else ""
 
         # Prepare model ID and a short stable fingerprint so distinct settings
         # (e.g. view_mode=full vs local) do not collide in the skip log path.
@@ -1149,31 +1148,31 @@ def evaluate_conditions_ray(
             )
             + "\n"
         )
-        # If file already contains a COMPLETED marker, skip this condition
+        if _completed_cache_is_valid(
+            results_path,
+            summary_path,
+            records_path,
+            manifest_hash=manifest_hash,
+            expected_count=N_TOTAL,
+        ):
+            results[spec.name] = json.loads(Path(summary_path).read_text())
+            cached_correct, cached_prefixes = _cached_correctness(records_path)
+            correct_by_kind[spec.kind] = cached_correct
+            if any(cached_prefixes[threshold] for threshold in cached_prefixes):
+                prefix_correct_by_kind[spec.kind] = cached_prefixes
+            print(f"[skip] Loaded completed '{spec.name}' from {results_path}.")
+            continue
         if Path(results_path).exists():
-            try:
-                txt = Path(results_path).read_text()
-            except Exception:
-                txt = ""
-            if "COMPLETED" in txt:
-                if Path(summary_path).exists() and Path(records_path).exists():
-                    results[spec.name] = json.loads(Path(summary_path).read_text())
-                    cached_correct, cached_prefixes = _cached_correctness(records_path)
-                    correct_by_kind[spec.kind] = cached_correct
-                    if any(cached_prefixes[threshold] for threshold in cached_prefixes):
-                        prefix_correct_by_kind[spec.kind] = cached_prefixes
-                    print(f"[skip] Loaded completed '{spec.name}' from {results_path}.")
-                    continue
-                print(
-                    f"[rerun] Completed text log for '{spec.name}' lacks cache sidecars."
-                )
-        # Write a start header (append if rerunning)
-        with open(results_path, "a") as f:
+            print(f"[rerun] Resetting incomplete cache for '{spec.name}'.")
+
+        # A rerun must not retain a stale COMPLETED marker or summary.
+        with open(results_path, "w") as f:
             f.write(
                 f"=== START {spec.name} | dataset={name_dataset} | N={N_TOTAL} "
                 f"| manifest={manifest_hash} ===\n"
             )
         Path(records_path).write_text("")
+        Path(summary_path).unlink(missing_ok=True)
 
         if spec.kind not in handoff_kinds and handoff_workers is not None:
             for worker in handoff_workers:
@@ -1252,9 +1251,7 @@ def evaluate_conditions_ray(
                     # If a worker is "ready" (finished) but we didn't get a None in the queue,
                     for ref in ready_refs:
                         try:
-                            ray.get(
-                                ref
-                            )  # This will raise the worker's exception if it crashed
+                            ray.get(ref)  # This will raise the worker's exception if it crashed
                         except Exception as e:
                             print(f"\n[CRITICAL] A worker crashed! Error: {e}")
                             worker_crashed = True
@@ -1264,9 +1261,7 @@ def evaluate_conditions_ray(
             if item is None:
                 finished += 1
                 continue
-            idx, pred, cand_list, tok_total, prm_calls, agent_runs, metadata, gold = (
-                item
-            )
+            idx, pred, cand_list, tok_total, prm_calls, agent_runs, metadata, gold = item
 
             # Normalize candidate list and ensure pred is first
             if not isinstance(cand_list, (list, tuple)):
@@ -1285,14 +1280,10 @@ def evaluate_conditions_ray(
             if isinstance(metadata, dict) and "prefix_answers" in metadata:
                 handoff_examples += 1
                 for threshold in prefix_correct:
-                    prefix_answer = metadata.get("prefix_answers", {}).get(
-                        str(threshold), ""
-                    )
+                    prefix_answer = metadata.get("prefix_answers", {}).get(str(threshold), "")
                     prefix_is_correct = is_correct(prefix_answer, gold)
                     prefix_correct[threshold] += int(prefix_is_correct)
-                    prefix_condition_correct[threshold][int(idx)] = bool(
-                        prefix_is_correct
-                    )
+                    prefix_condition_correct[threshold][int(idx)] = bool(prefix_is_correct)
                 depths.append(int(metadata.get("depth", 0)))
                 unique_agents.append(int(metadata.get("unique_agents", 0)))
                 unique_edges.append(int(metadata.get("unique_directed_role_edges", 0)))
@@ -1302,9 +1293,7 @@ def evaluate_conditions_ray(
                     speaker = str(turn.get("speaker", ""))
                     recipient = str(turn.get("recipient", ""))
                     if speaker and recipient and recipient != "FINAL":
-                        route_counts_by_speaker.setdefault(speaker, Counter())[
-                            recipient
-                        ] += 1
+                        route_counts_by_speaker.setdefault(speaker, Counter())[recipient] += 1
                 context_token_values.extend(
                     int(value) for value in metadata.get("prm_context_tokens", [])
                 )
@@ -1314,12 +1303,8 @@ def evaluate_conditions_ray(
                 prm_evaluations_total += int(metadata.get("prm_evaluations", 0))
             if isinstance(metadata, dict) and "pool_answers" in metadata:
                 pooled_examples += 1
-                pool_answers = [
-                    str(answer) for answer in metadata.get("pool_answers", [])
-                ]
-                pool_weights = [
-                    float(weight) for weight in metadata.get("pool_weights", [])
-                ]
+                pool_answers = [str(answer) for answer in metadata.get("pool_answers", [])]
+                pool_weights = [float(weight) for weight in metadata.get("pool_weights", [])]
                 labels = [bool(is_correct(answer, gold)) for answer in pool_answers]
                 oracle_hits += int(any(labels))
                 if any(labels):
@@ -1331,9 +1316,7 @@ def evaluate_conditions_ray(
                 latencies.append(float(metadata["latency_s"]))
             if isinstance(metadata, dict) and metadata.get("judge_calls"):
                 judge_calls_total += int(metadata.get("judge_calls", 0))
-                judge_parse_failures_total += int(
-                    metadata.get("judge_parse_failures", 0)
-                )
+                judge_parse_failures_total += int(metadata.get("judge_parse_failures", 0))
             if isinstance(metadata, dict) and metadata.get("error"):
                 decoder_errors += 1
 
@@ -1369,12 +1352,9 @@ def evaluate_conditions_ray(
             if seen % LOG_EVERY == 0:
                 acc_so_far = correct / max(1, seen)
                 mean_so_far = float(statistics.mean(totals)) if totals else 0.0
-                std_so_far = (
-                    float(statistics.pstdev(totals)) if len(totals) > 1 else 0.0
-                )
+                std_so_far = float(statistics.pstdev(totals)) if len(totals) > 1 else 0.0
                 pass_str = ", ".join(
-                    f"p@{i+1}={pass_counts[i]/max(1, seen):.4f}"
-                    for i in range(MAX_PASS_K)
+                    f"p@{i+1}={pass_counts[i]/max(1, seen):.4f}" for i in range(MAX_PASS_K)
                 )
                 with open(results_path, "a") as f:
                     f.write(
@@ -1429,10 +1409,7 @@ def evaluate_conditions_ray(
             }
             for i in range(1, MAX_PASS_K + 1):
                 results[spec.name][f"pass_at_{i}"] = float("nan")
-            print(
-                f"[result] {spec.name}: FAILED "
-                f"({processed}/{len(data)} examples processed)"
-            )
+            print(f"[result] {spec.name}: FAILED " f"({processed}/{len(data)} examples processed)")
             if spec.kind in handoff_kinds and handoff_workers is not None:
                 for worker in handoff_workers:
                     ray.kill(worker, no_restart=True)
@@ -1462,11 +1439,7 @@ def evaluate_conditions_ray(
 
         if handoff_examples:
             sorted_context = sorted(context_token_values)
-            p95_idx = (
-                max(0, math.ceil(0.95 * len(sorted_context)) - 1)
-                if sorted_context
-                else 0
-            )
+            p95_idx = max(0, math.ceil(0.95 * len(sorted_context)) - 1) if sorted_context else 0
             routed_edge_total = sum(
                 sum(recipient_counts.values())
                 for recipient_counts in route_counts_by_speaker.values()
@@ -1490,18 +1463,14 @@ def evaluate_conditions_ray(
                     "realized_depth_mean": float(statistics.mean(depths)),
                     "realized_depth_median": float(statistics.median(depths)),
                     "unique_agents_mean": float(statistics.mean(unique_agents)),
-                    "unique_directed_role_edges_mean": float(
-                        statistics.mean(unique_edges)
-                    ),
+                    "unique_directed_role_edges_mean": float(statistics.mean(unique_edges)),
                     "role_revisit_rate_mean": float(statistics.mean(revisit_rates)),
                     "route_entropy_bits": conditional_route_entropy,
                     "within_trajectory_edge_entropy_bits_mean": float(
                         statistics.mean(route_entropies)
                     ),
                     "prm_context_token_median": (
-                        float(statistics.median(sorted_context))
-                        if sorted_context
-                        else 0.0
+                        float(statistics.median(sorted_context)) if sorted_context else 0.0
                     ),
                     "prm_context_token_p95": (
                         float(sorted_context[p95_idx]) if sorted_context else 0.0
@@ -1512,9 +1481,7 @@ def evaluate_conditions_ray(
                         else 0.0
                     ),
                     "parse_failure_rate": (
-                        parse_failures_total / proposals_total
-                        if proposals_total
-                        else 0.0
+                        parse_failures_total / proposals_total if proposals_total else 0.0
                     ),
                     "agent_proposals_total": float(proposals_total),
                     "agent_proposals_mean": proposals_total / handoff_examples,
@@ -1541,9 +1508,7 @@ def evaluate_conditions_ray(
                 {
                     "judge_calls_total": judge_calls_total,
                     "judge_calls_mean": judge_calls_total / n,
-                    "judge_parse_failure_rate": (
-                        judge_parse_failures_total / judge_calls_total
-                    ),
+                    "judge_parse_failure_rate": (judge_parse_failures_total / judge_calls_total),
                 }
             )
 
@@ -1559,18 +1524,12 @@ def evaluate_conditions_ray(
             f.write(f"Tokens: {mean:.1f} ± {std:.1f} ({len(totals)} examples)\n")
             f.write(f"Total PRM calls: {prm_calls_total}\n")
             f.write(f"Total Agent runs: {agent_runs_total}\n")
-            f.write(
-                f"Mean PRM calls per example: {results[spec.name]['prm_calls_mean']:.2f}\n"
-            )
-            f.write(
-                f"Mean Agent runs per example: {results[spec.name]['agent_runs_mean']:.2f}\n"
-            )
+            f.write(f"Mean PRM calls per example: {results[spec.name]['prm_calls_mean']:.2f}\n")
+            f.write(f"Mean Agent runs per example: {results[spec.name]['agent_runs_mean']:.2f}\n")
             if handoff_examples:
                 f.write(f"Hit@1 at 4 messages: {results[spec.name]['hit_at_4']:.4f}\n")
                 f.write(f"Hit@1 at 8 messages: {results[spec.name]['hit_at_8']:.4f}\n")
-                f.write(
-                    f"Hit@1 at 12 messages: {results[spec.name]['hit_at_12']:.4f}\n"
-                )
+                f.write(f"Hit@1 at 12 messages: {results[spec.name]['hit_at_12']:.4f}\n")
                 f.write(
                     "Realized depth (mean/median): "
                     f"{results[spec.name]['realized_depth_mean']:.2f}/"
@@ -1593,9 +1552,7 @@ def evaluate_conditions_ray(
                     f"{results[spec.name]['prm_context_token_median']:.1f}/"
                     f"{results[spec.name]['prm_context_token_p95']:.1f}\n"
                 )
-                f.write(
-                    f"PRM truncation rate: {results[spec.name]['prm_truncation_rate']:.4f}\n"
-                )
+                f.write(f"PRM truncation rate: {results[spec.name]['prm_truncation_rate']:.4f}\n")
                 f.write(
                     f"Action parse-failure rate: {results[spec.name]['parse_failure_rate']:.4f}\n"
                 )
@@ -1621,8 +1578,7 @@ def evaluate_conditions_ray(
                 f.write(f"Candidate AUC: {results[spec.name]['candidate_auc']:.4f}\n")
             if latencies:
                 f.write(
-                    f"Selector latency mean (s): "
-                    f"{results[spec.name]['latency_mean_s']:.3f}\n"
+                    f"Selector latency mean (s): " f"{results[spec.name]['latency_mean_s']:.3f}\n"
                 )
             if judge_calls_total:
                 f.write(
@@ -1641,10 +1597,7 @@ def evaluate_conditions_ray(
         for worker in handoff_workers:
             ray.kill(worker, no_restart=True)
 
-    if (
-        "handoff_policy" in prefix_correct_by_kind
-        and "handoff_prm" in prefix_correct_by_kind
-    ):
+    if "handoff_policy" in prefix_correct_by_kind and "handoff_prm" in prefix_correct_by_kind:
         comparisons = {
             threshold: _paired_condition_comparison(
                 prefix_correct_by_kind["handoff_policy"][threshold],
@@ -1701,9 +1654,7 @@ def evaluate_conditions_ray(
         name = result_name_by_kind.get(kind)
         if not comparison or name not in results:
             continue
-        results[name].update(
-            {f"vs_masprm_{key}": value for key, value in comparison.items()}
-        )
+        results[name].update({f"vs_masprm_{key}": value for key, value in comparison.items()})
         row_path = result_path_by_kind.get(kind)
         if row_path:
             with open(row_path, "a") as f:
