@@ -13,9 +13,11 @@ class Agent:
         max_new_tokens: int = 512,
         temperature: float = 0.7,
         top_p: float = 0.95,
+        name: Optional[str] = None,
     ):
         self.model = model
         self.tok = tok
+        self.name = name
         self.system_prompt = system_prompt
         self.max_new_tokens = max_new_tokens
         self.temperature = temperature
@@ -28,14 +30,17 @@ class Agent:
         ]
 
     def _generation_kwargs(self, **gen_kwargs):
+        global_cap = int(gen_kwargs.get("max_new_tokens", self.max_new_tokens))
         return {
             "temperature": gen_kwargs.get("temperature", self.temperature),
             "top_p": gen_kwargs.get("top_p", self.top_p),
-            "max_new_tokens": gen_kwargs.get("max_new_tokens", self.max_new_tokens),
+            "max_new_tokens": min(global_cap, self.max_new_tokens),
         }
 
     def _to_inputs(self, msgs):
-        enc = self.tok.apply_chat_template(msgs, tokenize=True, add_generation_prompt=True)
+        enc = self.tok.apply_chat_template(
+            msgs, tokenize=True, add_generation_prompt=True
+        )
 
         if isinstance(enc, list):
             return self.tok.pad({"input_ids": [enc]}, return_tensors="pt")
@@ -45,14 +50,18 @@ class Agent:
                 enc = enc.unsqueeze(0)
             return {"input_ids": enc, "attention_mask": torch.ones_like(enc)}
 
-        rendered = self.tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+        rendered = self.tok.apply_chat_template(
+            msgs, tokenize=False, add_generation_prompt=True
+        )
         return self.tok(rendered, return_tensors="pt", add_special_tokens=False)
 
     @torch.inference_mode()
     def _generate_local_n(self, msgs, n: int, **gen_kwargs):
         params = self._generation_kwargs(**gen_kwargs)
         inputs = self._to_inputs(msgs)
-        inputs = {k: v.to(self.model.device, non_blocking=True) for k, v in inputs.items()}
+        inputs = {
+            k: v.to(self.model.device, non_blocking=True) for k, v in inputs.items()
+        }
 
         out = self.model.generate(
             **inputs,

@@ -24,7 +24,6 @@ from tqdm import tqdm
 
 import yaml
 
-
 _ACTION_TEXT_RE = re.compile(r"^\[agent\s+(\d+)\]")
 
 
@@ -92,7 +91,9 @@ def _node_value(nd: Dict[str, Any]) -> Optional[float]:
 
 
 def _is_pm1(x: Optional[float]) -> bool:
-    return (x is not None) and math.isclose(abs(float(x)), 1.0, rel_tol=0.0, abs_tol=1e-6)
+    return (x is not None) and math.isclose(
+        abs(float(x)), 1.0, rel_tol=0.0, abs_tol=1e-6
+    )
 
 
 def _iter_paths_exact_nodes(
@@ -401,7 +402,8 @@ def _ppm_pairs_from_tree(
         # (depth == target_nodes - 2). In variable-depth mode it is structural:
         # all children of this prefix are terminal leaves.
         is_final_step = (
-            (depth == tn - 2) if fixed_len
+            (depth == tn - 2)
+            if fixed_len
             else all(bool(c.get("is_terminal", False)) for c in children)
         )
         if is_final_step:
@@ -542,7 +544,9 @@ def _ppm_pairs_from_tree_local(
     # DFS stack carries (node, node_path, agent_idx_path). agent_idx_path
     # mirrors node_path[1:] (root excluded) and lets us build prefix_forced
     # without re-parsing action_text each time.
-    stack: List[Tuple[Dict[str, Any], List[Dict[str, Any]], List[int]]] = [(data, [data], [])]
+    stack: List[Tuple[Dict[str, Any], List[Dict[str, Any]], List[int]]] = [
+        (data, [data], [])
+    ]
     while stack and (pairs_made_total < max_pairs):
         nd, path, agent_prefix = stack.pop()
         depth = len(path) - 1
@@ -563,7 +567,8 @@ def _ppm_pairs_from_tree_local(
         # See _ppm_pairs_from_tree: in fixed-depth mode "final step" is by
         # depth, in variable-depth mode it is "all children are terminal".
         is_final_step = (
-            (depth == tn - 2) if fixed_len
+            (depth == tn - 2)
+            if fixed_len
             else all(bool(c.get("is_terminal", False)) for c in children)
         )
         if is_final_step:
@@ -697,7 +702,10 @@ def main():
         ),
     )
     ap.add_argument(
-        "--dedupe", action="store_true", default=True, help="Remove exact duplicate samples"
+        "--dedupe",
+        action="store_true",
+        default=True,
+        help="Remove exact duplicate samples",
     )
     # Preference Pair Mining (PPM) switches
     ap.add_argument(
@@ -706,13 +714,22 @@ def main():
         help="Also emit PPM preference pairs JSONL (chosen/rejected).",
     )
     ap.add_argument(
-        "--ppm-max-pairs", type=int, default=8, help="Max preference pairs to emit per tree."
+        "--ppm-max-pairs",
+        type=int,
+        default=8,
+        help="Max preference pairs to emit per tree.",
     )
     ap.add_argument(
-        "--ppm-pos-topk", type=int, default=4, help="Top-K positive terminal paths to consider."
+        "--ppm-pos-topk",
+        type=int,
+        default=4,
+        help="Top-K positive terminal paths to consider.",
     )
     ap.add_argument(
-        "--ppm-neg-topk", type=int, default=4, help="Top-K negative terminal paths to consider."
+        "--ppm-neg-topk",
+        type=int,
+        default=4,
+        help="Top-K negative terminal paths to consider.",
     )
     ap.add_argument(
         "--ppm-root-window",
@@ -745,7 +762,9 @@ def main():
         int(args.target_nodes) if int(args.target_nodes) > 0 else None
     )
     view_tag = "" if args.view == "full" else f"_{args.view}"
-    prm_output_path = args.input.with_name(f"prm_samples{view_tag}_{args.input.stem}.jsonl")
+    prm_output_path = args.input.with_name(
+        f"prm_samples{view_tag}_{args.input.stem}.jsonl"
+    )
     prm_output_path.parent.mkdir(parents=True, exist_ok=True)
 
     ppm_output_path = (
@@ -780,7 +799,11 @@ def main():
     ppm_n_pairs = 0
 
     prm_out = prm_output_path.open("w", encoding="utf-8")
-    ppm_out = ppm_output_path.open("w", encoding="utf-8") if ppm_output_path is not None else None
+    ppm_out = (
+        ppm_output_path.open("w", encoding="utf-8")
+        if ppm_output_path is not None
+        else None
+    )
 
     json_files = sorted(args.input.rglob("*.json"))
     n_files = len(json_files)
@@ -831,7 +854,9 @@ def main():
                         neg_topk=args.ppm_neg_topk,
                         max_pairs=args.ppm_max_pairs,
                         require_root_window=(
-                            tuple(args.ppm_root_window) if args.ppm_root_window else None
+                            tuple(args.ppm_root_window)
+                            if args.ppm_root_window
+                            else None
                         ),
                     )
                 else:
@@ -843,13 +868,17 @@ def main():
                         neg_topk=args.ppm_neg_topk,
                         max_pairs=args.ppm_max_pairs,
                         require_root_window=(
-                            tuple(args.ppm_root_window) if args.ppm_root_window else None
+                            tuple(args.ppm_root_window)
+                            if args.ppm_root_window
+                            else None
                         ),
                     )
 
                 for p in pairs:
                     if args.dedupe:
-                        key = tuple([p["prompt"]] + p["chosen_actions"] + p["rejected_actions"])
+                        key = tuple(
+                            [p["prompt"]] + p["chosen_actions"] + p["rejected_actions"]
+                        )
                         if key in seen_ppm:
                             continue
                         seen_ppm.add(key)

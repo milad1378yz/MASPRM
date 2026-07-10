@@ -15,7 +15,9 @@ def pad_without_fast_tokenizer_warning(tokenizer, *pad_args, **pad_kwargs):
         return tokenizer.pad(*pad_args, **pad_kwargs)
 
     # Save the state of the warning, then disable it
-    warning_state = tokenizer.deprecation_warnings.get("Asking-to-pad-a-fast-tokenizer", False)
+    warning_state = tokenizer.deprecation_warnings.get(
+        "Asking-to-pad-a-fast-tokenizer", False
+    )
     tokenizer.deprecation_warnings["Asking-to-pad-a-fast-tokenizer"] = True
 
     try:
@@ -49,7 +51,9 @@ class DataCollatorForTokenRegression:
         if "targets" in features[0]:
             source_name = "targets"  # preferred: float targets
         elif "labels" in features[0]:
-            source_name = "labels"  # may be float labels OR integer-encoded floats OR a mask
+            source_name = (
+                "labels"  # may be float labels OR integer-encoded floats OR a mask
+            )
         elif "label" in features[0]:
             source_name = "label"
         else:
@@ -122,7 +126,11 @@ class PairwiseDataCollatorForPPM:
     """Pads pos and neg batches separately, returns tensors."""
 
     def __init__(
-        self, tokenizer: AutoTokenizer, padding=True, max_length=None, return_tensors="pt"
+        self,
+        tokenizer: AutoTokenizer,
+        padding=True,
+        max_length=None,
+        return_tensors="pt",
     ):
         self.tokenizer = tokenizer
         self.padding = padding

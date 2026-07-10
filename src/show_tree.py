@@ -113,7 +113,9 @@ def draw_tree(G, out_path: Path, dpi=200, font_size=9):
         raise ValueError("Root node '0' missing. Is the JSON from node_to_dict?")
 
     # More space between levels + better leaf separation
-    pos = hierarchy_pos(G, root="0", vert_gap=1.4, vert_loc=0.0, xcenter=0.0, leaf_pad=0.6)
+    pos = hierarchy_pos(
+        G, root="0", vert_gap=1.4, vert_loc=0.0, xcenter=0.0, leaf_pad=0.6
+    )
 
     # Build labels: only q_mean
     labels = {n: f"{G.nodes[n].get('q_mean', 0.0):.3f}" for n in G.nodes}

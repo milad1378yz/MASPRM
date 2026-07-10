@@ -79,7 +79,9 @@ def _to_number(s):
     s = s.strip()
     s = s.replace(",", "")
     s = re.sub(r"^\$", "", s)
-    s = re.sub(r"\s+(dollars?|tickets?|units?|boxes?|people|students?)$", "", s, flags=re.I)
+    s = re.sub(
+        r"\s+(dollars?|tickets?|units?|boxes?|people|students?)$", "", s, flags=re.I
+    )
     if re.fullmatch(r"-?\d+/\d+", s):
         return float(Fraction(s))
     if s.endswith("%"):

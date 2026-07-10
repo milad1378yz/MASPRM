@@ -1,10 +1,20 @@
 import heapq
 import re
-from typing import Annotated, Any, Callable, Dict, List, Optional, Set, Tuple, TypedDict, Union
+from typing import (
+    Annotated,
+    Any,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Set,
+    Tuple,
+    TypedDict,
+    Union,
+)
 
 from agent import Agent
 from langgraph.graph import START, StateGraph
-
 
 Predicate = Callable[[str], bool]
 
@@ -16,12 +26,12 @@ def _always_true(_text: str) -> bool:
 def _parse_condition(spec: Union[str, Predicate, None]) -> Predicate:
     """Compile a small DSL for conditional edges, applied to the source output.
 
-      None / "" / "always"    -> fires unconditionally
-      "contains:TEXT"         -> case-insensitive substring match
-      "not_contains:TEXT"     -> negated substring match
-      "regex:PATTERN"         -> re.search (use (?i) inline for case-insensitive)
-      "not_regex:PATTERN"     -> negated re.search
-      callable                -> used as-is (programmatic configs only)
+    None / "" / "always"    -> fires unconditionally
+    "contains:TEXT"         -> case-insensitive substring match
+    "not_contains:TEXT"     -> negated substring match
+    "regex:PATTERN"         -> re.search (use (?i) inline for case-insensitive)
+    "not_regex:PATTERN"     -> negated re.search
+    callable                -> used as-is (programmatic configs only)
     """
     if spec is None or spec == "" or spec == "always":
         return _always_true
@@ -51,9 +61,12 @@ def _parse_condition(spec: Union[str, Predicate, None]) -> Predicate:
 
 
 def _merge_nested_dicts(
-    left: Optional[Dict[int, Dict[int, str]]], right: Optional[Dict[int, Dict[int, str]]]
+    left: Optional[Dict[int, Dict[int, str]]],
+    right: Optional[Dict[int, Dict[int, str]]],
 ) -> Dict[int, Dict[int, str]]:
-    merged: Dict[int, Dict[int, str]] = {int(k): dict(v) for k, v in (left or {}).items()}
+    merged: Dict[int, Dict[int, str]] = {
+        int(k): dict(v) for k, v in (left or {}).items()
+    }
     for key, value in (right or {}).items():
         key = int(key)
         child_updates = dict(value)
@@ -66,7 +79,9 @@ def _merge_nested_dicts(
     return merged
 
 
-def _merge_dicts(left: Optional[Dict[int, Any]], right: Optional[Dict[int, Any]]) -> Dict[int, Any]:
+def _merge_dicts(
+    left: Optional[Dict[int, Any]], right: Optional[Dict[int, Any]]
+) -> Dict[int, Any]:
     merged = dict(left or {})
     merged.update(right or {})
     return merged
@@ -117,7 +132,9 @@ class MAS:
                     )
             parsed_edges.append((src, dst))
             edge_conditions[(src, dst)] = _parse_condition(cond_spec)
-            edge_condition_specs[(src, dst)] = cond_spec if isinstance(cond_spec, str) else None
+            edge_condition_specs[(src, dst)] = (
+                cond_spec if isinstance(cond_spec, str) else None
+            )
 
         self.edges = parsed_edges
         self.edge_conditions = edge_conditions
@@ -129,7 +146,9 @@ class MAS:
         self.parents: Dict[int, List[int]] = {}
         for s, t in self.edges:
             if t < 0 or t >= self.n:
-                raise ValueError(f"Invalid edge target {t}; expected an agent index in [0, {self.n}).")
+                raise ValueError(
+                    f"Invalid edge target {t}; expected an agent index in [0, {self.n})."
+                )
             if s != self.INPUT and (s < 0 or s >= self.n):
                 raise ValueError(
                     f"Invalid edge source {s}; expected {self.INPUT} or an agent index in [0, {self.n})."
@@ -144,12 +163,16 @@ class MAS:
 
         self.edge_index = {e: i for i, e in enumerate(self.edges)}
         self.agent_order = self._topological_order()
-        self.agent_position = {agent_idx: pos for pos, agent_idx in enumerate(self.agent_order)}
+        self.agent_position = {
+            agent_idx: pos for pos, agent_idx in enumerate(self.agent_order)
+        }
         self.sinks = [i for i in range(self.n) if len(self.children.get(i, [])) == 0]
         self.required_parents: Dict[int, Set[int]] = {
             i: set(self.parents.get(i, [])) for i in range(self.n)
         }
-        self.parent_order: Dict[int, List[int]] = {i: sorted(self.required_parents[i]) for i in range(self.n)}
+        self.parent_order: Dict[int, List[int]] = {
+            i: sorted(self.required_parents[i]) for i in range(self.n)
+        }
         self.agent_round = self._compute_agent_rounds()
         self._graph = self._build_graph()
 
@@ -202,9 +225,15 @@ class MAS:
             return []
         return [str(out)]
 
-    def agent_input_map(self, idx: int, inbox: Dict[int, Dict[int, str]]) -> Dict[int, str]:
+    def agent_input_map(
+        self, idx: int, inbox: Dict[int, Dict[int, str]]
+    ) -> Dict[int, str]:
         have = inbox.get(idx, {})
-        return {parent_idx: have[parent_idx] for parent_idx in self.parent_order[idx] if parent_idx in have}
+        return {
+            parent_idx: have[parent_idx]
+            for parent_idx in self.parent_order[idx]
+            if parent_idx in have
+        }
 
     def agent_inputs(self, idx: int, inbox: Dict[int, Dict[int, str]]) -> List[str]:
         return list(self.agent_input_map(idx, inbox).values())
@@ -223,7 +252,9 @@ class MAS:
             {"role": "user", "content": user_content},
         ]
 
-    def run_agent(self, idx: int, inbox: Dict[int, Dict[int, str]], **gen_kwargs) -> List[str]:
+    def run_agent(
+        self, idx: int, inbox: Dict[int, Dict[int, str]], **gen_kwargs
+    ) -> List[str]:
         out = self.agents[idx].generate(self.agent_messages(idx, inbox), **gen_kwargs)
         return self._normalize_outs(out)
 
@@ -239,10 +270,14 @@ class MAS:
         if hasattr(agent, "generate_n"):
             outs_list = agent.generate_n(msgs, n=n_candidates, **gen_kwargs)
         else:
-            outs_list = [agent.generate(msgs, **gen_kwargs) for _ in range(n_candidates)]
+            outs_list = [
+                agent.generate(msgs, **gen_kwargs) for _ in range(n_candidates)
+            ]
         return [self._normalize_outs(out) for out in outs_list]
 
-    def _deliver_outputs(self, idx: int, outs: List[str]) -> Tuple[Dict[int, Dict[int, str]], Dict[int, str]]:
+    def _deliver_outputs(
+        self, idx: int, outs: List[str]
+    ) -> Tuple[Dict[int, Dict[int, str]], Dict[int, str]]:
         delivered: Dict[int, Dict[int, str]] = {}
         outputs: Dict[int, str] = {}
         children = self.children.get(idx, [])
@@ -301,7 +336,9 @@ class MAS:
             "inbox": {},
             "agent_io": {},
             "primary_out": {},
-            "active_agents": None if active_agents is None else {int(i) for i in active_agents},
+            "active_agents": (
+                None if active_agents is None else {int(i) for i in active_agents}
+            ),
             "forced_outputs": {
                 int(agent_idx): self._normalize_outs(outs)
                 for agent_idx, outs in (forced_outputs or {}).items()
@@ -354,11 +391,16 @@ class MAS:
         graph = StateGraph(_MASState)
         graph.add_node(self._INPUT_NODE, self._input_node)
         for agent_idx in range(self.n):
-            graph.add_node(self._agent_node_name(agent_idx), self._agent_node(agent_idx))
+            graph.add_node(
+                self._agent_node_name(agent_idx), self._agent_node(agent_idx)
+            )
 
         graph.add_edge(START, self._INPUT_NODE)
         for agent_idx in self.agent_order:
-            parents = [self._graph_node_name(parent_idx) for parent_idx in self.parent_order[agent_idx]]
+            parents = [
+                self._graph_node_name(parent_idx)
+                for parent_idx in self.parent_order[agent_idx]
+            ]
             if not parents:
                 continue
             if len(parents) == 1:
@@ -397,7 +439,9 @@ class MAS:
         if len(finals) == 1:
             return finals[0]
         if len(finals) > 1:
-            ordered = [f"[agent {i}] {primary_out[i]}" for i in self.sinks if i in primary_out]
+            ordered = [
+                f"[agent {i}] {primary_out[i]}" for i in self.sinks if i in primary_out
+            ]
             return "\n\n".join(ordered)
         return last
 

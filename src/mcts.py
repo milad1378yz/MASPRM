@@ -76,7 +76,9 @@ class BaseMCTS:
             raise RuntimeError("Tried to expand a terminal MCTS node.")
         return nxt
 
-    def _sample_candidates(self, node: Node, n_candidates: int) -> tuple[int, List[List[str]]]:
+    def _sample_candidates(
+        self, node: Node, n_candidates: int
+    ) -> tuple[int, List[List[str]]]:
         agent_idx, inbox = self._expansion_context(node)
         candidates = self.mas.sample_candidates(
             agent_idx,
@@ -200,7 +202,7 @@ class MAS_MCTS(BaseMCTS):
 
             # Expand if no children. With conditional edges, the trajectory
             # depth is not fixed at `len(self.order)`: an AGREE branch may
-                # terminate at depth 4 while a DISAGREE branch goes to depth 8.
+            # terminate at depth 4 while a DISAGREE branch goes to depth 8.
             # We therefore use the full `n_candidates` budget at every
             # expansion rather than halving at "the last layer" — that
             # heuristic only made sense when every trajectory had the same
