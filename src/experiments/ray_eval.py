@@ -468,12 +468,12 @@ def evaluate_conditions_ray(
         # Prepare conditional path parts
         prm = (
             f"_{Path(worker_init.prm_dir).name}"
-            if worker_init.prm_dir and spec.kind in {"sbs_prm", "mcts_prm", "voter_prm"}
+            if worker_init.prm_dir and needs_prm
             else ""
         )
         orm = (
             f"_{Path(worker_init.orm_dir).name}"
-            if worker_init.orm_dir and spec.kind in {"mcts_orm", "voter_orm"}
+            if worker_init.orm_dir and needs_orm
             else ""
         )
 

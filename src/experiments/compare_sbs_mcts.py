@@ -1,10 +1,10 @@
+import argparse
 import os
 import sys
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import Any, Dict, List
 
 import yaml
-import argparse
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from dataset_handler import load_hard_dataset
@@ -19,6 +19,93 @@ os.environ.setdefault(
     "PYTORCH_ALLOC_CONF",
     "max_split_size_mb:128",
 )
+
+METHODS = (
+    "single_pass",
+    "sbs_prm",
+    "sbs_logprob",
+    "mcts_prm",
+    "mcts_logprob",
+    "mcts_orm",
+    "voter_plain",
+    "voter_prm",
+    "voter_logprob",
+    "voter_orm",
+)
+DEFAULT_METHODS = ("single_pass", "mcts_prm")
+
+
+def build_condition_specs(args: argparse.Namespace) -> List[ConditionSpec]:
+    sbs_kwargs = {
+        "temperature": args.sbs_temperature,
+        "top_p": args.top_p,
+        "max_new_tokens": args.max_new_tokens,
+    }
+    mcts_kwargs = {
+        "temperature": args.mcts_temperature,
+        "top_p": args.top_p,
+        "max_new_tokens": args.max_new_tokens,
+    }
+    conditions: List[ConditionSpec] = []
+
+    for method in dict.fromkeys(args.methods):
+        if method == "single_pass":
+            conditions.append(
+                ConditionSpec(
+                    "DyLAN single pass (no scorer)",
+                    "sbs_none",
+                    {"B1": 1, "B2": 1, "gen_kwargs": sbs_kwargs},
+                )
+            )
+            continue
+
+        family, scorer = method.split("_", 1)
+        if family == "sbs":
+            params = {"B1": args.b1, "B2": args.b2, "gen_kwargs": sbs_kwargs}
+            details = [f"B1={args.b1}", f"B2={args.b2}"]
+            name = f"SBS + {'PRM' if scorer == 'prm' else 'logprob'}"
+        elif family == "mcts":
+            params = {
+                "n_simulations": args.n_simulations,
+                "max_children": args.max_children,
+                "c_uct": args.c_uct,
+                "mcts_kwargs": mcts_kwargs,
+            }
+            details = [f"N={args.n_simulations}", f"{args.max_children} children"]
+            search_name = "MCTS" if args.uct_type == "uct" else "MCTS (PUCT)"
+            scorer_name = {
+                "prm": "PPM",
+                "logprob": "logprob",
+                "orm": "ORM",
+            }[scorer]
+            name = f"{'DyLAN ' if method == 'mcts_prm' else ''}{search_name} + {scorer_name}"
+            if args.uct_type != "uct":
+                params["uct_type"] = args.uct_type
+            if method == "mcts_prm" and args.orm_leaf:
+                params["leaf_score_type"] = "orm"
+                details.insert(0, "ORM leaf")
+        else:
+            params = {"k": args.voter_k, "gen_kwargs": sbs_kwargs}
+            details = []
+            voter_descriptions = {
+                "plain": "policy only, no PRM",
+                "prm": "score-weighted, PRM-steps",
+                "logprob": "score-weighted, logprob",
+                "orm": "score-weighted, ORM end",
+            }
+            name = f"Greedy + Voter ({voter_descriptions[scorer]})"
+
+        if scorer in {"prm", "orm"}:
+            params["view_mode"] = args.view_mode
+        if scorer == "logprob" and args.logprob_agg != "sum":
+            params["logprob_agg"] = args.logprob_agg
+            details.insert(0, args.logprob_agg.replace("_", "-"))
+        if details:
+            name += f" ({', '.join(details)})"
+
+        conditions.append(ConditionSpec(name, method, params))
+
+    return conditions
 
 
 def main():
@@ -49,7 +136,85 @@ def main():
         default=None,
         help="Optional path to a MAS YAML config. Defaults to configs/<dataset>.yaml.",
     )
+    parser.add_argument(
+        "--methods",
+        nargs="+",
+        choices=METHODS,
+        default=list(DEFAULT_METHODS),
+        metavar="METHOD",
+        help=(
+            "Methods to evaluate in the given order. "
+            f"Defaults to: {' '.join(DEFAULT_METHODS)}. "
+            f"Available: {', '.join(METHODS)}."
+        ),
+    )
+    method_args = parser.add_argument_group("method hyperparameters")
+    method_args.add_argument("--b1", type=int, default=3, help="SBS expansion width.")
+    method_args.add_argument(
+        "--b2", type=int, default=5, help="SBS retained beam width."
+    )
+    method_args.add_argument(
+        "--voter_k", type=int, default=5, help="Number of voter candidates."
+    )
+    method_args.add_argument(
+        "--n_simulations", type=int, default=10, help="MCTS simulation budget."
+    )
+    method_args.add_argument(
+        "--max_children", type=int, default=3, help="Maximum MCTS children per node."
+    )
+    method_args.add_argument("--c_uct", type=float, default=2.0)
+    method_args.add_argument("--uct_type", choices=["uct", "puct"], default="uct")
+    method_args.add_argument(
+        "--orm_leaf",
+        action="store_true",
+        help="Use ORM leaf scoring with mcts_prm.",
+    )
+    method_args.add_argument(
+        "--logprob_agg",
+        choices=["sum", "avg_token", "avg_step"],
+        default="sum",
+    )
+    method_args.add_argument("--sbs_temperature", type=float, default=1.0)
+    method_args.add_argument("--mcts_temperature", type=float, default=0.6)
+    method_args.add_argument("--top_p", type=float, default=0.95)
+    method_args.add_argument("--max_new_tokens", type=int, default=1024)
     args = parser.parse_args()
+
+    for arg_name in (
+        "b1",
+        "b2",
+        "voter_k",
+        "n_simulations",
+        "max_children",
+        "max_new_tokens",
+    ):
+        if getattr(args, arg_name) < 1:
+            parser.error(f"--{arg_name} must be at least 1")
+    if args.c_uct < 0:
+        parser.error("--c_uct cannot be negative")
+    if args.sbs_temperature <= 0 or args.mcts_temperature <= 0:
+        parser.error("temperatures must be greater than zero")
+    if not 0 < args.top_p <= 1:
+        parser.error("--top_p must be in the interval (0, 1]")
+    if args.orm_leaf and "mcts_prm" not in args.methods:
+        parser.error("--orm_leaf requires the mcts_prm method")
+
+    conditions = build_condition_specs(args)
+
+    needs_prm = any(
+        condition.kind in {"sbs_prm", "mcts_prm", "voter_prm"}
+        or condition.params.get("leaf_score_type") == "prm"
+        for condition in conditions
+    )
+    needs_orm = any(
+        condition.kind in {"mcts_orm", "voter_orm"}
+        or condition.params.get("leaf_score_type") == "orm"
+        for condition in conditions
+    )
+    if needs_prm and not args.prm_dir:
+        parser.error("--prm_dir is required by the selected methods")
+    if needs_orm and not args.orm_dir:
+        parser.error("--orm_dir is required by the selected methods")
 
     # Dataset
     DATASET_NAME = args.dataset
@@ -58,7 +223,9 @@ def main():
 
     SEED = args.seed
 
-    raw_ds, q_fn, gold_fn = load_hard_dataset(DATASET_NAME, SPLIT, n=SAMPLE_N, seed=SEED)
+    raw_ds, q_fn, gold_fn = load_hard_dataset(
+        DATASET_NAME, SPLIT, n=SAMPLE_N, seed=SEED
+    )
     data: List[Dict[str, str]] = []
     for ex in raw_ds:
         g = gold_fn(ex)
@@ -69,7 +236,9 @@ def main():
     # MAS graph config
 
     cfg_path = (
-        Path(args.mas_config) if args.mas_config else Path("configs") / f"{DATASET_NAME}.yaml"
+        Path(args.mas_config)
+        if args.mas_config
+        else Path("configs") / f"{DATASET_NAME}.yaml"
     )
     cfg = yaml.safe_load(cfg_path.read_text())
     agent_specs: List[Dict[str, Any]] = cfg["agents"]
@@ -80,7 +249,6 @@ def main():
     prm_dir = str(Path(args.prm_dir).resolve()) if args.prm_dir else args.prm_dir
     prm_base_model_id = args.prm_base_model_id
     gen_model_id = args.gen_model_id
-    view_mode = args.view_mode
     # Optional ORM scorer (same API as PRM loader)
     ORM_DIR = (
         str(Path(args.orm_dir).resolve()) if args.orm_dir else None
@@ -98,179 +266,10 @@ def main():
         seed=SEED,
     )
 
-    # Conditions (descriptive, no closures)
-
-    sbs_fast = {"temperature": 1.0, "top_p": 0.95, "max_new_tokens": 1024}
-    mcts_kws = {"temperature": 0.6, "top_p": 0.95, "max_new_tokens": 1024}
-
-    conditions: List[ConditionSpec] = [
-        ConditionSpec(
-            "DyLAN single pass (no scorer)",
-            "sbs_none",
-            {"B1": 1, "B2": 1, "gen_kwargs": sbs_fast},
-        ),
-        # ConditionSpec(
-        #     "Greedy + Voter (policy only, no PRM)", "voter_plain", {"k": 5, "gen_kwargs": sbs_fast}
-        # ),
-        # ConditionSpec(
-        #     "Greedy + Voter (score-weighted, PRM-steps)",
-        #     "voter_prm",
-        #     {"k": 5, "gen_kwargs": sbs_fast},
-        # ),
-        # ConditionSpec(
-        #     "Greedy + Voter (score-weighted, logprob)",
-        #     "voter_logprob",
-        #     {"k": 5, "gen_kwargs": sbs_fast},
-        # ),
-        # ConditionSpec(
-        #     "SBS + PRM (B1=1, B2=5)", "sbs_prm", {"B1": 1, "B2": 5, "gen_kwargs": sbs_fast}
-        # ),
-        # ConditionSpec(
-        #     "SBS + PRM (B1=3, B2=5)",
-        #     "sbs_prm",
-        #     {"B1": 3, "B2": 5, "gen_kwargs": sbs_fast, "view_mode": view_mode},
-        # ),
-        # ConditionSpec(
-        #     "SBS + logprob (B1=1, B2=5)", "sbs_logprob", {"B1": 1, "B2": 5, "gen_kwargs": sbs_fast}
-        # ),
-        # ConditionSpec(
-        #     "SBS + logprob (B1=1, B2=5)", "sbs_logprob", {"B1": 1, "B2": 5, "gen_kwargs": sbs_fast}
-        # ),
-        # ConditionSpec(
-        #     "MCTS + PRM (N=16, 2 children)",
-        #     "mcts_prm",
-        #     {"n_simulations": 16, "max_children": 2, "c_uct": 2.0, "mcts_kwargs": mcts_kws},
-        # ),
-        ConditionSpec(
-            "DyLAN MCTS + PPM (N=10, 3 children)",
-            "mcts_prm",
-            {
-                "n_simulations": 10,
-                "max_children": 3,
-                "c_uct": 2.0,
-                "mcts_kwargs": mcts_kws,
-                "view_mode": view_mode,
-            },
-        ),
-        # ConditionSpec(
-        #     "MCTS + logprob (N=16, 2 children)",
-        #     "mcts_logprob",
-        #     {"n_simulations": 16, "max_children": 2, "c_uct": 2.0, "mcts_kwargs": mcts_kws},
-        # ),
-    ]
-
-    # conditions.append(
-    #     ConditionSpec(
-    #         "SBS + logprob (avg-token, B1=3, B2=5)",
-    #         "sbs_logprob",
-    #         {"B1": 3, "B2": 5, "gen_kwargs": sbs_fast, "logprob_agg": "avg_token"},
-    #     )
-    # )
-
-    # conditions.append(
-    #     ConditionSpec(
-    #         "MCTS + logprob (avg-token, N=10, 3 children)",
-    #         "mcts_logprob",
-    #         {
-    #             "n_simulations": 10,
-    #             "max_children": 3,
-    #             "c_uct": 2.0,
-    #             "mcts_kwargs": mcts_kws,
-    #             "logprob_agg": "avg_token",
-    #         },
-    #     )
-    # )
-
-    # conditions.append(
-    #     ConditionSpec(
-    #         "Greedy + Voter (score-weighted, logprob avg-token)",
-    #         "voter_logprob",
-    #         {"k": 5, "gen_kwargs": sbs_fast, "logprob_agg": "avg_token"},
-    #     )
-    # )
-
-    # conditions.append(
-    #     ConditionSpec(
-    #         "MCTS (PUCT) + PRM (N=16, 2 children)",
-    #         "mcts_prm",
-    #         {
-    #             "n_simulations": 16,
-    #             "max_children": 2,
-    #             "c_uct": 2.0,  # acts as c_puct here
-    #             "uct_type": "puct",  # switch from UCT to PUCT
-    #             "mcts_kwargs": mcts_kws,
-    #         },
-    #     )
-    # )
-
-    if ORM_DIR:
-        conditions.append(
-            ConditionSpec(
-                "MCTS + ORM (N=10, 3 children)",
-                "mcts_orm",
-                {
-                    "n_simulations": 10,
-                    "max_children": 3,
-                    "c_uct": 2.0,
-                    "mcts_kwargs": mcts_kws,
-                    "view_mode": view_mode,
-                },
-            )
-        )
-        conditions.append(
-            ConditionSpec(
-                "Greedy + Voter (score-weighted, ORM end)",
-                "voter_orm",
-                {"k": 5, "gen_kwargs": sbs_fast, "view_mode": view_mode},
-            )
-        )
-        # conditions.append(
-        #     ConditionSpec(
-        #         "MCTS (PRM expand + ORM leaf) (N=16, 2 children)",
-        #         "mcts_prm",  # we still use the 'prm' kind, but override leaf with ORM
-        #         {
-        #             "n_simulations": 16,
-        #             "max_children": 2,
-        #             "c_uct": 2.0,
-        #             "mcts_kwargs": mcts_kws,
-        #             "leaf_score_type": "orm",  # use ORM only at the leaf
-        #         },
-        #     )
-        # )
-        # conditions.append(
-        #     ConditionSpec(
-        #         "MCTS (PUCT) + ORM (N=16, 2 children)",
-        #         "mcts_orm",
-        #         {
-        #             "n_simulations": 16,
-        #             "max_children": 2,
-        #             "c_uct": 2.0,
-        #             "uct_type": "puct",
-        #             "mcts_kwargs": mcts_kws,
-        #         },
-        #     )
-        # )
-
     # Ray scaling knobs (optional)
     # For large models, safer defaults:
     os.environ.setdefault("WORKERS_PER_GPU", "1")  # 1 actor per GPU
     # os.environ.setdefault("RAY_NUM_WORKERS", "2") # Or set absolute count
-
-    # if dataset name is different from the name in the prm dir only do MCTS + PRM also competittion means MATH
-    # if DATASET_NAME not in prm_dir:
-    #     if DATASET_NAME == "competition_math":
-    #         if "MATH" not in prm_dir:
-    #             print(
-    #                 f"[info] Dataset name '{DATASET_NAME}' not found in prm_dir '{prm_dir}'. "
-    #                 "Only evaluating MCTS + PRM condition."
-    #             )
-    #             conditions = [cond for cond in conditions if cond.name.startswith("MCTS + PRM")]
-    #     else:
-    #         print(
-    #             f"[info] Dataset name '{DATASET_NAME}' not found in prm_dir '{prm_dir}'. "
-    #             "Only evaluating MCTS + PRM condition."
-    #         )
-    #         conditions = [cond for cond in conditions if cond.name.startswith("MCTS + PRM")]
 
     # Evaluate (models are constructed inside workers)
     results = evaluate_conditions_ray(
