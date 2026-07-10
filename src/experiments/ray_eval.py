@@ -3,8 +3,10 @@ from functools import partial
 from typing import Optional, Dict, List, Any
 import hashlib
 import json
+import math
 import os
 import queue
+import random
 import statistics
 from pathlib import Path
 
@@ -14,12 +16,14 @@ import ray
 from ray.util.queue import Queue
 
 from answer_utils import is_correct
+from handoff_mas import build_handoff_mas_from_specs
 from mas import MAS, build_mas_from_specs
 
 
 from core import (
     _seed_everything,
     TokenStats,
+    handoff_sbs_decode,
     sbs_decode2,
     make_scored_voter,
     load_prm_scorer,
@@ -36,6 +40,7 @@ class WorkerInit:
     # MAS graph
     agent_specs: List[Dict[str, Any]]
     edges: List[List[int]]
+    handoff_config: Optional[Dict[str, Any]] = None
     step_separator: str = "</step>"
 
     # Models
@@ -43,6 +48,7 @@ class WorkerInit:
     prm_dir: Optional[str] = None
     prm_base_model_id: Optional[str] = None
     orm_dir: Optional[str] = None
+    prm_max_length: int = 2048
 
     # dtype options: "float16" | "bfloat16" | "float32"
     dtype: str = "float16"
@@ -52,7 +58,7 @@ class WorkerInit:
 @dataclass
 class ConditionSpec:
     name: str
-    kind: str  # 'sbs_none' | 'sbs_prm' | 'sbs_logprob' | 'mcts_prm' | 'mcts_logprob' | 'mcts_orm' | 'voter_plain' | 'voter_prm' | 'voter_logprob' | 'voter_orm'
+    kind: str
     params: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -65,6 +71,97 @@ def _dtype_from_str(s: str) -> torch.dtype:
     if s in ("float32", "fp32", "full", "float"):
         return torch.float32
     return torch.float16
+
+
+def _paired_handoff_comparison(
+    policy_correct: Dict[int, bool],
+    prm_correct: Dict[int, bool],
+    *,
+    seed: int,
+    bootstrap_samples: int = 10000,
+) -> Dict[str, float]:
+    common = sorted(set(policy_correct).intersection(prm_correct))
+    if not common:
+        return {}
+    differences = [int(prm_correct[idx]) - int(policy_correct[idx]) for idx in common]
+    delta = sum(differences) / len(differences)
+    rng = random.Random(int(seed))
+    boot = []
+    for _ in range(max(1, int(bootstrap_samples))):
+        boot.append(
+            sum(differences[rng.randrange(len(differences))] for _ in differences)
+            / len(differences)
+        )
+    boot.sort()
+    low_idx = max(0, math.floor(0.025 * (len(boot) - 1)))
+    high_idx = min(len(boot) - 1, math.ceil(0.975 * (len(boot) - 1)))
+
+    policy_only = sum(bool(policy_correct[idx]) and not bool(prm_correct[idx]) for idx in common)
+    prm_only = sum(bool(prm_correct[idx]) and not bool(policy_correct[idx]) for idx in common)
+    discordant = policy_only + prm_only
+    if discordant:
+        tail = sum(math.comb(discordant, k) for k in range(0, min(policy_only, prm_only) + 1)) / (
+            2**discordant
+        )
+        mcnemar_p = min(1.0, 2.0 * tail)
+    else:
+        mcnemar_p = 1.0
+    return {
+        "paired_n": float(len(common)),
+        "paired_accuracy_delta": float(delta),
+        "paired_bootstrap_ci_low": float(boot[low_idx]),
+        "paired_bootstrap_ci_high": float(boot[high_idx]),
+        "mcnemar_policy_only_correct": float(policy_only),
+        "mcnemar_prm_only_correct": float(prm_only),
+        "mcnemar_exact_p": float(mcnemar_p),
+    }
+
+
+def _stable_hash(value: Any) -> str:
+    payload = json.dumps(value, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _checkpoint_identity(path: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not path:
+        return None
+    checkpoint = Path(path).resolve()
+    identity: Dict[str, Any] = {"path": str(checkpoint), "exists": checkpoint.exists()}
+    if checkpoint.is_dir():
+        identity["files"] = [
+            {
+                "path": str(file.relative_to(checkpoint)),
+                "size": file.stat().st_size,
+                "mtime_ns": file.stat().st_mtime_ns,
+            }
+            for file in sorted(checkpoint.rglob("*"))
+            if file.is_file()
+        ]
+    elif checkpoint.is_file():
+        stat = checkpoint.stat()
+        identity.update({"size": stat.st_size, "mtime_ns": stat.st_mtime_ns})
+    return identity
+
+
+def _cached_correctness(records_path: str):
+    correct: Dict[int, bool] = {}
+    prefixes: Dict[int, Dict[int, bool]] = {4: {}, 8: {}, 12: {}}
+    path = Path(records_path)
+    if not path.exists():
+        return correct, prefixes
+    for line in path.read_text().splitlines():
+        if not line.strip():
+            continue
+        record = json.loads(line)
+        idx = int(record["index"])
+        correct[idx] = bool(record.get("correct", False))
+        metrics = record.get("metrics") or {}
+        gold = record.get("gold", "")
+        for threshold in prefixes:
+            answer = metrics.get("prefix_answers", {}).get(str(threshold))
+            if answer is not None:
+                prefixes[threshold][idx] = bool(is_correct(answer, gold))
+    return correct, prefixes
 
 
 def evaluate_conditions_ray(
@@ -128,6 +225,7 @@ def evaluate_conditions_ray(
             self.step_sep = init.step_separator
             self.agent_specs = init.agent_specs
             self.edges = init.edges
+            self.handoff_config = dict(init.handoff_config or {})
             self.dtype = _dtype_from_str(dtype)
 
             # 1) Load PRM scorer (optional)
@@ -138,6 +236,7 @@ def evaluate_conditions_ray(
                 self.prm_score_fn, self.prm_tok, self.prm_model = load_prm_scorer(
                     init.prm_dir,
                     base_model_id=init.prm_base_model_id,
+                    max_length=int(init.prm_max_length),
                     torch_dtype=self.dtype,
                     step_separator=self.step_sep,
                 )
@@ -147,11 +246,22 @@ def evaluate_conditions_ray(
                 print(f"[Worker {self.rank}] Added {added} special tokens for step separator.")
                 if added > 0 and self.prm_model is not None:
                     align_model_to_tokenizer(self.prm_model, self.prm_tok)
-            # 2) Load generation runtime; reuse the PRM tokenizer when available.
+            # 2) Load the generation runtime.
             self.runtime = build_runtime(
                 init.gen_model_id,
-                tokenizer=self.prm_tok,
+                # Handoff workers are reused across all four rows, so the
+                # policy LM must not change tokenizer when the PRM row is present.
+                tokenizer=None if self.handoff_config else self.prm_tok,
                 torch_dtype=self.dtype,
+            )
+            self.handoff_mas = (
+                build_handoff_mas_from_specs(
+                    self.runtime.model,
+                    self.runtime.tokenizer,
+                    self.agent_specs,
+                )
+                if self.handoff_config
+                else None
             )
 
             # 4) ORM scorer (optional) — same API as PRM loader
@@ -171,18 +281,18 @@ def evaluate_conditions_ray(
                     align_model_to_tokenizer(self.orm_model, self.orm_tok)
 
         # --- decoders by spec.kind
-        def _decode_by_spec(
-            self, q: str, spec: ConditionSpec
-        ) -> tuple[str, List[str], int, int, int]:
+        def _decode_by_spec(self, q: str, spec: ConditionSpec, example_seed: Optional[int] = None):
             kind = spec.kind
             p = spec.params or {}
 
             # Defaults
             sbs_kwargs = p.get(
-                "gen_kwargs", {"temperature": 1.0, "top_p": 0.95, "max_new_tokens": 1024}
+                "gen_kwargs",
+                {"temperature": 1.0, "top_p": 0.95, "max_new_tokens": 1024},
             )
             mcts_kwargs = p.get(
-                "mcts_kwargs", {"temperature": 0.6, "top_p": 0.95, "max_new_tokens": 1024}
+                "mcts_kwargs",
+                {"temperature": 0.6, "top_p": 0.95, "max_new_tokens": 1024},
             )
             B1 = int(p.get("B1", 1))
             B2 = int(p.get("B2", 5))
@@ -196,6 +306,62 @@ def evaluate_conditions_ray(
             # Scope of state text fed to PRM/ORM: "full" = routed transcript,
             # "local" = only what the scored agent itself received + produced.
             view_mode = str(p.get("view_mode", "full")).lower()
+
+            if kind in {
+                "handoff_fixed",
+                "handoff_random",
+                "handoff_policy",
+                "handoff_prm",
+            }:
+                if self.handoff_mas is None:
+                    raise ValueError(
+                        "A handoff condition requires a config with a handoff section."
+                    )
+                route_mode = {
+                    "handoff_fixed": "fixed",
+                    "handoff_random": "random",
+                    "handoff_policy": "agent",
+                    "handoff_prm": "agent",
+                }[kind]
+                score_type = "prm" if kind == "handoff_prm" else "logprob"
+                result = handoff_sbs_decode(
+                    self.handoff_mas,
+                    q,
+                    route_mode=route_mode,
+                    score_type=score_type,
+                    score_fn=self.prm_score_fn if score_type == "prm" else None,
+                    prm_tokenizer=self.prm_tok if score_type == "prm" else None,
+                    n_candidates=int(p.get("handoff_candidates", 3)),
+                    min_turns=int(p.get("min_turns", 4)),
+                    max_turns=int(p.get("max_turns", 12)),
+                    initial_speaker=str(
+                        p.get(
+                            "initial_speaker",
+                            self.handoff_config.get("initial_role", "Problem Analyst"),
+                        )
+                    ),
+                    fixed_schedule=p.get(
+                        "fixed_schedule",
+                        self.handoff_config.get("fixed_schedule"),
+                    ),
+                    gen_kwargs=sbs_kwargs,
+                    logprob_agg=str(p.get("logprob_agg", "avg_token")),
+                    step_separator=self.step_sep,
+                    max_context_tokens=int(p.get("prm_context_length", 16384)),
+                    seed=int(example_seed if example_seed is not None else p.get("seed", 42)),
+                    allow_self=bool(p.get("allow_self", False)),
+                    random_can_finalize=bool(p.get("random_can_finalize", True)),
+                )
+                metrics = result.metrics()
+                return (
+                    result.answer,
+                    [result.answer],
+                    result.usage.generated,
+                    result.usage.prm_calls,
+                    result.usage.agent_runs,
+                    metrics,
+                )
+
             build_mas = partial(
                 build_mas_from_specs,
                 self.runtime.model,
@@ -235,7 +401,13 @@ def evaluate_conditions_ray(
                     final_answers_out=finals,
                 )
                 candidates = finals[:pass_k] if finals else [pred]
-                return pred, candidates, usage.generated, usage.prm_calls, usage.agent_runs
+                return (
+                    pred,
+                    candidates,
+                    usage.generated,
+                    usage.prm_calls,
+                    usage.agent_runs,
+                )
 
             if kind == "sbs_prm":
                 finals: List[str] = []
@@ -253,7 +425,13 @@ def evaluate_conditions_ray(
                     view_mode=view_mode,
                 )
                 candidates = finals[:pass_k] if finals else [pred]
-                return pred, candidates, usage.generated, usage.prm_calls, usage.agent_runs
+                return (
+                    pred,
+                    candidates,
+                    usage.generated,
+                    usage.prm_calls,
+                    usage.agent_runs,
+                )
 
             if kind == "sbs_logprob":
                 finals: List[str] = []
@@ -269,11 +447,21 @@ def evaluate_conditions_ray(
                     final_answers_out=finals,
                 )
                 candidates = finals[:pass_k] if finals else [pred]
-                return pred, candidates, usage.generated, usage.prm_calls, usage.agent_runs
+                return (
+                    pred,
+                    candidates,
+                    usage.generated,
+                    usage.prm_calls,
+                    usage.agent_runs,
+                )
 
             #  MCTS variants
             if kind in ("mcts_prm", "mcts_logprob", "mcts_orm"):
-                score_type = {"mcts_prm": "prm", "mcts_logprob": "logprob", "mcts_orm": "orm"}[kind]
+                score_type = {
+                    "mcts_prm": "prm",
+                    "mcts_logprob": "logprob",
+                    "mcts_orm": "orm",
+                }[kind]
                 score_fn = (
                     self.prm_score_fn
                     if score_type == "prm"
@@ -313,7 +501,13 @@ def evaluate_conditions_ray(
                     candidates = []
                 if not candidates:
                     candidates = [pred]
-                return pred, candidates, usage.generated, usage.prm_calls, usage.agent_runs
+                return (
+                    pred,
+                    candidates,
+                    usage.generated,
+                    usage.prm_calls,
+                    usage.agent_runs,
+                )
 
             #  Majority voters
             if kind == "voter_plain":
@@ -329,13 +523,21 @@ def evaluate_conditions_ray(
                     total.add(ui)
                 pred = _majority_by_numbers_equal(preds)
                 candidates = preds[:pass_k] if pass_k > 0 else [pred]
-                return pred, candidates, total.generated, total.prm_calls, total.agent_runs
+                return (
+                    pred,
+                    candidates,
+                    total.generated,
+                    total.prm_calls,
+                    total.agent_runs,
+                )
 
             if kind in ("voter_prm", "voter_logprob", "voter_orm"):
                 # Build make_scored_voter *inside* the actor (no cross-process capture)
-                score_mode = {"voter_prm": "prm", "voter_logprob": "logprob", "voter_orm": "orm"}[
-                    kind
-                ]
+                score_mode = {
+                    "voter_prm": "prm",
+                    "voter_logprob": "logprob",
+                    "voter_orm": "orm",
+                }[kind]
 
                 def base_with_trace(mas: MAS, q: str):
                     return sbs_decode2(
@@ -379,7 +581,13 @@ def evaluate_conditions_ray(
                     pred = str(res)
                     usage = TokenStats()
                     candidates = [pred]
-                return pred, candidates, usage.generated, usage.prm_calls, usage.agent_runs
+                return (
+                    pred,
+                    candidates,
+                    usage.generated,
+                    usage.prm_calls,
+                    usage.agent_runs,
+                )
 
             # Fallback: do a single greedy
             finals: List[str] = []
@@ -405,11 +613,21 @@ def evaluate_conditions_ray(
                         break
                     idx, q, gold, ex_seed = item
                     _seed_everything(int(ex_seed))
+                    metadata: Dict[str, Any] = {}
                     try:
-                        res = self._decode_by_spec(q, spec)
+                        res = self._decode_by_spec(q, spec, example_seed=int(ex_seed))
                         # normalize length (be paranoid)
                         if isinstance(res, tuple):
-                            if len(res) == 5:
+                            if len(res) == 6:
+                                (
+                                    pred,
+                                    cand_list,
+                                    tok_total,
+                                    prm_calls,
+                                    agent_runs,
+                                    metadata,
+                                ) = res
+                            elif len(res) == 5:
                                 pred, cand_list, tok_total, prm_calls, agent_runs = res
                             elif len(res) == 4:
                                 pred, tok_total, prm_calls, agent_runs = res
@@ -438,17 +656,47 @@ def evaluate_conditions_ray(
                         tok_total = 0
                         prm_calls = 0
                         agent_runs = 0
-                    out_q.put((idx, pred, cand_list, tok_total, prm_calls, agent_runs, gold))
+                        metadata = {"error": str(e)}
+                    out_q.put(
+                        (
+                            idx,
+                            pred,
+                            cand_list,
+                            tok_total,
+                            prm_calls,
+                            agent_runs,
+                            metadata,
+                            gold,
+                        )
+                    )
             finally:
                 # Always signal completion so the driver doesn’t hang.
                 out_q.put(None)
 
     results: Dict[str, Dict[str, float]] = {}
+    correct_by_kind: Dict[str, Dict[int, bool]] = {}
+    prefix_correct_by_kind: Dict[str, Dict[int, Dict[int, bool]]] = {}
+    result_path_by_kind: Dict[str, str] = {}
+    result_name_by_kind: Dict[str, str] = {}
     LOG_EVERY = int(os.environ.get("LOG_EVERY", "10"))  # progress write interval (examples)
     N_TOTAL = len(data)
+    handoff_kinds = {
+        "handoff_fixed",
+        "handoff_random",
+        "handoff_policy",
+        "handoff_prm",
+    }
+    handoff_bundle_needs_prm = any(spec.kind == "handoff_prm" for spec in conditions)
+    handoff_workers = None
     for spec in conditions:
-        needs_prm = spec.kind in {"sbs_prm", "mcts_prm", "voter_prm"} or (
-            str(spec.params.get("leaf_score_type", "")).lower() == "prm"
+        condition_needs_prm = spec.kind in {
+            "sbs_prm",
+            "mcts_prm",
+            "voter_prm",
+            "handoff_prm",
+        } or (str(spec.params.get("leaf_score_type", "")).lower() == "prm")
+        worker_needs_prm = condition_needs_prm or (
+            spec.kind in handoff_kinds and handoff_bundle_needs_prm
         )
         needs_orm = spec.kind in {"mcts_orm", "voter_orm"} or (
             str(spec.params.get("leaf_score_type", "")).lower() == "orm"
@@ -456,11 +704,13 @@ def evaluate_conditions_ray(
         spec_worker_init = WorkerInit(
             agent_specs=worker_init.agent_specs,
             edges=worker_init.edges,
+            handoff_config=worker_init.handoff_config,
             step_separator=worker_init.step_separator,
             gen_model_id=worker_init.gen_model_id,
-            prm_dir=worker_init.prm_dir if needs_prm else None,
-            prm_base_model_id=worker_init.prm_base_model_id if needs_prm else None,
+            prm_dir=worker_init.prm_dir if worker_needs_prm else None,
+            prm_base_model_id=worker_init.prm_base_model_id if worker_needs_prm else None,
             orm_dir=worker_init.orm_dir if needs_orm else None,
+            prm_max_length=int(spec.params.get("prm_context_length", worker_init.prm_max_length)),
             dtype=worker_init.dtype,
             seed=worker_init.seed,
         )
@@ -468,14 +718,10 @@ def evaluate_conditions_ray(
         # Prepare conditional path parts
         prm = (
             f"_{Path(worker_init.prm_dir).name}"
-            if worker_init.prm_dir and needs_prm
+            if worker_init.prm_dir and condition_needs_prm
             else ""
         )
-        orm = (
-            f"_{Path(worker_init.orm_dir).name}"
-            if worker_init.orm_dir and needs_orm
-            else ""
-        )
+        orm = f"_{Path(worker_init.orm_dir).name}" if worker_init.orm_dir and needs_orm else ""
 
         # Prepare model ID and a short stable fingerprint so distinct settings
         # (e.g. view_mode=full vs local) do not collide in the skip log path.
@@ -490,6 +736,9 @@ def evaluate_conditions_ray(
             f"logs/{name_dataset}_{spec.name}{params}_{params_fingerprint}"
             f"{prm}{orm}_{model}_{worker_init.seed}.txt"
         )
+        records_path = str(Path(results_path).with_suffix(".jsonl"))
+        result_path_by_kind[spec.kind] = results_path
+        result_name_by_kind[spec.kind] = spec.name
         os.makedirs("logs", exist_ok=True)
         # If file already contains a COMPLETED marker, skip this condition
         if Path(results_path).exists():
@@ -503,10 +752,21 @@ def evaluate_conditions_ray(
         # Write a start header (append if rerunning)
         with open(results_path, "a") as f:
             f.write(f"=== START {spec.name} | dataset={name_dataset} | N={N_TOTAL} ===\n")
+        Path(records_path).write_text("")
 
-        workers = [
-            EvalWorker.remote(spec_worker_init, worker_init.dtype, rank=i) for i in range(num_workers)
-        ]
+        if spec.kind not in handoff_kinds and handoff_workers is not None:
+            for worker in handoff_workers:
+                ray.kill(worker, no_restart=True)
+            handoff_workers = None
+        if spec.kind in handoff_kinds and handoff_workers is not None:
+            workers = handoff_workers
+        else:
+            workers = [
+                EvalWorker.remote(spec_worker_init, worker_init.dtype, rank=i)
+                for i in range(num_workers)
+            ]
+            if spec.kind in handoff_kinds:
+                handoff_workers = workers
         in_q = Queue()
         out_q = Queue()
         consume_refs = [w.consume.remote(spec, in_q, out_q) for w in workers]
@@ -525,6 +785,20 @@ def evaluate_conditions_ray(
         worker_crashed = False
         prm_calls_total = 0
         agent_runs_total = 0
+        condition_correct: Dict[int, bool] = {}
+        prefix_condition_correct: Dict[int, Dict[int, bool]] = {4: {}, 8: {}, 12: {}}
+        prefix_correct = {4: 0, 8: 0, 12: 0}
+        handoff_examples = 0
+        depths: List[int] = []
+        unique_agents: List[int] = []
+        unique_edges: List[int] = []
+        revisit_rates: List[float] = []
+        route_entropies: List[float] = []
+        context_token_values: List[int] = []
+        context_truncations = 0
+        parse_failures_total = 0
+        proposals_total = 0
+        decoder_errors = 0
         pbar = tqdm(total=len(data), desc=f"Evaluating: {spec.name}")
         while finished < len(workers):
             try:
@@ -547,7 +821,7 @@ def evaluate_conditions_ray(
             if item is None:
                 finished += 1
                 continue
-            idx, pred, cand_list, tok_total, prm_calls, agent_runs, gold = item
+            idx, pred, cand_list, tok_total, prm_calls, agent_runs, metadata, gold = item
 
             # Normalize candidate list and ensure pred is first
             if not isinstance(cand_list, (list, tuple)):
@@ -558,8 +832,43 @@ def evaluate_conditions_ray(
             ordered_cands = ordered_cands[:MAX_PASS_K]
 
             # pass@1 (accuracy on top-1)
-            if is_correct(pred, gold):
+            top_correct = is_correct(pred, gold)
+            condition_correct[int(idx)] = bool(top_correct)
+            if top_correct:
                 correct += 1
+
+            if isinstance(metadata, dict) and "prefix_answers" in metadata:
+                handoff_examples += 1
+                for threshold in prefix_correct:
+                    prefix_answer = metadata.get("prefix_answers", {}).get(str(threshold), "")
+                    prefix_is_correct = is_correct(prefix_answer, gold)
+                    prefix_correct[threshold] += int(prefix_is_correct)
+                    prefix_condition_correct[threshold][int(idx)] = bool(prefix_is_correct)
+                depths.append(int(metadata.get("depth", 0)))
+                unique_agents.append(int(metadata.get("unique_agents", 0)))
+                unique_edges.append(int(metadata.get("unique_directed_role_edges", 0)))
+                revisit_rates.append(float(metadata.get("role_revisit_rate", 0.0)))
+                route_entropies.append(float(metadata.get("route_entropy_bits", 0.0)))
+                context_token_values.extend(
+                    int(value) for value in metadata.get("prm_context_tokens", [])
+                )
+                context_truncations += int(metadata.get("prm_truncations", 0))
+                parse_failures_total += int(metadata.get("parse_failures", 0))
+                proposals_total += int(metadata.get("agent_proposals", 0))
+            if isinstance(metadata, dict) and metadata.get("error"):
+                decoder_errors += 1
+
+            record = {
+                "index": int(idx),
+                "condition": spec.kind,
+                "prediction": str(pred),
+                "gold": str(gold),
+                "correct": bool(top_correct),
+                "candidates": [str(value) for value in ordered_cands],
+                "metrics": metadata if isinstance(metadata, dict) else {},
+            }
+            with open(records_path, "a") as records_file:
+                records_file.write(json.dumps(record, ensure_ascii=False) + "\n")
 
             # pass@k: any correct among the first k candidates
             any_correct = False
@@ -602,19 +911,21 @@ def evaluate_conditions_ray(
         # Ensure outstanding tasks are resolved before tearing down this pool.
         if consume_refs:
             ray.get(consume_refs)
-        for w in workers:
-            ray.kill(w, no_restart=True)
+        if spec.kind not in handoff_kinds:
+            for w in workers:
+                ray.kill(w, no_restart=True)
 
         processed = len(totals)
         mean = float(statistics.mean(totals)) if totals else 0.0
         std = float(statistics.pstdev(totals)) if len(totals) > 1 else 0.0
 
-        if worker_crashed or processed != len(data):
+        if worker_crashed or processed != len(data) or decoder_errors:
             with open(results_path, "a") as f:
                 f.write(
                     f"FAILED: processed {processed}/{len(data)} examples; "
                     f"worker_crashed={worker_crashed}\n"
                 )
+                f.write(f"Decoder errors: {decoder_errors}\n")
                 f.write(f"Tokens so far: {mean:.1f} ± {std:.1f}\n")
                 f.write(f"Total PRM calls so far: {prm_calls_total}\n")
                 f.write(f"Total Agent runs so far: {agent_runs_total}\n")
@@ -629,10 +940,11 @@ def evaluate_conditions_ray(
             }
             for i in range(1, MAX_PASS_K + 1):
                 results[spec.name][f"pass_at_{i}"] = float("nan")
-            print(
-                f"[result] {spec.name}: FAILED "
-                f"({processed}/{len(data)} examples processed)"
-            )
+            print(f"[result] {spec.name}: FAILED " f"({processed}/{len(data)} examples processed)")
+            if spec.kind in handoff_kinds and handoff_workers is not None:
+                for worker in handoff_workers:
+                    ray.kill(worker, no_restart=True)
+                handoff_workers = None
             continue
 
         n = len(data)
@@ -648,8 +960,46 @@ def evaluate_conditions_ray(
             "prm_calls_mean": float(prm_calls_total) / n,
             "agent_runs_mean": float(agent_runs_total) / n,
         }
+        correct_by_kind[spec.kind] = condition_correct
+        if handoff_examples:
+            prefix_correct_by_kind[spec.kind] = prefix_condition_correct
         for i, v in enumerate(pass_at, start=1):
             results[spec.name][f"pass_at_{i}"] = v
+
+        if handoff_examples:
+            sorted_context = sorted(context_token_values)
+            p95_idx = max(0, math.ceil(0.95 * len(sorted_context)) - 1) if sorted_context else 0
+            handoff_summary = {
+                f"hit_at_{threshold}": prefix_correct[threshold] / handoff_examples
+                for threshold in prefix_correct
+            }
+            handoff_summary.update(
+                {
+                    "realized_depth_mean": float(statistics.mean(depths)),
+                    "realized_depth_median": float(statistics.median(depths)),
+                    "unique_agents_mean": float(statistics.mean(unique_agents)),
+                    "unique_directed_role_edges_mean": float(statistics.mean(unique_edges)),
+                    "role_revisit_rate_mean": float(statistics.mean(revisit_rates)),
+                    "route_entropy_bits_mean": float(statistics.mean(route_entropies)),
+                    "prm_context_token_median": (
+                        float(statistics.median(sorted_context)) if sorted_context else 0.0
+                    ),
+                    "prm_context_token_p95": (
+                        float(sorted_context[p95_idx]) if sorted_context else 0.0
+                    ),
+                    "prm_truncation_rate": (
+                        context_truncations / len(context_token_values)
+                        if context_token_values
+                        else 0.0
+                    ),
+                    "parse_failure_rate": (
+                        parse_failures_total / proposals_total if proposals_total else 0.0
+                    ),
+                    "agent_proposals_total": float(proposals_total),
+                    "agent_proposals_mean": proposals_total / handoff_examples,
+                }
+            )
+            results[spec.name].update(handoff_summary)
 
         # Append final summary and mark as completed
         with open(results_path, "a") as f:
@@ -661,6 +1011,40 @@ def evaluate_conditions_ray(
             f.write(f"Total Agent runs: {agent_runs_total}\n")
             f.write(f"Mean PRM calls per example: {results[spec.name]['prm_calls_mean']:.2f}\n")
             f.write(f"Mean Agent runs per example: {results[spec.name]['agent_runs_mean']:.2f}\n")
+            if handoff_examples:
+                f.write(f"Hit@1 at 4 messages: {results[spec.name]['hit_at_4']:.4f}\n")
+                f.write(f"Hit@1 at 8 messages: {results[spec.name]['hit_at_8']:.4f}\n")
+                f.write(f"Hit@1 at 12 messages: {results[spec.name]['hit_at_12']:.4f}\n")
+                f.write(
+                    "Realized depth (mean/median): "
+                    f"{results[spec.name]['realized_depth_mean']:.2f}/"
+                    f"{results[spec.name]['realized_depth_median']:.2f}\n"
+                )
+                f.write(
+                    "Unique agents / directed edges (mean): "
+                    f"{results[spec.name]['unique_agents_mean']:.2f}/"
+                    f"{results[spec.name]['unique_directed_role_edges_mean']:.2f}\n"
+                )
+                f.write(
+                    f"Role revisit rate (mean): {results[spec.name]['role_revisit_rate_mean']:.4f}\n"
+                )
+                f.write(
+                    f"Route entropy bits (mean): {results[spec.name]['route_entropy_bits_mean']:.4f}\n"
+                )
+                f.write(
+                    "PRM context tokens (median/p95): "
+                    f"{results[spec.name]['prm_context_token_median']:.1f}/"
+                    f"{results[spec.name]['prm_context_token_p95']:.1f}\n"
+                )
+                f.write(f"PRM truncation rate: {results[spec.name]['prm_truncation_rate']:.4f}\n")
+                f.write(
+                    f"Action parse-failure rate: {results[spec.name]['parse_failure_rate']:.4f}\n"
+                )
+                f.write(
+                    "Batched policy calls / proposals per example: "
+                    f"{results[spec.name]['agent_runs_mean']:.2f}/"
+                    f"{results[spec.name]['agent_proposals_mean']:.2f}\n"
+                )
             f.write("COMPLETED\n")
 
         pass_str = " ".join(f"p@{i+1}={pass_at[i]:.4f}" for i in range(MAX_PASS_K))
@@ -668,5 +1052,44 @@ def evaluate_conditions_ray(
             f"[result] {spec.name}: acc={acc:.4f} ({pass_str})  "
             f"tokens={mean:.1f}±{std:.1f} ({len(totals)} examples)"
         )
+
+    if handoff_workers is not None:
+        for worker in handoff_workers:
+            ray.kill(worker, no_restart=True)
+
+    if "handoff_policy" in prefix_correct_by_kind and "handoff_prm" in prefix_correct_by_kind:
+        comparisons = {
+            threshold: _paired_handoff_comparison(
+                prefix_correct_by_kind["handoff_policy"][threshold],
+                prefix_correct_by_kind["handoff_prm"][threshold],
+                seed=worker_init.seed + threshold,
+            )
+            for threshold in (8, 12)
+        }
+        prm_name = result_name_by_kind.get("handoff_prm")
+        if all(comparisons.values()) and prm_name in results:
+            for threshold, comparison in comparisons.items():
+                results[prm_name].update(
+                    {f"t{threshold}_{key}": value for key, value in comparison.items()}
+                )
+            # Keep the unprefixed names as the final/T=12 comparison for existing consumers.
+            results[prm_name].update(comparisons[12])
+            comparison_path = result_path_by_kind.get("handoff_prm")
+            if comparison_path:
+                with open(comparison_path, "a") as f:
+                    for threshold, comparison in comparisons.items():
+                        f.write(
+                            f"T={threshold} paired dynamic PRM-policy accuracy delta "
+                            "(95% bootstrap CI): "
+                            f"{comparison['paired_accuracy_delta']:.4f} "
+                            f"[{comparison['paired_bootstrap_ci_low']:.4f}, "
+                            f"{comparison['paired_bootstrap_ci_high']:.4f}]\n"
+                        )
+                        f.write(
+                            f"T={threshold} McNemar exact: "
+                            f"policy-only={int(comparison['mcnemar_policy_only_correct'])}, "
+                            f"prm-only={int(comparison['mcnemar_prm_only_correct'])}, "
+                            f"p={comparison['mcnemar_exact_p']:.6f}\n"
+                        )
 
     return results

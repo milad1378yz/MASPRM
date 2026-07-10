@@ -6,7 +6,46 @@ import random
 from answer_utils import _to_number
 
 
-def load_hard_dataset(name, split, n, seed):
+def _select_stratified(data, n, field, seed):
+    if not n:
+        return data
+    if field not in data.column_names:
+        raise ValueError(f"Cannot stratify by missing field {field!r}.")
+
+    groups = {}
+    for idx, value in enumerate(data[field]):
+        groups.setdefault(str(value), []).append(idx)
+    rng = random.Random(seed)
+    for indices in groups.values():
+        rng.shuffle(indices)
+
+    selected = []
+    positions = {key: 0 for key in groups}
+    keys = sorted(groups)
+    target = min(int(n), len(data))
+    while len(selected) < target:
+        progressed = False
+        for key in keys:
+            pos = positions[key]
+            if pos >= len(groups[key]):
+                continue
+            selected.append(groups[key][pos])
+            positions[key] += 1
+            progressed = True
+            if len(selected) == target:
+                break
+        if not progressed:
+            break
+    rng.shuffle(selected)
+    return data.select(selected)
+
+
+def _math_level_key(value):
+    match = re.search(r"\d+", str(value))
+    return int(match.group(0)) if match else None
+
+
+def load_hard_dataset(name, split, n, seed, *, levels=None, stratify_by=None):
     if name == "competition_math":
         ds = load_dataset("qwedsacf/competition_math")
         shuffled = ds["train"].shuffle(seed=seed)
@@ -16,11 +55,19 @@ def load_hard_dataset(name, split, n, seed):
         test_data = shuffled.select(range(test_size))
 
         if split == "train":
-            data = train_data.select(range(n)) if n else train_data
+            data = train_data
         elif split == "test":
-            data = test_data.select(range(n)) if n else test_data
+            data = test_data
         else:
             raise ValueError(f"Unknown split: {split}")
+
+        if levels:
+            allowed_levels = {int(level) for level in levels}
+            data = data.filter(lambda ex: _math_level_key(ex.get("level")) in allowed_levels)
+        if stratify_by:
+            data = _select_stratified(data, n, stratify_by, seed)
+        elif n:
+            data = data.select(range(min(int(n), len(data))))
 
         gold_fn = gold_competition_math
         q_fn = lambda ex: ex["problem"]
@@ -109,6 +156,9 @@ def load_hard_dataset(name, split, n, seed):
         raise ValueError(
             "Unsupported dataset. Choose from: competition_math, aqua_rat, svamp, gsm8k, mmlu, gpqa, logiqa"
         )
+
+    if name != "competition_math" and (levels or stratify_by):
+        raise ValueError("levels and stratify_by are supported only for competition_math.")
 
     return data, q_fn, gold_fn
 

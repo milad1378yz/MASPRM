@@ -31,6 +31,10 @@ METHODS = (
     "voter_prm",
     "voter_logprob",
     "voter_orm",
+    "handoff_fixed",
+    "handoff_random",
+    "handoff_policy",
+    "handoff_prm",
 )
 DEFAULT_METHODS = ("single_pass", "mcts_prm")
 
@@ -49,6 +53,31 @@ def build_condition_specs(args: argparse.Namespace) -> List[ConditionSpec]:
     conditions: List[ConditionSpec] = []
 
     for method in dict.fromkeys(args.methods):
+        if method.startswith("handoff_"):
+            handoff_names = {
+                "handoff_fixed": "Fixed schedule + policy likelihood",
+                "handoff_random": "Random handoff + policy likelihood",
+                "handoff_policy": "Agent-selected handoff + policy likelihood",
+                "handoff_prm": "Agent-selected handoff + MASPRM",
+            }
+            conditions.append(
+                ConditionSpec(
+                    handoff_names[method],
+                    method,
+                    {
+                        "handoff_candidates": args.handoff_candidates,
+                        "min_turns": args.min_turns,
+                        "max_turns": args.max_turns,
+                        "gen_kwargs": sbs_kwargs,
+                        "logprob_agg": args.handoff_logprob_agg,
+                        "prm_context_length": args.prm_context_length,
+                        "allow_self": args.allow_self_handoff,
+                        "random_can_finalize": not args.random_fixed_horizon,
+                    },
+                )
+            )
+            continue
+
         if method == "single_pass":
             conditions.append(
                 ConditionSpec(
@@ -111,7 +140,7 @@ def build_condition_specs(args: argparse.Namespace) -> List[ConditionSpec]:
 def main():
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", default="mmlu")
+    parser.add_argument("--dataset", default=None)
     parser.add_argument("--split", default="test")
     parser.add_argument("--sample_n", type=int, default=None)  # set None for full
     parser.add_argument("--seed", type=int, default=42)
@@ -120,6 +149,16 @@ def main():
         default="checkpoints/Qwen2.5-1.5B-RM",
     )
     parser.add_argument("--prm_base_model_id", default="Qwen/Qwen2.5-1.5B-Instruct")
+    parser.add_argument(
+        "--handoff_prm_dir",
+        default=None,
+        help="Explicit frozen MASPRM checkpoint for handoff_prm (required for that row).",
+    )
+    parser.add_argument(
+        "--handoff_prm_base_model_id",
+        default=None,
+        help="Optional base model for --handoff_prm_dir; otherwise read from its adapter config.",
+    )
     parser.add_argument("--gen_model_id", default="Qwen/Qwen2.5-1.5B-Instruct")
     parser.add_argument(
         "--view_mode",
@@ -149,9 +188,9 @@ def main():
         ),
     )
     method_args = parser.add_argument_group("method hyperparameters")
-    method_args.add_argument("--b1", type=int, default=3, help="SBS expansion width.")
+    method_args.add_argument("--b1", type=int, default=3, help="SBS retained beam width.")
     method_args.add_argument(
-        "--b2", type=int, default=5, help="SBS retained beam width."
+        "--b2", type=int, default=5, help="SBS candidates sampled per expansion."
     )
     method_args.add_argument(
         "--voter_k", type=int, default=5, help="Number of voter candidates."
@@ -178,7 +217,38 @@ def main():
     method_args.add_argument("--mcts_temperature", type=float, default=0.6)
     method_args.add_argument("--top_p", type=float, default=0.95)
     method_args.add_argument("--max_new_tokens", type=int, default=1024)
+    handoff_args = parser.add_argument_group("dynamic handoff hyperparameters")
+    handoff_args.add_argument("--handoff_candidates", type=int, default=3)
+    handoff_args.add_argument("--min_turns", type=int, default=4)
+    handoff_args.add_argument("--max_turns", type=int, default=12)
+    handoff_args.add_argument(
+        "--handoff_logprob_agg",
+        choices=["sum", "avg_token"],
+        default="avg_token",
+    )
+    handoff_args.add_argument("--prm_context_length", type=int, default=16384)
+    handoff_args.add_argument("--allow_self_handoff", action="store_true")
+    handoff_args.add_argument(
+        "--random_fixed_horizon",
+        action="store_true",
+        help="Prevent the random-routing control from sampling FINAL before max_turns.",
+    )
+    handoff_args.add_argument("--math_levels", nargs="+", type=int, default=[4, 5])
+    handoff_args.add_argument("--math_stratify_by", default="type")
     args = parser.parse_args()
+
+    uses_handoff = any(method.startswith("handoff_") for method in args.methods)
+    if uses_handoff and any(
+        not method.startswith("handoff_") for method in args.methods
+    ):
+        parser.error(
+            "handoff and static methods require different MAS configs; run them in "
+            "separate invocations"
+        )
+    if args.dataset is None:
+        args.dataset = "competition_math" if uses_handoff else "mmlu"
+    if uses_handoff and args.sample_n is None:
+        args.sample_n = 200
 
     for arg_name in (
         "b1",
@@ -187,6 +257,10 @@ def main():
         "n_simulations",
         "max_children",
         "max_new_tokens",
+        "handoff_candidates",
+        "min_turns",
+        "max_turns",
+        "prm_context_length",
     ):
         if getattr(args, arg_name) < 1:
             parser.error(f"--{arg_name} must be at least 1")
@@ -198,21 +272,24 @@ def main():
         parser.error("--top_p must be in the interval (0, 1]")
     if args.orm_leaf and "mcts_prm" not in args.methods:
         parser.error("--orm_leaf requires the mcts_prm method")
+    if args.max_turns < args.min_turns:
+        parser.error("--max_turns must be greater than or equal to --min_turns")
 
     conditions = build_condition_specs(args)
 
-    needs_prm = any(
-        condition.kind in {"sbs_prm", "mcts_prm", "voter_prm"}
-        or condition.params.get("leaf_score_type") == "prm"
-        for condition in conditions
-    )
     needs_orm = any(
         condition.kind in {"mcts_orm", "voter_orm"}
         or condition.params.get("leaf_score_type") == "orm"
         for condition in conditions
     )
-    if needs_prm and not args.prm_dir:
-        parser.error("--prm_dir is required by the selected methods")
+    if "handoff_prm" in args.methods and not args.handoff_prm_dir:
+        parser.error(
+            "--handoff_prm_dir is required for handoff_prm; the requested MASPRM-7B "
+            "checkpoint is not available at the repository's 1.5B default"
+        )
+    static_prm_methods = {"sbs_prm", "mcts_prm", "voter_prm"}
+    if any(method in static_prm_methods for method in args.methods) and not args.prm_dir:
+        parser.error("--prm_dir is required by the selected static PRM methods")
     if needs_orm and not args.orm_dir:
         parser.error("--orm_dir is required by the selected methods")
 
@@ -224,7 +301,16 @@ def main():
     SEED = args.seed
 
     raw_ds, q_fn, gold_fn = load_hard_dataset(
-        DATASET_NAME, SPLIT, n=SAMPLE_N, seed=SEED
+        DATASET_NAME,
+        SPLIT,
+        n=SAMPLE_N,
+        seed=SEED,
+        levels=(args.math_levels if uses_handoff and DATASET_NAME == "competition_math" else None),
+        stratify_by=(
+            args.math_stratify_by
+            if uses_handoff and DATASET_NAME == "competition_math"
+            else None
+        ),
     )
     data: List[Dict[str, str]] = []
     for ex in raw_ds:
@@ -232,22 +318,49 @@ def main():
         if g is not None:
             data.append({"question": q_fn(ex), "answer": str(g)})
     print(f"[info] Loaded {len(data)} {DATASET_NAME}/{SPLIT} examples.")
+    if uses_handoff and len(data) != SAMPLE_N:
+        parser.error(
+            f"requested {SAMPLE_N} handoff examples but only {len(data)} have answers "
+            "supported by the current evaluator; choose a symbolic MATH verifier or "
+            "an explicitly numeric-only stratified subset before running this experiment"
+        )
 
     # MAS graph config
 
     cfg_path = (
         Path(args.mas_config)
         if args.mas_config
-        else Path("configs") / f"{DATASET_NAME}.yaml"
+        else (
+            Path("configs/math_handoff8.yaml")
+            if uses_handoff
+            else Path("configs") / f"{DATASET_NAME}.yaml"
+        )
     )
     cfg = yaml.safe_load(cfg_path.read_text())
     agent_specs: List[Dict[str, Any]] = cfg["agents"]
-    edges: List[List[int]] = cfg["edges"]
+    edges: List[List[int]] = cfg.get("edges", [])
+    handoff_config = dict(cfg.get("handoff", {})) if uses_handoff else None
+    if uses_handoff and not handoff_config:
+        parser.error("Handoff methods require a top-level 'handoff' section in --mas_config")
+    if handoff_config:
+        for condition in conditions:
+            if condition.kind.startswith("handoff_"):
+                condition.params.setdefault("initial_speaker", handoff_config.get("initial_role"))
+                condition.params.setdefault("fixed_schedule", handoff_config.get("fixed_schedule"))
 
     STEP_SEP = "</step>"
 
-    prm_dir = str(Path(args.prm_dir).resolve()) if args.prm_dir else args.prm_dir
-    prm_base_model_id = args.prm_base_model_id
+    selected_prm_dir = (
+        args.handoff_prm_dir if "handoff_prm" in args.methods else args.prm_dir
+    )
+    prm_dir = (
+        str(Path(selected_prm_dir).resolve()) if selected_prm_dir else selected_prm_dir
+    )
+    prm_base_model_id = (
+        args.handoff_prm_base_model_id
+        if "handoff_prm" in args.methods
+        else args.prm_base_model_id
+    )
     gen_model_id = args.gen_model_id
     # Optional ORM scorer (same API as PRM loader)
     ORM_DIR = (
@@ -257,11 +370,13 @@ def main():
     worker_init = WorkerInit(
         agent_specs=agent_specs,
         edges=edges,
+        handoff_config=handoff_config,
         step_separator=STEP_SEP,
         gen_model_id=gen_model_id,
         prm_dir=prm_dir,
         prm_base_model_id=prm_base_model_id,
         orm_dir=ORM_DIR,
+        prm_max_length=2048,
         dtype="float16",
         seed=SEED,
     )
@@ -302,6 +417,38 @@ def main():
         pass_cols = "  ".join(f"{p:>6.3f}" for p in passes)
         print(f"{cond_name:<{name_width}}  {pass_cols}   {tmean:>8.1f}±{tstd:<8.1f}")
     print("#" * 80)
+
+    handoff_results = {
+        name: values for name, values in results.items() if "hit_at_4" in values
+    }
+    if handoff_results:
+        print("\nDynamic-handoff prefix results")
+        print(f"{'Condition':<{name_width}}  {'Hit@4':>7}  {'Hit@8':>7}  {'Hit@12':>7}  {'Depth':>7}")
+        for cond_name, values in handoff_results.items():
+            print(
+                f"{cond_name:<{name_width}}  "
+                f"{values['hit_at_4']:>7.3f}  {values['hit_at_8']:>7.3f}  "
+                f"{values['hit_at_12']:>7.3f}  "
+                f"{values['realized_depth_mean']:>7.2f}"
+            )
+        comparison = next(
+            (
+                values
+                for values in handoff_results.values()
+                if "paired_accuracy_delta" in values
+            ),
+            None,
+        )
+        if comparison:
+            for threshold in (8, 12):
+                prefix = f"t{threshold}_"
+                print(
+                    f"T={threshold} dynamic MASPRM − policy: "
+                    f"Δ={comparison[prefix + 'paired_accuracy_delta']:.3f}, "
+                    f"95% CI [{comparison[prefix + 'paired_bootstrap_ci_low']:.3f}, "
+                    f"{comparison[prefix + 'paired_bootstrap_ci_high']:.3f}], "
+                    f"McNemar p={comparison[prefix + 'mcnemar_exact_p']:.4g}"
+                )
 
 
 if __name__ == "__main__":
