@@ -30,7 +30,7 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--prm_dir",
-        default="checkpoints/Qwen2.5-1.5B-1.5B-PPM-qlora-512-mmlu",
+        default="checkpoints/Qwen2.5-1.5B-RM",
     )
     parser.add_argument("--prm_base_model_id", default="Qwen/Qwen2.5-1.5B-Instruct")
     parser.add_argument("--gen_model_id", default="Qwen/Qwen2.5-1.5B-Instruct")
@@ -42,7 +42,7 @@ def main():
     )
     parser.add_argument(
         "--orm_dir",
-        default="checkpoints/Qwen2.5-1.5B-1.5B-ORM-qlora-512-mmlu",
+        default="",
     )
     parser.add_argument(
         "--mas_config",
@@ -68,7 +68,9 @@ def main():
 
     # MAS graph config
 
-    cfg_path = Path(args.mas_config) if args.mas_config else Path("configs") / f"{DATASET_NAME}.yaml"
+    cfg_path = (
+        Path(args.mas_config) if args.mas_config else Path("configs") / f"{DATASET_NAME}.yaml"
+    )
     cfg = yaml.safe_load(cfg_path.read_text())
     agent_specs: List[Dict[str, Any]] = cfg["agents"]
     edges: List[List[int]] = cfg["edges"]
@@ -102,9 +104,11 @@ def main():
     mcts_kws = {"temperature": 0.6, "top_p": 0.95, "max_new_tokens": 1024}
 
     conditions: List[ConditionSpec] = [
-        # ConditionSpec(
-        #     "Greedy (policy only, no PRM)", "sbs_none", {"B1": 1, "B2": 1, "gen_kwargs": sbs_fast}
-        # ),
+        ConditionSpec(
+            "DyLAN single pass (no scorer)",
+            "sbs_none",
+            {"B1": 1, "B2": 1, "gen_kwargs": sbs_fast},
+        ),
         # ConditionSpec(
         #     "Greedy + Voter (policy only, no PRM)", "voter_plain", {"k": 5, "gen_kwargs": sbs_fast}
         # ),
@@ -121,14 +125,14 @@ def main():
         # ConditionSpec(
         #     "SBS + PRM (B1=1, B2=5)", "sbs_prm", {"B1": 1, "B2": 5, "gen_kwargs": sbs_fast}
         # ),
-        ConditionSpec(
-            "SBS + PRM (B1=3, B2=5)",
-            "sbs_prm",
-            {"B1": 3, "B2": 5, "gen_kwargs": sbs_fast, "view_mode": view_mode},
-        ),
-        ConditionSpec(
-            "SBS + logprob (B1=1, B2=5)", "sbs_logprob", {"B1": 1, "B2": 5, "gen_kwargs": sbs_fast}
-        ),
+        # ConditionSpec(
+        #     "SBS + PRM (B1=3, B2=5)",
+        #     "sbs_prm",
+        #     {"B1": 3, "B2": 5, "gen_kwargs": sbs_fast, "view_mode": view_mode},
+        # ),
+        # ConditionSpec(
+        #     "SBS + logprob (B1=1, B2=5)", "sbs_logprob", {"B1": 1, "B2": 5, "gen_kwargs": sbs_fast}
+        # ),
         # ConditionSpec(
         #     "SBS + logprob (B1=1, B2=5)", "sbs_logprob", {"B1": 1, "B2": 5, "gen_kwargs": sbs_fast}
         # ),
@@ -138,7 +142,7 @@ def main():
         #     {"n_simulations": 16, "max_children": 2, "c_uct": 2.0, "mcts_kwargs": mcts_kws},
         # ),
         ConditionSpec(
-            "MCTS + PRM (N=10, 3 children)",
+            "DyLAN MCTS + PPM (N=10, 3 children)",
             "mcts_prm",
             {
                 "n_simulations": 10,
@@ -253,20 +257,20 @@ def main():
     # os.environ.setdefault("RAY_NUM_WORKERS", "2") # Or set absolute count
 
     # if dataset name is different from the name in the prm dir only do MCTS + PRM also competittion means MATH
-    if DATASET_NAME not in prm_dir:
-        if DATASET_NAME == "competition_math":
-            if "MATH" not in prm_dir:
-                print(
-                    f"[info] Dataset name '{DATASET_NAME}' not found in prm_dir '{prm_dir}'. "
-                    "Only evaluating MCTS + PRM condition."
-                )
-                conditions = [cond for cond in conditions if cond.name.startswith("MCTS + PRM")]
-        else:
-            print(
-                f"[info] Dataset name '{DATASET_NAME}' not found in prm_dir '{prm_dir}'. "
-                "Only evaluating MCTS + PRM condition."
-            )
-            conditions = [cond for cond in conditions if cond.name.startswith("MCTS + PRM")]
+    # if DATASET_NAME not in prm_dir:
+    #     if DATASET_NAME == "competition_math":
+    #         if "MATH" not in prm_dir:
+    #             print(
+    #                 f"[info] Dataset name '{DATASET_NAME}' not found in prm_dir '{prm_dir}'. "
+    #                 "Only evaluating MCTS + PRM condition."
+    #             )
+    #             conditions = [cond for cond in conditions if cond.name.startswith("MCTS + PRM")]
+    #     else:
+    #         print(
+    #             f"[info] Dataset name '{DATASET_NAME}' not found in prm_dir '{prm_dir}'. "
+    #             "Only evaluating MCTS + PRM condition."
+    #         )
+    #         conditions = [cond for cond in conditions if cond.name.startswith("MCTS + PRM")]
 
     # Evaluate (models are constructed inside workers)
     results = evaluate_conditions_ray(
