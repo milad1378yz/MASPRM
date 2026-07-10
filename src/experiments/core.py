@@ -1473,7 +1473,7 @@ def load_prm_scorer(
     )
 
     # Align embeddings to tokenizer before loading adapter
-    if len(tok) != base.get_input_embeddings().weight.size(0):
+    if len(tok) > base.get_input_embeddings().weight.size(0):
         base.resize_token_embeddings(len(tok))
 
     # Attach LoRA adapter
@@ -1558,7 +1558,7 @@ def load_generation_model(
         base_model_id,
         **kwargs,
     )
-    if len(tokenizer) != model.get_input_embeddings().weight.size(0):
+    if len(tokenizer) > model.get_input_embeddings().weight.size(0):
         model.resize_token_embeddings(len(tokenizer))
     model.eval()
 
@@ -1584,8 +1584,8 @@ def ensure_separator_token(tokenizer: AutoTokenizer, sep: str) -> int:
 
 
 def align_model_to_tokenizer(model, tokenizer) -> None:
-    """Resize model embeddings to match tokenizer size if needed."""
-    if len(tokenizer) != model.get_input_embeddings().weight.size(0):
+    """Grow model embeddings when the tokenizer exceeds the model vocabulary."""
+    if len(tokenizer) > model.get_input_embeddings().weight.size(0):
         model.resize_token_embeddings(len(tokenizer))
 
 

@@ -1,5 +1,7 @@
 import argparse
+import json
 import os
+import random
 import sys
 from pathlib import Path
 from typing import Any, Dict, List
@@ -166,6 +168,14 @@ def main():
     parser.add_argument("--dataset", default=None)
     parser.add_argument("--split", default="test")
     parser.add_argument("--sample_n", type=int, default=None)  # set None for full
+    parser.add_argument(
+        "--exclude_questions_file",
+        default=None,
+        help=(
+            "Optional GSM8K JSONL whose prompt/question values are excluded before "
+            "the seeded sample is drawn; useful for question-disjoint dev runs."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--prm_dir",
@@ -349,7 +359,7 @@ def main():
     raw_ds, q_fn, gold_fn = load_hard_dataset(
         DATASET_NAME,
         SPLIT,
-        n=SAMPLE_N,
+        n=(None if args.exclude_questions_file else SAMPLE_N),
         seed=SEED,
         levels=(
             args.math_levels
@@ -365,6 +375,37 @@ def main():
         # BEFORE sampling, so the handoff run gets its full quota.
         require_parseable_gold=(uses_handoff and DATASET_NAME == "competition_math"),
     )
+    if args.exclude_questions_file:
+        if DATASET_NAME != "gsm8k":
+            parser.error("--exclude_questions_file currently supports only GSM8K")
+        excluded_questions = set()
+        with Path(args.exclude_questions_file).open() as excluded_file:
+            for line_number, line in enumerate(excluded_file, start=1):
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    parser.error(
+                        f"invalid JSON on line {line_number} of "
+                        f"{args.exclude_questions_file}: {exc}"
+                    )
+                question = record.get("prompt", record.get("question"))
+                if question is not None:
+                    excluded_questions.add(str(question))
+        eligible = [
+            idx
+            for idx, example in enumerate(raw_ds)
+            if str(q_fn(example)) not in excluded_questions
+        ]
+        random.Random(SEED).shuffle(eligible)
+        if SAMPLE_N is not None:
+            eligible = eligible[: int(SAMPLE_N)]
+        raw_ds = raw_ds.select(eligible)
+        print(
+            f"[info] Excluded {len(excluded_questions)} listed questions; "
+            f"selected {len(raw_ds)} disjoint examples."
+        )
     data: List[Dict[str, str]] = []
     for ex in raw_ds:
         g = gold_fn(ex)

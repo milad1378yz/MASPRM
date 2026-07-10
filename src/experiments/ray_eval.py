@@ -1229,6 +1229,7 @@ def evaluate_conditions_ray(
         context_truncations = 0
         parse_failures_total = 0
         proposals_total = 0
+        prm_evaluations_total = 0
         decoder_errors = 0
         pooled_examples = 0
         oracle_hits = 0
@@ -1310,6 +1311,7 @@ def evaluate_conditions_ray(
                 context_truncations += int(metadata.get("prm_truncations", 0))
                 parse_failures_total += int(metadata.get("parse_failures", 0))
                 proposals_total += int(metadata.get("agent_proposals", 0))
+                prm_evaluations_total += int(metadata.get("prm_evaluations", 0))
             if isinstance(metadata, dict) and "pool_answers" in metadata:
                 pooled_examples += 1
                 pool_answers = [
@@ -1420,6 +1422,7 @@ def evaluate_conditions_ray(
                 "tok_mean": mean,
                 "tok_std": std,
                 "prm_calls_total": int(prm_calls_total),
+                "prm_evaluations_total": int(prm_evaluations_total),
                 "agent_runs_total": int(agent_runs_total),
                 "prm_calls_mean": float("nan"),
                 "agent_runs_mean": float("nan"),
@@ -1445,8 +1448,10 @@ def evaluate_conditions_ray(
             "tok_mean": mean,
             "tok_std": std,
             "prm_calls_total": int(prm_calls_total),
+            "prm_evaluations_total": int(prm_evaluations_total),
             "agent_runs_total": int(agent_runs_total),
             "prm_calls_mean": float(prm_calls_total) / n,
+            "prm_evaluations_mean": float(prm_evaluations_total) / n,
             "agent_runs_mean": float(agent_runs_total) / n,
         }
         correct_by_kind[spec.kind] = condition_correct
@@ -1598,6 +1603,11 @@ def evaluate_conditions_ray(
                     "Batched policy calls / proposals per example: "
                     f"{results[spec.name]['agent_runs_mean']:.2f}/"
                     f"{results[spec.name]['agent_proposals_mean']:.2f}\n"
+                )
+                f.write(
+                    "Batched PRM calls / successor evaluations per example: "
+                    f"{results[spec.name]['prm_calls_mean']:.2f}/"
+                    f"{results[spec.name]['prm_evaluations_mean']:.2f}\n"
                 )
             if pooled_examples:
                 f.write(
