@@ -1370,6 +1370,7 @@ def load_prm_scorer(
     max_length: int = 2048,
     torch_dtype: torch.dtype = torch.float16,
     step_separator: str = "</step>",
+    attn_impl: str = "sdpa",
 ):
     """
     Returns: (score: Callable[[str], float], tokenizer, model)
@@ -1409,7 +1410,7 @@ def load_prm_scorer(
         trust_remote_code=True,
         quantization_config=bnb_cfg,
         torch_dtype=torch_dtype,
-        attn_implementation="sdpa",
+        attn_implementation=attn_impl,
     )
 
     # Align embeddings to tokenizer before loading adapter

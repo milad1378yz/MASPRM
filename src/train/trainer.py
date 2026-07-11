@@ -2,6 +2,7 @@ import os
 import re
 import json
 import random
+import importlib.util
 import argparse
 import hashlib
 from pathlib import Path
@@ -14,7 +15,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 # Reduce CUDA fragmentation on long runs
 os.environ.setdefault(
     "PYTORCH_CUDA_ALLOC_CONF",
-    "max_split_size_mb:128",
+    "expandable_segments:True,max_split_size_mb:128",
 )
 
 import numpy as np
@@ -49,9 +50,7 @@ os.environ.setdefault("HF_HOME", str(Path.home() / ".cache" / "huggingface"))
 
 
 def arg_parser():
-    ap = argparse.ArgumentParser(
-        "Train PRM (regression), ORM (last-step PRM) or PPM (pairwise)."
-    )
+    ap = argparse.ArgumentParser("Train PRM (regression), ORM (last-step PRM) or PPM (pairwise).")
     # Mode
     ap.add_argument(
         "--mode",
@@ -68,9 +67,7 @@ def arg_parser():
     )
     # Model & training
     ap.add_argument("--model-id", type=str, default="Qwen/Qwen2.5-1.5B-Instruct")
-    ap.add_argument(
-        "--output-dir", type=Path, default=Path("checkpoints/Qwen2.5-1.5B-RM")
-    )
+    ap.add_argument("--output-dir", type=Path, default=Path("checkpoints/Qwen2.5-1.5B-RM"))
     ap.add_argument("--epochs", type=int, default=10)
     ap.add_argument(
         "--max-steps",
@@ -81,6 +78,19 @@ def arg_parser():
     ap.add_argument("--lr", type=float, default=1e-5)
     ap.add_argument("--weight-decay", type=float, default=0.01)
     ap.add_argument("--grad-accum", type=int, default=16)
+    ap.add_argument("--train-batch-size", type=int, default=8)
+    ap.add_argument("--eval-batch-size", type=int, default=8)
+    ap.add_argument(
+        "--auto-find-batch-size",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Reduce the microbatch automatically after CUDA OOM.",
+    )
+    ap.add_argument(
+        "--attn-implementation",
+        choices=["auto", "flash_attention_2", "sdpa"],
+        default="auto",
+    )
     ap.add_argument("--eval-steps", type=int, default=200)
     ap.add_argument("--save-steps", type=int, default=200)
     ap.add_argument("--save-total-limit", type=int, default=2)
@@ -212,9 +222,7 @@ class PRMRegressionTrainer(PRMTrainer):
       loss = MSE/Huber(z, z_target) on separator positions only
     """
 
-    def __init__(
-        self, *args, loss_type: str = "mse", huber_beta: float = 0.1, **kwargs
-    ):
+    def __init__(self, *args, loss_type: str = "mse", huber_beta: float = 0.1, **kwargs):
         super().__init__(*args, **kwargs)
         self._loss_type = loss_type
 
@@ -310,9 +318,7 @@ class PRMRegressionTrainer(PRMTrainer):
         int_mask = torch.tensor(row["labels"], dtype=torch.long)  # int mask from PRM
         mask = int_mask != -100
 
-        if "labels" not in features or not isinstance(
-            features["labels"], (list, tuple)
-        ):
+        if "labels" not in features or not isinstance(features["labels"], (list, tuple)):
             raise AssertionError(
                 "Expect features['labels'] to be a list/sequence of floats in [-1,1]."
             )
@@ -324,9 +330,7 @@ class PRMRegressionTrainer(PRMTrainer):
             )
 
         # Quantize: y \in [-1,1] → int code = round(y * SCALE) + SHIFT
-        encoded = (
-            torch.round(cont_vals * INT_LABEL_SCALE).to(torch.long) + INT_LABEL_SHIFT
-        )
+        encoded = torch.round(cont_vals * INT_LABEL_SCALE).to(torch.long) + INT_LABEL_SHIFT
         int_mask[mask] = encoded
         row["labels"] = int_mask.tolist()  # stays int64 for Arrow/TRL
         return row
@@ -361,14 +365,10 @@ class ORMRegressionTrainer(PRMRegressionTrainer):
                 # Must be on the separator and must be the *last* separator
                 lab_idx = int(mask.nonzero(as_tuple=True)[0][-1].item())
                 if int(ids[b, lab_idx].item()) != self._sep_id:
-                    raise AssertionError(
-                        "ORM label is not placed on the step separator token."
-                    )
+                    raise AssertionError("ORM label is not placed on the step separator token.")
                 sep_pos = (ids[b] == self._sep_id).nonzero(as_tuple=True)[0]
                 if sep_pos.numel() > 0 and lab_idx != int(sep_pos[-1].item()):
-                    raise AssertionError(
-                        "ORM label must be on the LAST step separator token."
-                    )
+                    raise AssertionError("ORM label must be on the LAST step separator token.")
             self._orm_checked_once = True
 
         out = model(**inputs)
@@ -571,9 +571,7 @@ def _last_sep_logits(
     B, T = input_ids.shape
     idx = torch.arange(T, device=input_ids.device).unsqueeze(0).expand(B, -1)
     is_sep = input_ids == sep_id
-    last_idx = (
-        torch.where(is_sep, idx, torch.full_like(idx, -1)).max(dim=1).values
-    )  # (B,)
+    last_idx = torch.where(is_sep, idx, torch.full_like(idx, -1)).max(dim=1).values  # (B,)
     # Fallback: last non-pad token
     last_tok = (input_ids != pad_id).int().sum(dim=1) - 1
     last_idx = torch.where(last_idx >= 0, last_idx, last_tok.clamp(min=0))
@@ -601,9 +599,7 @@ def compute_ppm_metrics(eval_pred):
         out["avg_margin"] = float(d.mean())
         out["median_margin"] = float(np.median(d))
         out["std_margin"] = float(d.std())
-        out["avg_bt_prob"] = float(
-            (1.0 / (1.0 + np.exp(-d))).mean()
-        )  # mean \sigma(diff)
+        out["avg_bt_prob"] = float((1.0 / (1.0 + np.exp(-d))).mean())  # mean \sigma(diff)
 
     if pos is not None:
         out["pos_mean"] = float(pos.mean())
@@ -626,9 +622,7 @@ def _last_sep_logits_with_flag(
     B, T = input_ids.shape
     idx = torch.arange(T, device=input_ids.device).unsqueeze(0).expand(B, -1)
     is_sep = input_ids == sep_id
-    last_idx = (
-        torch.where(is_sep, idx, torch.full_like(idx, -1)).max(dim=1).values
-    )  # (B,)
+    last_idx = torch.where(is_sep, idx, torch.full_like(idx, -1)).max(dim=1).values  # (B,)
     found = last_idx >= 0  # whether we saw at least one separator
     # Fallback to last non-pad
     last_tok = (input_ids != pad_id).int().sum(dim=1) - 1
@@ -646,9 +640,7 @@ class PPMTrainer(Trainer):
     Here, r(x, y) is the single score taken at the last step separator token.
     """
 
-    def __init__(
-        self, *args, tokenizer: AutoTokenizer, step_separator: str = "</step>", **kwargs
-    ):
+    def __init__(self, *args, tokenizer: AutoTokenizer, step_separator: str = "</step>", **kwargs):
         super().__init__(*args, processing_class=tokenizer, **kwargs)
         sep_ids = tokenizer.encode(step_separator, add_special_tokens=False)
         if len(sep_ids) != 1:
@@ -658,9 +650,7 @@ class PPMTrainer(Trainer):
             )
         self._sep_id = sep_ids[0]
         self._pad_id = (
-            tokenizer.pad_token_id
-            if tokenizer.pad_token_id is not None
-            else tokenizer.eos_token_id
+            tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
         )
 
     def compute_loss(self, model, inputs, return_outputs=False, **kw):
@@ -679,9 +669,7 @@ class PPMTrainer(Trainer):
         )  # (B,)
 
         diff = pos_score - neg_score
-        loss = -F.logsigmoid(
-            diff
-        ).mean()  # Bradley–Terry / InstructGPT-style pairwise loss
+        loss = -F.logsigmoid(diff).mean()  # Bradley–Terry / InstructGPT-style pairwise loss
 
         if return_outputs:
             # return "logits" as the difference so metrics can use it
@@ -790,13 +778,11 @@ def main():
 
     # Load dataset
     full_ds = load_dataset("json", data_files={"train": str(args.data_dir)})["train"]
-    base_train_dataset, base_eval_dataset, split_manifest = (
-        _grouped_train_eval_split(
-            full_ds,
-            group_column=args.split_group_column,
-            eval_ratio=args.eval_ratio,
-            seed=args.seed,
-        )
+    base_train_dataset, base_eval_dataset, split_manifest = _grouped_train_eval_split(
+        full_ds,
+        group_column=args.split_group_column,
+        eval_ratio=args.eval_ratio,
+        seed=args.seed,
     )
     rank_zero_print(
         "Grouped split: "
@@ -822,18 +808,13 @@ def main():
         looks_like_special = bool(re.match(r"^<[^>\s]+>$", args.step_separator))
         if (
             looks_like_special
-            and tokenizer.convert_tokens_to_ids(args.step_separator)
-            == tokenizer.unk_token_id
+            and tokenizer.convert_tokens_to_ids(args.step_separator) == tokenizer.unk_token_id
         ):
-            tokenizer.add_special_tokens(
-                {"additional_special_tokens": [args.step_separator]}
-            )
+            tokenizer.add_special_tokens({"additional_special_tokens": [args.step_separator]})
             rank_zero_print(f"Added special token to tokenizer: {args.step_separator}")
     new_token_indices = list(range(tokenizer_size_before, len(tokenizer)))
     if args.train_new_token_only and not new_token_indices:
-        rank_zero_print(
-            "No new tokenizer rows were added; --train-new-token-only has no effect."
-        )
+        rank_zero_print("No new tokenizer rows were added; --train-new-token-only has no effect.")
     rank_zero_print(
         "Separator ids:",
         tokenizer.encode(args.step_separator, add_special_tokens=False),
@@ -880,30 +861,30 @@ def main():
         # bias="none",
         modules_to_save=modules_to_save,
         trainable_token_indices=(
-            new_token_indices
-            if args.train_new_token_only and new_token_indices
-            else None
+            new_token_indices if args.train_new_token_only and new_token_indices else None
         ),
     )
 
-    # Robust dtype/attention selection for V100-class GPUs (no BF16 support).
+    # Robust dtype/attention selection for V100-class GPUs (no BF16/FA2 support).
     if torch.cuda.is_available():
         cc_major = torch.cuda.get_device_capability(0)[0]
         ampere_or_newer = cc_major >= 8
-        from torch.nn.attention import sdpa_kernel, SDPBackend
-
-        if ampere_or_newer:
-            # Ampere+ → allow efficient kernels
-            sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH])
-            attn_impl = "sdpa"
-        else:
-            # Volta/Turing → math or eager only
-            sdpa_kernel([SDPBackend.MATH])
-            attn_impl = "sdpa"
     else:
         cc_major = 0
         ampere_or_newer = False
-        attn_impl = "sdpa"  # Default for CPU
+
+    flash_available = importlib.util.find_spec("flash_attn") is not None
+    if args.attn_implementation == "flash_attention_2":
+        if not ampere_or_newer or not flash_available:
+            raise RuntimeError(
+                "flash_attention_2 requires an Ampere-or-newer CUDA GPU and "
+                "an installed flash-attn package."
+            )
+        attn_impl = "flash_attention_2"
+    elif args.attn_implementation == "auto":
+        attn_impl = "flash_attention_2" if ampere_or_newer and flash_available else "sdpa"
+    else:
+        attn_impl = "sdpa"
 
     # Prefer BF16 on Ampere+ (including the LoRA path) to avoid FP16 grad-norm
     # overflow spikes. Only fall back to FP16 on Volta/Turing.
@@ -911,9 +892,7 @@ def main():
 
     device_map = "auto" if use_lora else None
 
-    print(
-        f"Using torch_dtype={chosen_dtype}, attn_impl={attn_impl}, device_map={device_map}"
-    )
+    print(f"Using torch_dtype={chosen_dtype}, attn_impl={attn_impl}, device_map={device_map}")
 
     # Model with single‑logit token head
     model = AutoModelForTokenClassification.from_pretrained(
@@ -931,19 +910,14 @@ def main():
         # Gradient checkpointing is great with QLoRA; keep it on.
         if torch.cuda.is_available():
             model.gradient_checkpointing_enable()
-            model = prepare_model_for_kbit_training(
-                model, use_gradient_checkpointing=True
-            )
+            model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
     else:
         # Older kernels/drivers are prone to invalid-argument errors with gc + FP32.
         if torch.cuda.is_available():
             model.gradient_checkpointing_disable()
 
     # Resize embeddings if we added special tokens
-    if (
-        args.ensure_step_token
-        and len(tokenizer) > model.get_input_embeddings().weight.size(0)
-    ):
+    if args.ensure_step_token and len(tokenizer) > model.get_input_embeddings().weight.size(0):
         model.resize_token_embeddings(len(tokenizer))
         rank_zero_print("Resized token embeddings to match tokenizer.")
 
@@ -955,9 +929,9 @@ def main():
         output_dir=str(args.output_dir),
         do_train=True,
         do_eval=True,
-        auto_find_batch_size=True,
-        # per_device_train_batch_size=32,
-        # per_device_eval_batch_size=64,
+        auto_find_batch_size=args.auto_find_batch_size,
+        per_device_train_batch_size=args.train_batch_size,
+        per_device_eval_batch_size=args.eval_batch_size,
         gradient_accumulation_steps=args.grad_accum,
         bf16=(chosen_dtype == torch.bfloat16),
         fp16=(chosen_dtype == torch.float16),
@@ -990,9 +964,7 @@ def main():
         # Keep rightmost tokens so last step separator survives truncation
         tokenizer.truncation_side = "left"
 
-        train_dataset = _expand_ppm_pairs(
-            base_train_dataset, args.step_separator
-        )
+        train_dataset = _expand_ppm_pairs(base_train_dataset, args.step_separator)
         eval_dataset = _expand_ppm_pairs(base_eval_dataset, args.step_separator)
 
         base = Path(args.output_dir) / "map_cache"
@@ -1098,9 +1070,7 @@ def main():
             train_on_last_step_only=True,
         )
 
-        data_collator = DataCollatorForTokenRegression(
-            tokenizer, label_pad_token_id=-100.0
-        )
+        data_collator = DataCollatorForTokenRegression(tokenizer, label_pad_token_id=-100.0)
         peft_cfg = lora_config if use_lora else None
         trainer = ORMRegressionTrainer(
             model=model,
@@ -1130,9 +1100,7 @@ def main():
             remove_unused_columns=False,
         )
 
-        data_collator = DataCollatorForTokenRegression(
-            tokenizer, label_pad_token_id=-100.0
-        )
+        data_collator = DataCollatorForTokenRegression(tokenizer, label_pad_token_id=-100.0)
         peft_cfg = lora_config if use_lora else None
         trainer = PRMRegressionTrainer(
             model=model,
@@ -1160,14 +1128,16 @@ def main():
             "learning_rate": args.lr,
             "weight_decay": args.weight_decay,
             "gradient_accumulation_steps": args.grad_accum,
+            "train_batch_size": args.train_batch_size,
+            "eval_batch_size": args.eval_batch_size,
+            "auto_find_batch_size": args.auto_find_batch_size,
+            "attn_implementation": attn_impl,
             "lora_r": args.lora_r,
             "lora_alpha": args.lora_alpha,
             "lora_dropout": args.lora_dropout,
             "train_new_token_only": args.train_new_token_only,
             "new_token_indices": new_token_indices,
-            "best_model_metric": (
-                "eval_pair_acc" if args.mode == "ppm" else "eval_pearson"
-            ),
+            "best_model_metric": ("eval_pair_acc" if args.mode == "ppm" else "eval_pearson"),
         }
     )
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -1195,13 +1165,9 @@ def main():
     # Sync before scanning filesystem
     if dist.is_initialized():
         dist.barrier()
-    last_ckpt_path = (
-        None if args.no_resume else find_last_checkpoint(args.output_dir)
-    )
+    last_ckpt_path = None if args.no_resume else find_last_checkpoint(args.output_dir)
     resume_ckpt = str(last_ckpt_path) if last_ckpt_path is not None else None
-    rank_zero_print(
-        f"Last complete checkpoint directory: {resume_ckpt}"
-    )
+    rank_zero_print(f"Last complete checkpoint directory: {resume_ckpt}")
 
     # Small help against fragmentation before heavy allocations
     if torch.cuda.is_available():

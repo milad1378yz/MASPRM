@@ -72,6 +72,7 @@ class WorkerInit:
     judge_model_id: Optional[str] = None
     judge_load_in_4bit: bool = False
     prm_max_length: int = 2048
+    attn_impl: str = "sdpa"
 
     # dtype options: "float16" | "bfloat16" | "float32"
     dtype: str = "float16"
@@ -328,6 +329,7 @@ def evaluate_conditions_ray(
                     max_length=int(init.prm_max_length),
                     torch_dtype=self.dtype,
                     step_separator=self.step_sep,
+                    attn_impl=init.attn_impl,
                 )
 
                 # modify the PRM tokenizer/model with the separator
@@ -342,6 +344,7 @@ def evaluate_conditions_ray(
                 # policy LM must not change tokenizer when the PRM row is present.
                 tokenizer=None if self.handoff_config else self.prm_tok,
                 torch_dtype=self.dtype,
+                attn_impl=init.attn_impl,
             )
             self.handoff_mas = (
                 build_handoff_mas_from_specs(
@@ -364,6 +367,7 @@ def evaluate_conditions_ray(
                     tokenizer=None,
                     torch_dtype=self.dtype,
                     load_in_4bit=bool(init.judge_load_in_4bit),
+                    attn_impl=init.attn_impl,
                 )
                 self.judge = make_llm_judge_voter(judge_runtime.model, judge_runtime.tokenizer)
                 self.judge_ranker = make_llm_action_ranker(
@@ -380,6 +384,7 @@ def evaluate_conditions_ray(
                     base_model_id=None,  # read from adapter config
                     torch_dtype=self.dtype,
                     step_separator=self.step_sep,
+                    attn_impl=init.attn_impl,
                 )
                 added = ensure_separator_token(self.orm_tok, self.step_sep)
                 print(f"[Worker {self.rank}] Added {added} special tokens for ORM separator.")
@@ -922,6 +927,7 @@ def evaluate_conditions_ray(
         "prm_base_model_id": worker_init.prm_base_model_id,
         "orm": _checkpoint_identity(worker_init.orm_dir),
         "dtype": worker_init.dtype,
+        "attn_implementation": worker_init.attn_impl,
         "seed": worker_init.seed,
         "implementation_sha256": implementation_sha256,
     }
@@ -985,6 +991,7 @@ def evaluate_conditions_ray(
                 handoff_config=None,
                 step_separator=worker_init.step_separator,
                 gen_model_id=worker_init.gen_model_id,
+                attn_impl=worker_init.attn_impl,
                 dtype=worker_init.dtype,
                 seed=worker_init.seed,
             )
@@ -1101,6 +1108,7 @@ def evaluate_conditions_ray(
             judge_model_id=worker_init.judge_model_id if needs_judge else None,
             judge_load_in_4bit=worker_init.judge_load_in_4bit,
             prm_max_length=int(spec.params.get("prm_context_length", worker_init.prm_max_length)),
+            attn_impl=worker_init.attn_impl,
             dtype=worker_init.dtype,
             seed=worker_init.seed,
         )

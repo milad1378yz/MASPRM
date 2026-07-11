@@ -258,6 +258,12 @@ def main():
     method_args.add_argument("--mcts_temperature", type=float, default=0.6)
     method_args.add_argument("--top_p", type=float, default=0.95)
     method_args.add_argument("--max_new_tokens", type=int, default=1024)
+    method_args.add_argument(
+        "--attn_implementation",
+        choices=["sdpa", "flash_attention_2"],
+        default="sdpa",
+        help="Attention backend used by generator and scoring models.",
+    )
     handoff_args = parser.add_argument_group("dynamic handoff hyperparameters")
     handoff_args.add_argument("--handoff_candidates", type=int, default=3)
     handoff_args.add_argument("--min_turns", type=int, default=4)
@@ -448,6 +454,7 @@ def main():
         judge_model_id=(args.judge_model_id if uses_judge else None),
         judge_load_in_4bit=args.judge_load_in_4bit,
         prm_max_length=args.prm_context_length,
+        attn_impl=args.attn_implementation,
         dtype="float16",
         seed=SEED,
     )
