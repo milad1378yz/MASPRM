@@ -256,6 +256,11 @@ class HandoffMAS:
     ) -> str:
         history = "\n\n".join(turn.render() for turn in context.visible_turns)
         permitted = ", ".join(permitted_recipients)
+        final_rule = (
+            "FINAL IS FORBIDDEN ON THIS TURN."
+            if FINAL_RECIPIENT not in permitted_recipients
+            else "FINAL may be used only when the answer is fully solved and verified."
+        )
         parts = [
             f"ORIGINAL QUESTION:\n{context.question}",
             (
@@ -268,6 +273,15 @@ class HandoffMAS:
             (
                 "Produce exactly one action using the required four fields. "
                 "Do not address any recipient outside the permitted list."
+            ),
+            (
+                "STRICT OUTPUT CHECK:\n"
+                f"{final_rule}\n"
+                "Do not output ACTION or any prose before SPEAKER. Fill this exact template:\n"
+                f"SPEAKER: {context.speaker}\n"
+                f"RECIPIENT: <exactly one of: {permitted}>\n"
+                "MESSAGE: <your reasoning or advice>\n"
+                "CURRENT_ANSWER: <the best answer so far>"
             ),
         ]
         return "\n\n".join(parts)
