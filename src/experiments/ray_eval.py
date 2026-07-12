@@ -279,10 +279,12 @@ def evaluate_conditions_ray(
             "PYTHONPATH": f"{existing}:{src_dir}" if existing else src_dir,
             # Pass the cache location to the workers
             "HF_HOME": os.environ.get("HF_HOME", "/tmp/hf"),
-            "HF_HUB_CACHE": os.environ.get("HF_HUB_CACHE", ""),
             # Pass the offline mode setting
             "HF_HUB_OFFLINE": os.environ.get("HF_HUB_OFFLINE", "0"),
         }
+        hf_hub_cache = os.environ.get("HF_HUB_CACHE")
+        if hf_hub_cache:
+            env_vars_to_pass["HF_HUB_CACHE"] = hf_hub_cache
 
         runtime_env = {
             "env_vars": env_vars_to_pass,

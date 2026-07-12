@@ -126,6 +126,12 @@ def arg_parser():
     # Loss (PRM/ORM only)
     ap.add_argument("--loss", choices=["mse", "huber", "bce"], default="bce")
     ap.add_argument("--huber-beta", type=float, default=0.1)
+    ap.add_argument(
+        "--ppm-best-metric",
+        choices=["pair_acc", "loss"],
+        default="pair_acc",
+        help="Held-out metric used to select the best PPM checkpoint.",
+    )
     # LoRA
     ap.add_argument("--lora-r", type=int, default=256)
     ap.add_argument("--lora-alpha", type=int, default=32)
@@ -604,6 +610,16 @@ def compute_ppm_metrics(eval_pred):
     if pos is not None:
         out["pos_mean"] = float(pos.mean())
         out["neg_mean"] = float(neg.mean())
+        raw_scores = np.concatenate(
+            [np.asarray(pos, dtype=np.float32), np.asarray(neg, dtype=np.float32)]
+        )
+        tanh_pos = torch.tanh(torch.from_numpy(np.asarray(pos, dtype=np.float32))).numpy()
+        tanh_neg = torch.tanh(torch.from_numpy(np.asarray(neg, dtype=np.float32))).numpy()
+        out["tanh_pair_acc"] = float((tanh_pos > tanh_neg).mean())
+        out["tanh_tie_rate"] = float((tanh_pos == tanh_neg).mean())
+        out["raw_score_abs_p95"] = float(np.quantile(np.abs(raw_scores), 0.95))
+        out["raw_score_abs_max"] = float(np.abs(raw_scores).max())
+        out["raw_score_abs_ge_9p011_rate"] = float((np.abs(raw_scores) >= 9.011).mean())
 
     if p_found is not None:
         out["fallback_rate_pos"] = float((1.0 - p_found).mean())
@@ -1015,10 +1031,11 @@ def main():
         if use_lora:
             model = get_peft_model(model, lora_config)
 
+        ppm_best_metric = "pair_acc" if args.ppm_best_metric == "pair_acc" else "loss"
         training_args = PRMConfig(
             **common_cfg,
-            metric_for_best_model="pair_acc",
-            greater_is_better=True,
+            metric_for_best_model=ppm_best_metric,
+            greater_is_better=(ppm_best_metric == "pair_acc"),
             group_by_length=False,
             remove_unused_columns=False,  # already needed for PPM collator
             label_names=["labels"],
@@ -1137,7 +1154,9 @@ def main():
             "lora_dropout": args.lora_dropout,
             "train_new_token_only": args.train_new_token_only,
             "new_token_indices": new_token_indices,
-            "best_model_metric": ("eval_pair_acc" if args.mode == "ppm" else "eval_pearson"),
+            "best_model_metric": (
+                f"eval_{args.ppm_best_metric}" if args.mode == "ppm" else "eval_pearson"
+            ),
         }
     )
     args.output_dir.mkdir(parents=True, exist_ok=True)
