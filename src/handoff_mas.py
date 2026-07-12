@@ -120,19 +120,31 @@ def parse_routed_turn(
     """Parse and strictly validate the four-field routed-action contract."""
     raw = str(text or "").strip()
     matches = list(_FIELD_RE.finditer(raw))
-    expected_fields = ["SPEAKER", "RECIPIENT", "MESSAGE", "CURRENT_ANSWER"]
     found_fields = [match.group(1).upper() for match in matches]
     has_leading_text = bool(matches and raw[: matches[0].start()].strip())
-    if has_leading_text or found_fields != expected_fields:
+    if has_leading_text or found_fields[:3] != ["SPEAKER", "RECIPIENT", "MESSAGE"]:
         raise ValueError(
-            "Routed action must contain SPEAKER, RECIPIENT, MESSAGE, and "
-            "CURRENT_ANSWER exactly once and in that order."
+            "Routed action must begin with SPEAKER, RECIPIENT, and MESSAGE " "in that order."
         )
-
-    values: Dict[str, str] = {}
-    for idx, match in enumerate(matches):
-        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(raw)
-        values[match.group(1).upper()] = raw[match.end() : end].strip()
+    answer_matches = [match for match in matches[3:] if match.group(1).upper() == "CURRENT_ANSWER"]
+    speaker_match, recipient_match, message_match = matches[:3]
+    answer_match = answer_matches[-1] if answer_matches else None
+    if answer_match is not None and answer_match.start() <= message_match.end():
+        raise ValueError("CURRENT_ANSWER must follow MESSAGE.")
+    message_end = answer_match.start() if answer_match is not None else len(raw)
+    message = raw[message_match.end() : message_end].strip()
+    values = {
+        "SPEAKER": raw[speaker_match.end() : recipient_match.start()].strip(),
+        "RECIPIENT": raw[recipient_match.end() : message_match.start()].strip(),
+        # Small models sometimes repeat field labels while revising an answer.
+        # Preserve those repetitions as message text and use the final answer.
+        "MESSAGE": message,
+        # If the explicit field is omitted, the complete message is the best
+        # available answer instead of silently carrying a stale prior answer.
+        "CURRENT_ANSWER": (
+            raw[answer_match.end() :].strip() if answer_match is not None else message
+        ),
+    }
 
     canonical_roles = {_role_key(name): str(name) for name in role_names}
     speaker_key = _role_key(values["SPEAKER"])
@@ -144,12 +156,13 @@ def parse_routed_turn(
         )
 
     recipient_value = values["RECIPIENT"]
-    if _role_key(recipient_value) == _role_key(FINAL_RECIPIENT):
+    recipient_key = _role_key(recipient_value)
+    terminal_aliases = {_role_key(value) for value in (FINAL_RECIPIENT, "none", "end", "stop")}
+    if recipient_key in terminal_aliases:
         if not allow_final:
             raise ValueError("FINAL is not allowed before the minimum turn count.")
         recipient = FINAL_RECIPIENT
     else:
-        recipient_key = _role_key(recipient_value)
         if recipient_key not in canonical_roles:
             raise ValueError(f"Unknown recipient role: {recipient_value!r}.")
         recipient = canonical_roles[recipient_key]
@@ -187,24 +200,19 @@ class HandoffMAS:
 
     def __init__(self, agents: Sequence[Agent], role_names: Sequence[str]):
         if len(agents) != len(role_names) or not agents:
-            raise ValueError(
-                "agents and role_names must have the same non-zero length."
-            )
+            raise ValueError("agents and role_names must have the same non-zero length.")
 
         self.agents = list(agents)
         self.role_names = [str(name).strip() for name in role_names]
         if any(not name for name in self.role_names):
             raise ValueError("Every handoff role must have a non-empty name.")
 
-        self._role_indices = {
-            _role_key(name): idx for idx, name in enumerate(self.role_names)
-        }
+        self._role_indices = {_role_key(name): idx for idx, name in enumerate(self.role_names)}
         if len(self._role_indices) != len(self.role_names):
             raise ValueError("Handoff role names must be unique (case-insensitive).")
         if _role_key(FINAL_RECIPIENT) in self._role_indices:
             raise ValueError(
-                f"{FINAL_RECIPIENT!r} is reserved for termination and cannot "
-                "name a role."
+                f"{FINAL_RECIPIENT!r} is reserved for termination and cannot " "name a role."
             )
 
         self.n = len(self.agents)
@@ -221,9 +229,7 @@ class HandoffMAS:
             raise ValueError(f"Unknown handoff role: {role!r}.")
         return self._role_indices[key]
 
-    def visible_turns(
-        self, role: str, turns: Sequence[RoutedTurn]
-    ) -> Tuple[RoutedTurn, ...]:
+    def visible_turns(self, role: str, turns: Sequence[RoutedTurn]) -> Tuple[RoutedTurn, ...]:
         """A role's private view: every turn it spoke or received, in order."""
         key = _role_key(role)
         return tuple(
@@ -384,8 +390,7 @@ class HandoffMAS:
             turn = params.selector(context)
             if _role_key(turn.speaker) != _role_key(speaker):
                 raise ValueError(
-                    f"Selected action speaker {turn.speaker!r} does not match "
-                    f"{speaker!r}."
+                    f"Selected action speaker {turn.speaker!r} does not match " f"{speaker!r}."
                 )
 
             is_final = _role_key(turn.recipient) == _role_key(FINAL_RECIPIENT)
