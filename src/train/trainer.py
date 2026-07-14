@@ -76,6 +76,13 @@ def arg_parser():
         help="Optional optimizer-step cap; useful for smoke tests. -1 uses --epochs.",
     )
     ap.add_argument("--lr", type=float, default=1e-5)
+    ap.add_argument(
+        "--init-adapter-dir",
+        type=Path,
+        default=None,
+        help="Warm-start: load LoRA adapter weights from this directory "
+        "instead of random adapter init (PPM mode only).",
+    )
     ap.add_argument("--weight-decay", type=float, default=0.01)
     ap.add_argument("--grad-accum", type=int, default=16)
     ap.add_argument("--train-batch-size", type=int, default=8)
@@ -1029,7 +1036,15 @@ def main():
         )
 
         if use_lora:
-            model = get_peft_model(model, lora_config)
+            if args.init_adapter_dir is not None:
+                from peft import PeftModel
+
+                model = PeftModel.from_pretrained(
+                    model, str(args.init_adapter_dir), is_trainable=True
+                )
+                rank_zero_print(f"Warm-started adapter from {args.init_adapter_dir}")
+            else:
+                model = get_peft_model(model, lora_config)
 
         ppm_best_metric = "pair_acc" if args.ppm_best_metric == "pair_acc" else "loss"
         training_args = PRMConfig(
