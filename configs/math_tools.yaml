@@ -1,5 +1,5 @@
-# AgentVerse-style vertical collaboration for numeric word problems. Each role
-# has a distinct allowlist and is required to use its assigned tool.
+# AgentVerse-style vertical collaboration for numeric word problems. Each
+# tool-using role has a distinct allowlist and is required to use its tool.
 agents:
   - name: Problem Analyst
     system_prompt: |

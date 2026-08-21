@@ -6,6 +6,13 @@ import random
 from answer_utils import _to_number
 
 
+_SOFT_NEWLINE_CODEPOINTS = dict.fromkeys((0x000B, 0x000C, 0x000D, 0x0085, 0x2028, 0x2029))
+
+
+def _remove_soft_newlines(value):
+    return str(value).translate(_SOFT_NEWLINE_CODEPOINTS)
+
+
 def _select_stratified(data, n, field, seed):
     if not n:
         return data
@@ -176,7 +183,7 @@ def load_hard_dataset(
             "for competition_math."
         )
 
-    return data, q_fn, gold_fn
+    return data, lambda ex: _remove_soft_newlines(q_fn(ex)), gold_fn
 
 
 def format_logiqa_question(ex):

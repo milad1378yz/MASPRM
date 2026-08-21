@@ -103,11 +103,18 @@ def _evaluate_tool_expression(expression: str) -> tuple[str, Fraction, List[Frac
     """Tolerate harmless calculator notation while keeping the AST evaluator strict."""
     normalized = (
         expression.strip()
+        .replace("\\$", "")
         .replace("$", "")
         .replace(",", "")
+        .replace("\\times", "*")
+        .replace("\\cdot", "*")
+        .replace("\\div", "/")
+        .replace("\\(", "")
+        .replace("\\)", "")
         .replace("×", "*")
         .replace("÷", "/")
         .replace("−", "-")
+        .replace("^", "**")
     )
     if "==" in normalized or "!=" in normalized or "<=" in normalized or ">=" in normalized:
         raise ToolExecutionError("Only a single arithmetic expression or equation is allowed.")

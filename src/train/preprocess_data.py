@@ -4,10 +4,7 @@ Example:
     python src/train/preprocess_data.py --target-nodes 4 --dedupe
 
     # PPM (global view)
-    python preprocess_prm.py \
-        --input trees_dir_or_file \
-        --make-ppm \
-        --ppm-max-pairs 8
+    python preprocess_prm.py --input trees_dir_or_file --make-ppm --ppm-max-pairs 8
 
     # Local view (MASPRM: each record scoped to a single agent's inbox + output)
     python src/train/preprocess_data.py --view local --make-ppm

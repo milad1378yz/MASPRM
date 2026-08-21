@@ -71,6 +71,23 @@ def test_disallowed_tool_does_not_satisfy_the_requirement():
     assert agent.last_tool_stats.required_tool_misses == 0
 
 
+def test_allowed_tool_error_still_records_real_tool_participation():
+    agent = ScriptedAgent(
+        [
+            '<tool_call>{"name":"calculate","arguments":{"expression":"unknown + 1"}}</tool_call>',
+            "Final Answer: 1",
+        ]
+    )
+
+    agent.generate(agent.format_messages("Use the required calculator."))
+
+    assert agent.last_tool_stats.tool_used_candidates == 1
+    assert agent.last_tool_stats.tool_names == {"calculate": 1}
+    assert agent.last_tool_stats.successful_tool_calls == 0
+    assert agent.last_tool_stats.tool_errors == 1
+    assert agent.last_tool_stats.required_tool_misses == 0
+
+
 def test_config_assigns_a_different_tool_to_each_agent():
     mas = build_mas_from_specs(
         model=None,

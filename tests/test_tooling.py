@@ -30,7 +30,7 @@ def test_verify_arithmetic_compares_computed_and_claimed_values():
 
 def test_tools_normalize_currency_unicode_and_an_equation():
     calculated = json.loads(
-        TOOL_REGISTRY["calculate"].invoke({"expression": "$1,200 ÷ 4"})
+        TOOL_REGISTRY["calculate"].invoke({"expression": r"\$1,200 \div 4"})
     )
     assert calculated["result"] == "300"
 

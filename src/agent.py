@@ -204,7 +204,7 @@ class Agent:
         trace: List[str] = []
         text = str(initial_text or "").strip()
         tool_calls = 0
-        successful_calls = 0
+        allowed_calls = 0
         required_retries = 0
 
         while True:
@@ -212,7 +212,7 @@ class Agent:
             if parsed is None:
                 if "<tool_call>" in text:
                     stats.invalid_tool_calls += 1
-                if self.require_tool_call and successful_calls == 0 and required_retries < 4:
+                if self.require_tool_call and allowed_calls == 0 and required_retries < 4:
                     required_retries += 1
                     stats.forced_tool_reprompts += 1
                     working_messages.extend(
@@ -234,9 +234,9 @@ class Agent:
                     )[0]
                     stats.model_responses += 1
                     continue
-                if self.require_tool_call and successful_calls == 0:
+                if self.require_tool_call and allowed_calls == 0:
                     stats.required_tool_misses += 1
-                stats.tool_used_candidates += int(successful_calls > 0)
+                stats.tool_used_candidates += int(allowed_calls > 0)
                 return self._serialize_tool_run(trace, text), stats
 
             name, arguments, residual = parsed
@@ -252,10 +252,10 @@ class Agent:
             try:
                 if tool is None:
                     raise ValueError(f"Tool {name!r} is not allowed for this agent.")
+                allowed_calls += 1
+                stats.tool_names[name] = stats.tool_names.get(name, 0) + 1
                 result = tool.invoke(arguments)
                 stats.successful_tool_calls += 1
-                successful_calls += 1
-                stats.tool_names[name] = stats.tool_names.get(name, 0) + 1
             except Exception as exc:
                 result = json.dumps({"error": str(exc)}, ensure_ascii=False)
                 stats.tool_errors += 1
@@ -279,7 +279,7 @@ class Agent:
             )
 
             if tool_calls >= self.max_tool_calls:
-                if self.require_tool_call and successful_calls == 0:
+                if self.require_tool_call and allowed_calls == 0:
                     stats.required_tool_misses += 1
                     stats.tool_used_candidates += 0
                     return self._serialize_tool_run(trace, text), stats
