@@ -21,10 +21,27 @@ def test_verify_arithmetic_compares_computed_and_claimed_values():
     )
     assert result == {
         "expression": "12 * 8",
+        "normalized_expression": "12 * 8",
         "computed": "96",
         "claimed_value": "96",
         "matches": True,
     }
+
+
+def test_tools_normalize_currency_unicode_and_an_equation():
+    calculated = json.loads(
+        TOOL_REGISTRY["calculate"].invoke({"expression": "$1,200 ÷ 4"})
+    )
+    assert calculated["result"] == "300"
+
+    verified = json.loads(
+        TOOL_REGISTRY["verify_arithmetic"].invoke(
+            {"expression": "1/4 + 1/2 = 3/4", "claimed_value": "0.75"}
+        )
+    )
+    assert verified["computed"] == "0.75"
+    assert verified["equation_consistent"] is True
+    assert verified["matches"] is True
 
 
 @pytest.mark.parametrize(

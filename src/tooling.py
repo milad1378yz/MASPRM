@@ -99,15 +99,39 @@ def _parse_claimed_number(value: Any) -> Fraction:
     return evaluate_arithmetic(text)
 
 
+def _evaluate_tool_expression(expression: str) -> tuple[str, Fraction, List[Fraction]]:
+    """Tolerate harmless calculator notation while keeping the AST evaluator strict."""
+    normalized = (
+        expression.strip()
+        .replace("$", "")
+        .replace(",", "")
+        .replace("×", "*")
+        .replace("÷", "/")
+        .replace("−", "-")
+    )
+    if "==" in normalized or "!=" in normalized or "<=" in normalized or ">=" in normalized:
+        raise ToolExecutionError("Only a single arithmetic expression or equation is allowed.")
+    parts = [part.strip() for part in normalized.split("=")]
+    if not parts or any(not part for part in parts):
+        raise ToolExecutionError("Expression is not valid arithmetic.")
+    values = [evaluate_arithmetic(part) for part in parts]
+    return normalized, values[0], values
+
+
 def _calculate(arguments: Mapping[str, Any]) -> str:
     expression = arguments.get("expression")
     if not isinstance(expression, str):
         raise ToolExecutionError("'expression' must be a string.")
-    result = evaluate_arithmetic(expression)
-    return json.dumps(
-        {"expression": expression, "result": _format_fraction(result)},
-        ensure_ascii=False,
-    )
+    normalized, result, equation_values = _evaluate_tool_expression(expression)
+    payload: Dict[str, Any] = {
+        "expression": expression,
+        "normalized_expression": normalized,
+        "result": _format_fraction(result),
+    }
+    if len(equation_values) > 1:
+        payload["equation_values"] = [_format_fraction(value) for value in equation_values]
+        payload["equation_consistent"] = len(set(equation_values)) == 1
+    return json.dumps(payload, ensure_ascii=False)
 
 
 def _verify_arithmetic(arguments: Mapping[str, Any]) -> str:
@@ -117,17 +141,19 @@ def _verify_arithmetic(arguments: Mapping[str, Any]) -> str:
     if "claimed_value" not in arguments:
         raise ToolExecutionError("'claimed_value' is required.")
 
-    computed = evaluate_arithmetic(expression)
+    normalized, computed, equation_values = _evaluate_tool_expression(expression)
     claimed = _parse_claimed_number(arguments["claimed_value"])
-    return json.dumps(
-        {
-            "expression": expression,
-            "computed": _format_fraction(computed),
-            "claimed_value": _format_fraction(claimed),
-            "matches": computed == claimed,
-        },
-        ensure_ascii=False,
-    )
+    payload: Dict[str, Any] = {
+        "expression": expression,
+        "normalized_expression": normalized,
+        "computed": _format_fraction(computed),
+        "claimed_value": _format_fraction(claimed),
+        "matches": computed == claimed,
+    }
+    if len(equation_values) > 1:
+        payload["equation_values"] = [_format_fraction(value) for value in equation_values]
+        payload["equation_consistent"] = len(set(equation_values)) == 1
+    return json.dumps(payload, ensure_ascii=False)
 
 
 @dataclass(frozen=True)
