@@ -101,7 +101,8 @@ def extract_pred_number(text: str):
     if "TERMINAL_LOG:" in text:
         text = text.rsplit("TERMINAL_LOG:", 1)[-1]
     m = re.findall(
-        r"answer\s*:\s*([-\$]?\s*\d[\d,]*(?:\.\d+)?(?:\s+\w+)?)",
+        r"(?:answer|recommended|candidate)\*{0,2}\s*:\*{0,2}\s*"
+        r"([-\$]?\s*\d[\d,]*(?:\.\d+)?)",
         text,
         flags=re.I,
     )
@@ -146,6 +147,12 @@ def is_correct(pred, truth) -> bool:
             return False
         if "TERMINAL_LOG:" in pred:
             pred = pred.rsplit("TERMINAL_LOG:", 1)[-1].split("TOOL_STATUS:", 1)[0]
+
+    # Numeric datasets must be decided by the stated final number. Falling through
+    # to text normalization can accidentally match an earlier number in the work.
+    truth_number = _to_number(str(truth))
+    if truth_number is not None:
+        return eq(extract_pred_number(pred), truth_number)
 
     # First: try numeric comparison (gsm8k, competition_math, etc.).
     # Both arguments as strings, since numbers_equal expects text.
