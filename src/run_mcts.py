@@ -249,6 +249,15 @@ def main():
     ap.add_argument("--no_compile", action="store_true", help="Disable torch.compile().")
 
     ap.add_argument("--n_rollouts", type=int, default=64)
+    ap.add_argument(
+        "--search_c",
+        type=float,
+        default=None,
+        help="MCTS exploration constant. Defaults to 8 with Ray and 4 otherwise.",
+    )
+    ap.add_argument("--n_candidates", type=int, default=4)
+    ap.add_argument("--temperature", type=float, default=0.7)
+    ap.add_argument("--top_p", type=float, default=0.95)
 
     ap.add_argument(
         "--mas_config",
@@ -273,6 +282,16 @@ def main():
     )
 
     args = ap.parse_args()
+    if args.n_rollouts < 1:
+        ap.error("--n_rollouts must be at least 1")
+    if args.n_candidates < 1:
+        ap.error("--n_candidates must be at least 1")
+    if args.search_c is not None and args.search_c < 0:
+        ap.error("--search_c cannot be negative")
+    if args.temperature <= 0:
+        ap.error("--temperature must be greater than zero")
+    if not 0 < args.top_p <= 1:
+        ap.error("--top_p must be in the interval (0, 1]")
 
     # Load dataset
     data, q_fn, gold_fn = load_hard_dataset(args.dataset, args.split, args.n, args.seed)
@@ -285,12 +304,9 @@ def main():
     agent_specs = cfg["agents"]
     edges = cfg["edges"]
 
-    if args.ray:
-        search_c = 8.0
-    else:
-        search_c = 4.0
-    search_n_candidates = 4
-    search_gen_kwargs = dict(temperature=0.7, top_p=0.95)
+    search_c = args.search_c if args.search_c is not None else (8.0 if args.ray else 4.0)
+    search_n_candidates = args.n_candidates
+    search_gen_kwargs = dict(temperature=args.temperature, top_p=args.top_p)
     result_path = _result_path(
         args.dataset,
         args.split,
