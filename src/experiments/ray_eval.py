@@ -611,7 +611,7 @@ def evaluate_conditions_ray(
                     return_trace=True,
                 )
                 candidates = finals[:pass_k] if finals else [pred]
-                tool_traces = [
+                agent_traces = [
                     {
                         "agent_idx": int(step["agent_idx"]),
                         "agent_name": mas0.agents[int(step["agent_idx"])].name,
@@ -619,7 +619,21 @@ def evaluate_conditions_ray(
                     }
                     for step in trace
                     if step.get("chosen_text")
-                    and mas0.agents[int(step["agent_idx"])].python_tool is not None
+                ]
+                tool_traces = [
+                    step
+                    for step in agent_traces
+                    if mas0.agents[step["agent_idx"]].python_tool is not None
+                ]
+                agent_stats = [
+                    {
+                        "agent_idx": idx,
+                        "agent_name": agent.name,
+                        "model_responses": agent.last_tool_stats.model_responses,
+                        "max_prompt_tokens": agent.last_tool_stats.max_prompt_tokens,
+                        "truncated_responses": agent.last_tool_stats.truncated_responses,
+                    }
+                    for idx, agent in enumerate(mas0.agents)
                 ]
                 return (
                     pred,
@@ -627,7 +641,12 @@ def evaluate_conditions_ray(
                     usage.generated,
                     usage.prm_calls,
                     usage.agent_runs,
-                    {"tool_usage": usage.tool_usage(), "tool_traces": tool_traces},
+                    {
+                        "tool_usage": usage.tool_usage(),
+                        "agent_traces": agent_traces,
+                        "tool_traces": tool_traces,
+                        "agent_stats": agent_stats,
+                    },
                 )
 
             if kind == "sbs_prm":

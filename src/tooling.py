@@ -1,17 +1,19 @@
 import re
 from dataclasses import dataclass
+from threading import Lock
 from typing import Iterable, List
 
 from pydantic_monty import CollectString, Monty
 
 _CODE_BLOCK_RE = re.compile(
-    r"\A```(?:python|py)?[ \t]*\r?\n(?P<code>.*?)(?:\r?\n)?```[ \t]*\Z",
+    r"```(?:python|py)?[ \t]*\r?\n(?P<code>.*?)(?:\r?\n)?```",
     re.DOTALL | re.IGNORECASE,
 )
 _MAX_CODE_LENGTH = 4096
 _MAX_LOG_BYTES = 2000
 _MAX_MEMORY_BYTES = 64 * 1024 * 1024
 _TIMEOUT_SECONDS = 2
+_EXECUTION_LOCK = Lock()
 
 
 @dataclass(frozen=True)
@@ -27,9 +29,10 @@ class ToolSpec:
 
     def invoke(self, code: str) -> PythonExecution:
         code = str(code or "").strip()
-        match = _CODE_BLOCK_RE.fullmatch(code)
+        match = _CODE_BLOCK_RE.search(code)
         if match is not None:
             code = match.group("code").strip()
+        code = code.replace("\\_", "_")
         if not code or len(code) > _MAX_CODE_LENGTH:
             return PythonExecution(
                 code=code,
@@ -39,14 +42,15 @@ class ToolSpec:
 
         terminal = CollectString(max_bytes=_MAX_LOG_BYTES)
         try:
-            with Monty(request_timeout=_TIMEOUT_SECONDS + 1) as pool:
-                with pool.checkout(
-                    limits={
-                        "max_duration_secs": _TIMEOUT_SECONDS,
-                        "max_memory": _MAX_MEMORY_BYTES,
-                    }
-                ) as session:
-                    session.feed_run(code, print_callback=terminal)
+            with _EXECUTION_LOCK:
+                with Monty(request_timeout=_TIMEOUT_SECONDS + 1) as pool:
+                    with pool.checkout(
+                        limits={
+                            "max_duration_secs": _TIMEOUT_SECONDS,
+                            "max_memory": _MAX_MEMORY_BYTES,
+                        }
+                    ) as session:
+                        result = session.feed_run(code, print_callback=terminal)
         except Exception as exc:
             display = getattr(exc, "display", None)
             error = str(display() if callable(display) else exc)
@@ -56,9 +60,11 @@ class ToolSpec:
                 succeeded=False,
             )
 
-        logs = (
-            terminal.output or "Python exited successfully with no terminal output.\n"
-        )
+        logs = terminal.output
+        if result is not None:
+            logs += f"{result}\n"
+        if not logs:
+            logs = "Python exited successfully with no terminal output.\n"
         return PythonExecution(code=code, logs=logs, succeeded=True)
 
 

@@ -147,17 +147,42 @@ class Agent:
         outputs: List[str] = []
         stats.tool_enabled_candidates = len(texts)
         for text in texts:
-            execution = self.python_tool.invoke(text)
-            stats.tool_calls += 1
-            stats.tool_names["python"] = stats.tool_names.get("python", 0) + 1
-            stats.successful_tool_calls += int(execution.succeeded)
-            stats.tool_used_candidates += int(execution.succeeded)
-            stats.tool_errors += int(not execution.succeeded)
-            stats.required_tool_misses += int(not execution.succeeded)
-            outputs.append(
-                f"PYTHON_CODE:\n{execution.code}\n"
-                f"TERMINAL_LOG:\n{execution.logs.rstrip()}"
-            )
+            trace: List[str] = []
+            for attempt in range(2):
+                execution = self.python_tool.invoke(text)
+                stats.tool_calls += 1
+                stats.tool_names["python"] = stats.tool_names.get("python", 0) + 1
+                trace.append(
+                    f"PYTHON_CODE:\n{execution.code}\n"
+                    f"TERMINAL_LOG:\n{execution.logs.rstrip()}"
+                )
+                if execution.succeeded:
+                    stats.successful_tool_calls += 1
+                    stats.tool_used_candidates += 1
+                    break
+
+                stats.tool_errors += 1
+                if attempt == 0:
+                    stats.forced_tool_reprompts += 1
+                    retry_messages = [
+                        *msgs,
+                        {"role": "assistant", "content": text},
+                        {
+                            "role": "user",
+                            "content": (
+                                f"TERMINAL_LOG:\n{execution.logs.rstrip()}\n"
+                                "Return corrected raw Python only."
+                            ),
+                        },
+                    ]
+                    text = self._generate_model_n(retry_messages, 1, **gen_kwargs)[0]
+                    stats.record_generation(
+                        self._last_generation_prompt_tokens,
+                        self._last_generation_truncated,
+                    )
+            if not execution.succeeded:
+                stats.required_tool_misses += 1
+            outputs.append("\n".join(trace))
         self.last_tool_stats = stats
         return outputs
 
