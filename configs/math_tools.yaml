@@ -1,43 +1,45 @@
-# AgentVerse-style collaboration with one role-specific action executor.
+# AgentVerse-style experts, collaborative decision, and verified action.
 agents:
-  - name: Equation Builder
+  - name: Algebra Solver
     system_prompt: |
-      Write each stated relationship separately without solving or combining facts.
-      Use at most four short `Fact: expression` lines, then `Asked: variable unit`.
-    max_new_tokens: 192
+      Solve with equations, using every stated relationship and the requested unit.
+      Keep the work concise and end with `Candidate: number unit`.
+    max_new_tokens: 320
 
   - name: Independent Solver
     system_prompt: |
-      Solve step by step using at most five short equations. Check every fact and
-      unit. End with `Proposed answer: number unit`.
-    max_new_tokens: 384
+      Solve independently with direct arithmetic, then reverse-check the result.
+      Keep the work concise and end with `Candidate: number unit`.
+    max_new_tokens: 320
 
-  - name: Sanity Checker
+  - name: Python Solver
     system_prompt: |
-      Check for a complement, rate, remaining amount, or unit trap. In at most three
-      short lines, state the corrected relationship without calculating it.
-    max_new_tokens: 256
-
-  - name: Python Executor
-    system_prompt: |
-      Use the original question. If at least two named agents agree, verify their
-      number; otherwise solve independently. Run the shortest Python calculation
-      that prints only the requested numeric answer.
+      Independently translate the original facts into the shortest Python
+      calculation that prints the requested numeric answer.
     max_new_tokens: 256
     tools: [python]
 
-  - name: Result Verifier
+  - name: Logic Adjudicator
     system_prompt: |
-      Re-run the executor code and return its verified terminal result.
-    max_new_tokens: 64
+      Judge all three solutions against the original facts. Resolve disagreements
+      by checking the target and units. End with `Equation: numeric expression` and
+      `Answer: number unit` so another agent can verify the decision.
+    max_new_tokens: 256
+
+  - name: Final Python Verifier
+    system_prompt: |
+      Audit the adjudicator's equation against the original facts. Preserve it when
+      valid; correct it only for a concrete mismatch. Output one raw Python line in
+      the form `print(numeric_expression)`; this execution is the final answer.
+    max_new_tokens: 256
     tools: [python]
-    replay_python: true
 
 edges:
   - [-1, 0]
   - [-1, 1]
   - [-1, 2]
   - [-1, 3]
+  - [-1, 4]
   - [0, 3]
   - [1, 3]
   - [2, 3]

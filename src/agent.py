@@ -46,7 +46,6 @@ class Agent:
         top_p: float = 0.95,
         name: Optional[str] = None,
         tools: Optional[Sequence[ToolSpec]] = None,
-        replay_python: bool = False,
     ):
         self.model = model
         self.tok = tok
@@ -56,12 +55,9 @@ class Agent:
         self.temperature = temperature
         self.top_p = top_p
         self.tools = list(tools or [])
-        self.replay_python = bool(replay_python)
         if len(self.tools) > 1 or (self.tools and self.tools[0].name != "python"):
             raise ValueError("An agent may use only the single 'python' tool.")
         self.python_tool = self.tools[0] if self.tools else None
-        if self.replay_python and self.python_tool is None:
-            raise ValueError("replay_python requires the 'python' tool.")
         self.last_tool_stats = ToolGenerationStats()
         self._last_generation_prompt_tokens = 0
         self._last_generation_truncated: List[bool] = []
@@ -70,8 +66,9 @@ class Agent:
         system_prompt = self.system_prompt.rstrip()
         if self.python_tool is not None:
             system_prompt += (
-                "\nReturn only executable Python source without Markdown fences. "
-                "Print the requested answer; printed output becomes the terminal log."
+                "\nReturn concise executable Python without Markdown fences or prose; "
+                "prefer one `print(numeric_expression)` line. Printed output becomes "
+                "the terminal log."
             )
         return [
             {"role": "system", "content": system_prompt},
@@ -139,33 +136,6 @@ class Agent:
         return [text.strip() for text in texts]
 
     def _generate_local_n(self, msgs, n: int, **gen_kwargs):
-        if self.replay_python:
-            source = str(msgs[-1].get("content", ""))
-            code = source.rsplit("PYTHON_CODE:\n", 1)[-1]
-            code = code.split("\nTERMINAL_LOG:", 1)[0].strip()
-            outputs = []
-            stats = ToolGenerationStats(tool_enabled_candidates=n)
-            for _ in range(n):
-                execution = self.python_tool.invoke(code)
-                stats.tool_calls += 1
-                stats.tool_names["python"] = stats.tool_names.get("python", 0) + 1
-                if execution.succeeded:
-                    stats.successful_tool_calls += 1
-                    stats.tool_used_candidates += 1
-                else:
-                    stats.tool_errors += 1
-                    stats.required_tool_misses += 1
-                trace = (
-                    f"PYTHON_CODE:\n{execution.code}\n"
-                    f"TERMINAL_LOG:\n{execution.logs.rstrip()}\n"
-                    f"TOOL_STATUS: {'success' if execution.succeeded else 'error'}"
-                )
-                if execution.succeeded:
-                    trace += f"\nFinal Answer: {execution.logs.rstrip().splitlines()[-1]}"
-                outputs.append(trace)
-            self.last_tool_stats = stats
-            return outputs
-
         texts = self._generate_model_n(msgs, n, **gen_kwargs)
         stats = ToolGenerationStats().record_generation(
             self._last_generation_prompt_tokens,

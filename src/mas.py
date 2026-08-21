@@ -474,7 +474,6 @@ def build_mas_from_specs(
       - system_prompt (str)
       - max_new_tokens (int, default 512)
       - tools (empty or ["python"])
-      - replay_python (bool, default False)
     """
     agents = []
     for spec in agent_specs:
@@ -486,7 +485,6 @@ def build_mas_from_specs(
                 system_prompt=spec.get("system_prompt", ""),
                 max_new_tokens=int(spec.get("max_new_tokens", 512)),
                 tools=resolve_tools(spec.get("tools", [])),
-                replay_python=bool(spec.get("replay_python", False)),
             )
         )
     return MAS(edges, agents)
