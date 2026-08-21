@@ -115,9 +115,9 @@ class Agent:
         system_prompt = self.system_prompt
         if self.python_tool is not None:
             system_prompt = (
-                f"{system_prompt.rstrip()}\nState one brief equation plan, then give one "
-                "short ```python code block with no imports. End with the final numeric "
-                "expression or print it."
+                f"{system_prompt.rstrip()}\nFor calculation, return only one short "
+                "```python code block with no imports. End with the final numeric expression "
+                "or print it."
             )
         elif self.tools:
             tool_names = ", ".join(tool.name for tool in self.tools)
