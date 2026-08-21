@@ -173,7 +173,6 @@ def _run_numeric_python(arguments: Mapping[str, Any]) -> str:
     code = code.strip()
     if not code or len(code) > 1024:
         raise ToolExecutionError("Code must contain between 1 and 1024 characters.")
-
     executor = LocalPythonExecutor(
         additional_authorized_imports=[],
         max_print_outputs_length=2000,
