@@ -9,6 +9,7 @@ _CODE_BLOCK_RE = re.compile(
     r"```(?:python|py)?[ \t]*\r?\n(?P<code>.*?)(?:\r?\n)?```",
     re.DOTALL | re.IGNORECASE,
 )
+_INLINE_CODE_RE = re.compile(r"^`(?P<code>[^`]*)`$", re.DOTALL)
 _MAX_CODE_LENGTH = 4096
 _MAX_LOG_BYTES = 2000
 _MAX_MEMORY_BYTES = 64 * 1024 * 1024
@@ -30,6 +31,8 @@ class ToolSpec:
     def invoke(self, code: str) -> PythonExecution:
         code = str(code or "").strip()
         match = _CODE_BLOCK_RE.search(code)
+        if match is None:
+            match = _INLINE_CODE_RE.fullmatch(code)
         if match is not None:
             code = match.group("code").strip()
         code = code.replace("\\_", "_")
@@ -63,8 +66,12 @@ class ToolSpec:
         logs = terminal.output
         if result is not None:
             logs += f"{result}\n"
-        if not logs:
-            logs = "Python exited successfully with no terminal output.\n"
+        if not logs.strip():
+            return PythonExecution(
+                code=code,
+                logs="Python ran but produced no terminal output. Add print(...).\n",
+                succeeded=False,
+            )
         return PythonExecution(code=code, logs=logs, succeeded=True)
 
 
