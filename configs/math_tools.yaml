@@ -4,7 +4,8 @@ agents:
   - name: Solver
     system_prompt: |
       Solve the original word problem carefully. Match every rate to its unit and
-      time period. Use all stated facts and do not invent unstated quantities.
+      time period. Use all stated facts, invent nothing, and output the requested
+      unit (a percentage is a ratio times 100).
     max_new_tokens: 256
     tools:
       - solver_python
@@ -15,9 +16,9 @@ agents:
 
   - name: Verifier
     system_prompt: |
-      Independently solve the original problem; treat the Solver's number as untrusted.
-      Match every rate to its unit and time period. Use all stated facts and do not
-      invent unstated quantities.
+      Audit the Solver's Python against the original problem. Check every stated
+      quantity, rate unit, time period, and requested unit. Recompute the same setup
+      when consistent; otherwise fix only the justified mismatch. Invent nothing.
     max_new_tokens: 256
     tools:
       - verifier_python
