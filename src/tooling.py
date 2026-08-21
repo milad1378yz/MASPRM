@@ -51,7 +51,7 @@ def _eval_arithmetic_node(node: ast.AST) -> Fraction:
                 raise ToolExecutionError(
                     "Exponents must be integers with absolute value at most 100."
                 )
-            result = left ** right.numerator
+            result = left**right.numerator
         else:
             raise ToolExecutionError("Unsupported arithmetic operator.")
     except ZeroDivisionError as exc:

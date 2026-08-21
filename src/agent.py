@@ -8,7 +8,6 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from tooling import ToolSpec
 
-
 _TOOL_CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
 
 
@@ -147,9 +146,7 @@ class Agent:
     ) -> List[str]:
         params = self._generation_kwargs(**gen_kwargs)
         inputs = self._to_inputs(msgs, tools=tools)
-        inputs = {
-            k: v.to(self.model.device, non_blocking=True) for k, v in inputs.items()
-        }
+        inputs = {k: v.to(self.model.device, non_blocking=True) for k, v in inputs.items()}
 
         out = self.model.generate(
             **inputs,
@@ -165,9 +162,7 @@ class Agent:
         texts = self.tok.batch_decode(out[:, prompt_len:], skip_special_tokens=True)
         return [text.strip() for text in texts]
 
-    def _parse_tool_call(
-        self, text: str
-    ) -> Optional[Tuple[str, Dict[str, Any], str]]:
+    def _parse_tool_call(self, text: str) -> Optional[Tuple[str, Dict[str, Any], str]]:
         match = _TOOL_CALL_RE.search(str(text or ""))
         if match is None:
             return None
@@ -289,16 +284,12 @@ class Agent:
                         ),
                     }
                 )
-                text = self._generate_model_n(
-                    working_messages, n=1, tools=None, **gen_kwargs
-                )[0]
+                text = self._generate_model_n(working_messages, n=1, tools=None, **gen_kwargs)[0]
                 stats.model_responses += 1
                 stats.tool_used_candidates += 1
                 return self._serialize_tool_run(trace, text), stats
 
-            text = self._generate_model_n(
-                working_messages, n=1, tools=schemas, **gen_kwargs
-            )[0]
+            text = self._generate_model_n(working_messages, n=1, tools=schemas, **gen_kwargs)[0]
             stats.model_responses += 1
 
     def _generate_local_n(self, msgs, n: int, **gen_kwargs):

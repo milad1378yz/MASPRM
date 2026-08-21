@@ -15,6 +15,7 @@ from typing import (
 
 from agent import Agent
 from langgraph.graph import START, StateGraph
+from tooling import resolve_tools
 
 Predicate = Callable[[str], bool]
 
@@ -460,6 +461,10 @@ def build_mas_from_specs(
     Each agent spec supports:
       - system_prompt (str)
       - max_new_tokens (int, default 512)
+      - tools (list[str], default empty)
+      - max_tool_calls (int, default 4)
+      - require_tool_call (bool, default false)
+      - expose_tool_trace (bool, default true)
     """
     agents = []
     for spec in agent_specs:
@@ -470,6 +475,10 @@ def build_mas_from_specs(
                 name=spec.get("name"),
                 system_prompt=spec.get("system_prompt", ""),
                 max_new_tokens=int(spec.get("max_new_tokens", 512)),
+                tools=resolve_tools(spec.get("tools", [])),
+                max_tool_calls=int(spec.get("max_tool_calls", 4)),
+                require_tool_call=bool(spec.get("require_tool_call", False)),
+                expose_tool_trace=bool(spec.get("expose_tool_trace", True)),
             )
         )
     return MAS(edges, agents)

@@ -1,5 +1,5 @@
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Callable, Dict, List, Sequence, Tuple, Any
 import json
 import os
@@ -53,6 +53,16 @@ class TokenStats:
     scorer: int = 0  # tokens processed by scoring models (PRM/logprob/ORM)
     prm_calls: int = 0  # how many times PRM was called
     agent_runs: int = 0  # how many times we ran a single agent (one step decode)
+    tool_enabled_candidates: int = 0
+    tool_used_candidates: int = 0
+    tool_model_responses: int = 0
+    tool_calls: int = 0
+    successful_tool_calls: int = 0
+    tool_errors: int = 0
+    invalid_tool_calls: int = 0
+    required_tool_misses: int = 0
+    forced_tool_reprompts: int = 0
+    tool_names: Dict[str, int] = field(default_factory=dict)
 
     def add(self, other: "TokenStats") -> "TokenStats":
         self.prompt += other.prompt
@@ -60,7 +70,48 @@ class TokenStats:
         self.scorer += other.scorer
         self.prm_calls += other.prm_calls
         self.agent_runs += other.agent_runs
+        self.tool_enabled_candidates += other.tool_enabled_candidates
+        self.tool_used_candidates += other.tool_used_candidates
+        self.tool_model_responses += other.tool_model_responses
+        self.tool_calls += other.tool_calls
+        self.successful_tool_calls += other.successful_tool_calls
+        self.tool_errors += other.tool_errors
+        self.invalid_tool_calls += other.invalid_tool_calls
+        self.required_tool_misses += other.required_tool_misses
+        self.forced_tool_reprompts += other.forced_tool_reprompts
+        for name, count in other.tool_names.items():
+            self.tool_names[name] = self.tool_names.get(name, 0) + int(count)
         return self
+
+    def add_tool_stats(self, stats: Any) -> "TokenStats":
+        if stats is None:
+            return self
+        self.tool_enabled_candidates += int(stats.tool_enabled_candidates)
+        self.tool_used_candidates += int(stats.tool_used_candidates)
+        self.tool_model_responses += int(stats.model_responses)
+        self.tool_calls += int(stats.tool_calls)
+        self.successful_tool_calls += int(stats.successful_tool_calls)
+        self.tool_errors += int(stats.tool_errors)
+        self.invalid_tool_calls += int(stats.invalid_tool_calls)
+        self.required_tool_misses += int(stats.required_tool_misses)
+        self.forced_tool_reprompts += int(stats.forced_tool_reprompts)
+        for name, count in stats.tool_names.items():
+            self.tool_names[name] = self.tool_names.get(name, 0) + int(count)
+        return self
+
+    def tool_usage(self) -> Dict[str, Any]:
+        return {
+            "tool_enabled_candidates": self.tool_enabled_candidates,
+            "tool_used_candidates": self.tool_used_candidates,
+            "model_responses": self.tool_model_responses,
+            "tool_calls": self.tool_calls,
+            "successful_tool_calls": self.successful_tool_calls,
+            "tool_errors": self.tool_errors,
+            "invalid_tool_calls": self.invalid_tool_calls,
+            "required_tool_misses": self.required_tool_misses,
+            "forced_tool_reprompts": self.forced_tool_reprompts,
+            "tool_names": dict(sorted(self.tool_names.items())),
+        }
 
 
 # ======================
@@ -371,6 +422,9 @@ def sbs_decode2(
             # Generate candidates
             cands = mas.sample_candidates(agent_idx, inbox, n_candidates=B2, **gen_kwargs)
             usage.agent_runs += B2
+            agent = mas.agents[agent_idx]
+            if getattr(agent, "tools", None):
+                usage.add_tool_stats(getattr(agent, "last_tool_stats", None))
 
             # Account policy tokens (prompt + generated)
             usage.prompt += p_len

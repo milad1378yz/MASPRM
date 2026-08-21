@@ -65,9 +65,7 @@ def load_hard_dataset(
 
         if levels:
             allowed_levels = {int(level) for level in levels}
-            data = data.filter(
-                lambda ex: _math_level_key(ex.get("level")) in allowed_levels
-            )
+            data = data.filter(lambda ex: _math_level_key(ex.get("level")) in allowed_levels)
         if require_parseable_gold:
             data = data.filter(lambda ex: gold_competition_math(ex) is not None)
         if stratify_by:
@@ -88,6 +86,14 @@ def load_hard_dataset(
         ds = load_dataset("gsm8k", "main")
         data = ds[split].shuffle(seed=seed).select(range(n)) if n else ds[split]
         gold_fn = lambda ex: gold_from_gsm8k(ex["answer"])
+        q_fn = lambda ex: ex["question"]
+
+    elif name == "mgsm":
+        ds = load_dataset("juletxara/mgsm", "en")
+        if split not in ds:
+            raise ValueError(f"Unknown split for mgsm: {split}")
+        data = ds[split].shuffle(seed=seed).select(range(n)) if n else ds[split]
+        gold_fn = lambda ex: _to_number(str(ex["answer_number"]))
         q_fn = lambda ex: ex["question"]
 
     elif name == "svamp":
@@ -160,7 +166,8 @@ def load_hard_dataset(
 
     else:
         raise ValueError(
-            "Unsupported dataset. Choose from: competition_math, aqua_rat, svamp, gsm8k, mmlu, gpqa, logiqa"
+            "Unsupported dataset. Choose from: competition_math, aqua_rat, svamp, "
+            "gsm8k, mgsm, mmlu, gpqa, logiqa"
         )
 
     if name != "competition_math" and (levels or stratify_by or require_parseable_gold):
