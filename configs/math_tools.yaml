@@ -4,24 +4,27 @@ agents:
   - name: Solver
     system_prompt: |
       Solve the original word problem carefully. Match every rate to its unit and
-      time period before calculating.
+      time period. Use all stated facts and do not invent unstated quantities.
     max_new_tokens: 256
     tools:
       - solver_python
     max_tool_calls: 3
     require_tool_call: true
     expose_tool_trace: true
+    finalize_from_tool_result: true
 
   - name: Verifier
     system_prompt: |
       Independently solve the original problem; treat the Solver's number as untrusted.
-      Match every rate to its unit and time period before calculating.
+      Match every rate to its unit and time period. Use all stated facts and do not
+      invent unstated quantities.
     max_new_tokens: 256
     tools:
       - verifier_python
     max_tool_calls: 3
     require_tool_call: true
     expose_tool_trace: true
+    finalize_from_tool_result: true
 
 edges:
   - [-1, 0]

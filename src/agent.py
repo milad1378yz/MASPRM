@@ -117,7 +117,7 @@ class Agent:
             system_prompt = (
                 f"{system_prompt.rstrip()}\nFor calculation, return only one short "
                 "```python code block with no imports. End with the final numeric expression "
-                "or print it. After Execution logs, reply exactly: Final Answer: <log number>."
+                "or print it."
             )
         elif self.tools:
             tool_names = ", ".join(tool.name for tool in self.tools)
