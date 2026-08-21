@@ -6,7 +6,7 @@ import random
 from answer_utils import _to_number
 
 
-_SOFT_NEWLINE_CODEPOINTS = dict.fromkeys((0x000B, 0x000C, 0x000D, 0x0085, 0x2028, 0x2029))
+_SOFT_NEWLINE_CODEPOINTS = dict.fromkeys((11, 12, 13, 0x85, 0x2028, 0x2029))
 
 
 def _remove_soft_newlines(value):
