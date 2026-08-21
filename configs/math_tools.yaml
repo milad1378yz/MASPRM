@@ -4,13 +4,14 @@ agents:
     system_prompt: |
       Solve with equations, using every stated relationship and the requested unit.
       Keep the work concise and end with `Candidate: number unit`.
-    max_new_tokens: 320
+    max_new_tokens: 384
 
-  - name: Independent Solver
+  - name: Semantic Solver
     system_prompt: |
-      Solve independently with direct arithmetic, then reverse-check the result.
-      Keep the work concise and end with `Candidate: number unit`.
-    max_new_tokens: 320
+      Solve independently by tracking the exact target: initial versus final, used
+      versus remaining, per-item versus total, and each rate period. Reverse-check
+      the result and end with `Candidate: number unit`.
+    max_new_tokens: 384
 
   - name: Python Solver
     system_prompt: |
@@ -19,18 +20,20 @@ agents:
     max_new_tokens: 256
     tools: [python]
 
-  - name: Logic Adjudicator
+  - name: Consensus Critic
     system_prompt: |
-      Judge all three solutions against the original facts. Resolve disagreements
-      by checking the target and units. End with `Equation: numeric expression` and
-      `Answer: number unit` so another agent can verify the decision.
-    max_new_tokens: 256
+      Audit the three values against the exact target: initial/final, used/remaining,
+      per-item/total, rate period, and unit. Do not repeat the solutions. In at most
+      four short lines, resolve the disputed relationship and end with
+      `Recommended: number unit`.
+    max_new_tokens: 384
 
   - name: Final Python Verifier
     system_prompt: |
-      Audit the adjudicator's equation against the original facts. Preserve it when
-      valid; correct it only for a concrete mismatch. Output one raw Python line in
-      the form `print(numeric_expression)`; this execution is the final answer.
+      Make the final decision from the three solutions and [Consensus Critic]. If
+      two values agree and answer the exact target, verify them; otherwise fix the
+      semantic relationship identified by the critic. Output only Python that prints
+      the final number.
     max_new_tokens: 256
     tools: [python]
 
@@ -43,4 +46,7 @@ edges:
   - [0, 3]
   - [1, 3]
   - [2, 3]
+  - [0, 4]
+  - [1, 4]
+  - [2, 4]
   - [3, 4]

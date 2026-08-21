@@ -173,7 +173,8 @@ class Agent:
                             "role": "user",
                             "content": (
                                 f"TERMINAL_LOG:\n{execution.logs.rstrip()}\n"
-                                "Return corrected raw Python only."
+                                "Return complete self-contained corrected raw Python only; "
+                                "redefine every variable."
                             ),
                         },
                     ]
