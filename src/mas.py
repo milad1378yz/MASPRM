@@ -228,7 +228,19 @@ class MAS:
         return list(self.agent_input_map(idx, inbox).values())
 
     def agent_user_content(self, idx: int, inbox: Dict[int, Dict[int, str]]) -> str:
-        return "\n\n".join(self.agent_inputs(idx, inbox)).strip()
+        inputs = self.agent_input_map(idx, inbox)
+        if list(inputs) == [self.INPUT]:
+            return inputs[self.INPUT].strip()
+
+        sections = []
+        for parent_idx, message in inputs.items():
+            name = (
+                "Original Question"
+                if parent_idx == self.INPUT
+                else self.agents[parent_idx].name or f"Agent {parent_idx}"
+            )
+            sections.append(f"[{name}]\n{message}")
+        return "\n\n".join(sections).strip()
 
     def agent_messages(self, idx: int, inbox: Dict[int, Dict[int, str]]):
         agent = self.agents[idx]
@@ -462,6 +474,7 @@ def build_mas_from_specs(
       - system_prompt (str)
       - max_new_tokens (int, default 512)
       - tools (empty or ["python"])
+      - replay_python (bool, default False)
     """
     agents = []
     for spec in agent_specs:
@@ -473,6 +486,7 @@ def build_mas_from_specs(
                 system_prompt=spec.get("system_prompt", ""),
                 max_new_tokens=int(spec.get("max_new_tokens", 512)),
                 tools=resolve_tools(spec.get("tools", [])),
+                replay_python=bool(spec.get("replay_python", False)),
             )
         )
     return MAS(edges, agents)

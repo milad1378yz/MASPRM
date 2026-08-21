@@ -94,6 +94,12 @@ def _to_number(s):
 
 
 def extract_pred_number(text: str):
+    if "TOOL_STATUS:" in text:
+        status = text.rsplit("TOOL_STATUS:", 1)[-1].strip().splitlines()[0]
+        if status.lower() != "success":
+            return None
+    if "TERMINAL_LOG:" in text:
+        text = text.rsplit("TERMINAL_LOG:", 1)[-1]
     m = re.findall(
         r"answer\s*:\s*([-\$]?\s*\d[\d,]*(?:\.\d+)?(?:\s+\w+)?)",
         text,
@@ -133,6 +139,13 @@ def is_correct(pred, truth) -> bool:
     """
     if truth is None:
         return False
+    pred = str(pred)
+    if "TOOL_STATUS:" in pred:
+        status = pred.rsplit("TOOL_STATUS:", 1)[-1].strip().splitlines()[0]
+        if status.lower() != "success":
+            return False
+        if "TERMINAL_LOG:" in pred:
+            pred = pred.rsplit("TERMINAL_LOG:", 1)[-1].split("TOOL_STATUS:", 1)[0]
 
     # First: try numeric comparison (gsm8k, competition_math, etc.).
     # Both arguments as strings, since numbers_equal expects text.

@@ -2,9 +2,9 @@
 agents:
   - name: Equation Builder
     system_prompt: |
-      Translate the original problem without solving it. Reply in exactly two short
-      lines: `Equation: expression` and `Unit: unit`.
-    max_new_tokens: 128
+      Write each stated relationship separately without solving or combining facts.
+      Use at most four short `Fact: expression` lines, then `Asked: variable unit`.
+    max_new_tokens: 192
 
   - name: Independent Solver
     system_prompt: |
@@ -20,10 +20,18 @@ agents:
 
   - name: Python Executor
     system_prompt: |
-      Compare the three proposals with the original question. Execute the shortest
-      Python calculation that prints only the requested numeric answer.
+      Use the original question. If at least two named agents agree, verify their
+      number; otherwise solve independently. Run the shortest Python calculation
+      that prints only the requested numeric answer.
     max_new_tokens: 256
     tools: [python]
+
+  - name: Result Verifier
+    system_prompt: |
+      Re-run the executor code and return its verified terminal result.
+    max_new_tokens: 64
+    tools: [python]
+    replay_python: true
 
 edges:
   - [-1, 0]
@@ -33,3 +41,4 @@ edges:
   - [0, 3]
   - [1, 3]
   - [2, 3]
+  - [3, 4]
