@@ -261,7 +261,11 @@ class Agent:
         if isinstance(payload, dict) and "logs" in payload:
             logs = str(payload.get("logs") or "").rstrip()
             return f"Execution logs:\n{logs}"
-        error = payload.get("error", "Unknown execution error") if isinstance(payload, dict) else payload
+        error = (
+            payload.get("error", "Unknown execution error")
+            if isinstance(payload, dict)
+            else payload
+        )
         return f"Execution error:\n{str(error)[:2000]}"
 
     def _serialize_tool_run(self, trace: List[str], final_text: str) -> str:
