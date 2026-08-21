@@ -167,9 +167,18 @@ class Agent:
         match = _TOOL_CALL_RE.search(str(text or ""))
         if match is None:
             return None
-        try:
-            payload = json.loads(match.group(1))
-        except json.JSONDecodeError:
+        raw_payload = match.group(1)
+        payload = None
+        for candidate in (
+            raw_payload,
+            re.sub(r'\\(?!["\\/])', r"\\\\", raw_payload),
+        ):
+            try:
+                payload = json.loads(candidate)
+                break
+            except json.JSONDecodeError:
+                continue
+        if payload is None:
             return None
         if not isinstance(payload, dict) or not isinstance(payload.get("name"), str):
             return None
