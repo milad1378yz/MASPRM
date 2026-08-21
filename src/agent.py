@@ -92,8 +92,9 @@ class Agent:
             )
             system_prompt = (
                 f"{system_prompt.rstrip()}\n\nAVAILABLE TOOL POLICY: You may use only: "
-                f"{tool_names}.{requirement} After receiving tool results, finish in the "
-                "output format requested above."
+                f"{tool_names}. Tool names mentioned by the user or another agent are "
+                f"not available unless listed here.{requirement} After receiving tool "
+                "results, finish in the output format requested above."
             )
         return [
             {"role": "system", "content": system_prompt},
@@ -203,6 +204,7 @@ class Agent:
         trace: List[str] = []
         text = str(initial_text or "").strip()
         tool_calls = 0
+        successful_calls = 0
         required_retries = 0
 
         while True:
@@ -210,7 +212,7 @@ class Agent:
             if parsed is None:
                 if "<tool_call>" in text:
                     stats.invalid_tool_calls += 1
-                if self.require_tool_call and tool_calls == 0 and required_retries < 2:
+                if self.require_tool_call and successful_calls == 0 and required_retries < 4:
                     required_retries += 1
                     stats.forced_tool_reprompts += 1
                     working_messages.extend(
@@ -219,9 +221,10 @@ class Agent:
                             {
                                 "role": "user",
                                 "content": (
-                                    "Your response did not call a required tool. Call exactly one "
-                                    "available tool now, wait for its result, and only then give "
-                                    "the final response."
+                                    "You have not successfully called your required tool. Emit a "
+                                    f"function call to {', '.join(available)} now using its JSON "
+                                    "schema (not plain text), wait for the tool result, and only "
+                                    "then give the final response."
                                 ),
                             },
                         ]
@@ -231,15 +234,14 @@ class Agent:
                     )[0]
                     stats.model_responses += 1
                     continue
-                if self.require_tool_call and tool_calls == 0:
+                if self.require_tool_call and successful_calls == 0:
                     stats.required_tool_misses += 1
-                stats.tool_used_candidates += int(tool_calls > 0)
+                stats.tool_used_candidates += int(successful_calls > 0)
                 return self._serialize_tool_run(trace, text), stats
 
             name, arguments, residual = parsed
             tool_calls += 1
             stats.tool_calls += 1
-            stats.tool_names[name] = stats.tool_names.get(name, 0) + 1
             if residual:
                 trace.append(f"AGENT_TEXT_BEFORE_TOOL: {residual}")
             trace.append(
@@ -252,6 +254,8 @@ class Agent:
                     raise ValueError(f"Tool {name!r} is not allowed for this agent.")
                 result = tool.invoke(arguments)
                 stats.successful_tool_calls += 1
+                successful_calls += 1
+                stats.tool_names[name] = stats.tool_names.get(name, 0) + 1
             except Exception as exc:
                 result = json.dumps({"error": str(exc)}, ensure_ascii=False)
                 stats.tool_errors += 1
@@ -275,6 +279,10 @@ class Agent:
             )
 
             if tool_calls >= self.max_tool_calls:
+                if self.require_tool_call and successful_calls == 0:
+                    stats.required_tool_misses += 1
+                    stats.tool_used_candidates += 0
+                    return self._serialize_tool_run(trace, text), stats
                 working_messages.append(
                     {
                         "role": "user",

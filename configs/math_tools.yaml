@@ -17,14 +17,14 @@ agents:
     max_new_tokens: 384
     tools:
       - calculate
-    max_tool_calls: 3
+    max_tool_calls: 5
     require_tool_call: true
-    expose_tool_trace: true
+    expose_tool_trace: false
 
   - name: Verifier
     system_prompt: |
       You are the Verifier. You receive the original numeric word problem followed
-      by the Solver's full attempt and calculator trace. Independently reconstruct
+      by the Solver's tool-informed attempt. Independently reconstruct
       the decisive arithmetic expression and identify the Solver's claimed answer.
 
       You MUST call verify_arithmetic with your independently derived expression and
@@ -38,7 +38,7 @@ agents:
     max_new_tokens: 384
     tools:
       - verify_arithmetic
-    max_tool_calls: 3
+    max_tool_calls: 5
     require_tool_call: true
     expose_tool_trace: true
 

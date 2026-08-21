@@ -32,6 +32,7 @@ def test_required_tool_call_is_executed_and_exposed_in_trace():
     assert output.endswith("Final Answer: 391")
     assert agent.last_tool_stats.tool_used_candidates == 1
     assert agent.last_tool_stats.successful_tool_calls == 1
+    assert agent.last_tool_stats.tool_names == {"calculate": 1}
     assert agent.last_tool_stats.required_tool_misses == 0
 
 
@@ -49,6 +50,25 @@ def test_missing_required_call_is_reprompted_before_answering():
     assert agent.last_tool_stats.forced_tool_reprompts == 1
     assert agent.last_tool_stats.required_tool_misses == 0
     assert agent.last_tool_stats.tool_calls == 1
+
+
+def test_disallowed_tool_does_not_satisfy_the_requirement():
+    agent = ScriptedAgent(
+        [
+            '<tool_call>{"name":"verify_arithmetic","arguments":{"expression":"6 * 7","claimed_value":"42"}}</tool_call>',
+            "Final Answer: 42",
+            '<tool_call>{"name":"calculate","arguments":{"expression":"6 * 7"}}</tool_call>',
+            "Final Answer: 42",
+        ]
+    )
+
+    agent.generate(agent.format_messages("What is 6 times 7?"))
+
+    assert agent.last_tool_stats.tool_calls == 2
+    assert agent.last_tool_stats.successful_tool_calls == 1
+    assert agent.last_tool_stats.tool_errors == 1
+    assert agent.last_tool_stats.tool_names == {"calculate": 1}
+    assert agent.last_tool_stats.required_tool_misses == 0
 
 
 def test_config_assigns_a_different_tool_to_each_agent():
