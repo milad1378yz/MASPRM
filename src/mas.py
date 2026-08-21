@@ -461,11 +461,8 @@ def build_mas_from_specs(
     Each agent spec supports:
       - system_prompt (str)
       - max_new_tokens (int, default 512)
-      - tools (list[str], default empty)
-      - max_tool_calls (int, default 4)
-      - require_tool_call (bool, default false)
-      - expose_tool_trace (bool, default true)
-      - finalize_from_tool_result (bool, default false)
+      - tools (empty or ["python"])
+      - max_tool_calls (int, default 3)
     """
     agents = []
     for spec in agent_specs:
@@ -477,12 +474,7 @@ def build_mas_from_specs(
                 system_prompt=spec.get("system_prompt", ""),
                 max_new_tokens=int(spec.get("max_new_tokens", 512)),
                 tools=resolve_tools(spec.get("tools", [])),
-                max_tool_calls=int(spec.get("max_tool_calls", 4)),
-                require_tool_call=bool(spec.get("require_tool_call", False)),
-                expose_tool_trace=bool(spec.get("expose_tool_trace", True)),
-                finalize_from_tool_result=bool(
-                    spec.get("finalize_from_tool_result", False)
-                ),
+                max_tool_calls=int(spec.get("max_tool_calls", 3)),
             )
         )
     return MAS(edges, agents)

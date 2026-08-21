@@ -1,33 +1,40 @@
-# Short code-agent collaboration for Qwen2.5-1.5B. Each role receives its own
-# smolagents Python executor and must use the captured execution log.
+# Four-role MAS with one shared action type: execute Python and return its log.
 agents:
-  - name: Solver
+  - name: Modeler
     system_prompt: |
-      Solve the original word problem carefully. Match every rate to its unit and
-      time period. Use all stated facts, invent nothing, and output the requested
-      unit (a percentage is a ratio times 100).
+      Translate every stated fact into named quantities with matching units. Build
+      the complete calculation in Python, including totals, complements, and conversions.
     max_new_tokens: 256
-    tools:
-      - solver_python
-    max_tool_calls: 3
-    require_tool_call: true
-    expose_tool_trace: true
-    finalize_from_tool_result: true
+    tools: [python]
 
-  - name: Verifier
+  - name: Independent Solver
     system_prompt: |
-      Audit the Solver's Python against the original problem. Check every stated
-      quantity, rate unit, time period, and requested unit. Recompute the same setup
-      when consistent; otherwise fix only the justified mismatch. Invent nothing.
+      Solve the original problem independently in Python. Use every stated fact,
+      invent nothing, and make the final value use the requested unit.
     max_new_tokens: 256
-    tools:
-      - verifier_python
-    max_tool_calls: 3
-    require_tool_call: true
-    expose_tool_trace: true
-    finalize_from_tool_result: true
+    tools: [python]
+
+  - name: Critic
+    system_prompt: |
+      Audit both proposed Python solutions against the original problem. Locate any
+      wrong relationship or unit, then execute a corrected calculation in Python.
+    max_new_tokens: 256
+    tools: [python]
+
+  - name: Final Judge
+    system_prompt: |
+      Judge the three proposed calculations from the original facts. Resolve any
+      disagreement by executing the decisive calculation yourself in Python.
+    max_new_tokens: 256
+    tools: [python]
 
 edges:
   - [-1, 0]
   - [-1, 1]
-  - [0, 1]
+  - [-1, 2]
+  - [0, 2]
+  - [1, 2]
+  - [-1, 3]
+  - [0, 3]
+  - [1, 3]
+  - [2, 3]
