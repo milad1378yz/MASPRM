@@ -3,7 +3,7 @@ import json
 import math
 from dataclasses import dataclass
 from fractions import Fraction
-from typing import Any, Callable, Dict, Iterable, List, Mapping
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional
 
 
 class ToolExecutionError(ValueError):
@@ -16,7 +16,15 @@ def _bounded_fraction(value: Fraction) -> Fraction:
     return value
 
 
-def _eval_arithmetic_node(node: ast.AST) -> Fraction:
+def _eval_arithmetic_node(
+    node: ast.AST,
+    variables: Optional[Mapping[str, Fraction]] = None,
+) -> Fraction:
+    if isinstance(node, ast.Name) and variables is not None:
+        if node.id not in variables:
+            raise ToolExecutionError(f"Unknown variable {node.id!r}.")
+        return variables[node.id]
+
     if isinstance(node, ast.Constant) and not isinstance(node.value, bool):
         if isinstance(node.value, int):
             return _bounded_fraction(Fraction(node.value))
@@ -25,14 +33,14 @@ def _eval_arithmetic_node(node: ast.AST) -> Fraction:
         raise ToolExecutionError("Only finite numeric literals are allowed.")
 
     if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
-        value = _eval_arithmetic_node(node.operand)
+        value = _eval_arithmetic_node(node.operand, variables)
         return value if isinstance(node.op, ast.UAdd) else -value
 
     if not isinstance(node, ast.BinOp):
         raise ToolExecutionError("Only arithmetic operators are allowed.")
 
-    left = _eval_arithmetic_node(node.left)
-    right = _eval_arithmetic_node(node.right)
+    left = _eval_arithmetic_node(node.left, variables)
+    right = _eval_arithmetic_node(node.right, variables)
     try:
         if isinstance(node.op, ast.Add):
             result = left + right
@@ -163,6 +171,68 @@ def _verify_arithmetic(arguments: Mapping[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False)
 
 
+def _run_numeric_python(arguments: Mapping[str, Any]) -> str:
+    """Run a tiny, deterministic Python subset for numeric scratch work.
+
+    Model-produced code is untrusted, so this deliberately interprets only numeric
+    assignments and ``print(...)`` instead of passing text to Python's ``exec``.
+    """
+    code = arguments.get("code")
+    if not isinstance(code, str):
+        raise ToolExecutionError("'code' must be a string.")
+    code = code.strip()
+    if not code or len(code) > 512:
+        raise ToolExecutionError("Code must contain between 1 and 512 characters.")
+    try:
+        parsed = ast.parse(code, mode="exec")
+    except (SyntaxError, ValueError) as exc:
+        raise ToolExecutionError("Code is not valid Python.") from exc
+    if len(parsed.body) > 32:
+        raise ToolExecutionError("Code may contain at most 32 statements.")
+
+    variables: Dict[str, Fraction] = {}
+    stdout: List[str] = []
+    last_result: Optional[Fraction] = None
+    for statement in parsed.body:
+        if isinstance(statement, ast.Assign):
+            if (
+                len(statement.targets) != 1
+                or not isinstance(statement.targets[0], ast.Name)
+                or statement.targets[0].id.startswith("_")
+            ):
+                raise ToolExecutionError("Assignments require one simple variable name.")
+            variables[statement.targets[0].id] = _eval_arithmetic_node(
+                statement.value, variables
+            )
+            continue
+
+        if (
+            isinstance(statement, ast.Expr)
+            and isinstance(statement.value, ast.Call)
+            and isinstance(statement.value.func, ast.Name)
+            and statement.value.func.id == "print"
+        ):
+            call = statement.value
+            if not call.args or call.keywords:
+                raise ToolExecutionError("print requires numeric positional arguments.")
+            values = [_eval_arithmetic_node(arg, variables) for arg in call.args]
+            stdout.append(" ".join(_format_fraction(value) for value in values))
+            last_result = values[-1]
+            continue
+
+        raise ToolExecutionError(
+            "Only numeric assignments and print(arithmetic) are allowed; imports, "
+            "loops, functions, attributes, and file access are disabled."
+        )
+
+    if last_result is None:
+        raise ToolExecutionError("Code must print the final numeric answer.")
+    return json.dumps(
+        {"stdout": "\n".join(stdout), "result": _format_fraction(last_result)},
+        ensure_ascii=False,
+    )
+
+
 @dataclass(frozen=True)
 class ToolSpec:
     name: str
@@ -188,6 +258,34 @@ class ToolSpec:
 
 
 TOOL_REGISTRY: Dict[str, ToolSpec] = {
+    "solver_python": ToolSpec(
+        name="solver_python",
+        description=(
+            "Run a restricted numeric Python scratchpad. Use numeric assignments and "
+            "print only; for example: total = 12 * 3; print(total)."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {"code": {"type": "string"}},
+            "required": ["code"],
+            "additionalProperties": False,
+        },
+        handler=_run_numeric_python,
+    ),
+    "verifier_python": ToolSpec(
+        name="verifier_python",
+        description=(
+            "Run a restricted numeric Python scratchpad to independently verify an "
+            "answer. Use numeric assignments and print only."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {"code": {"type": "string"}},
+            "required": ["code"],
+            "additionalProperties": False,
+        },
+        handler=_run_numeric_python,
+    ),
     "calculate": ToolSpec(
         name="calculate",
         description=(

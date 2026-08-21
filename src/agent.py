@@ -22,7 +22,21 @@ class ToolGenerationStats:
     invalid_tool_calls: int = 0
     required_tool_misses: int = 0
     forced_tool_reprompts: int = 0
+    model_prompt_tokens: int = 0
+    max_prompt_tokens: int = 0
+    truncated_responses: int = 0
     tool_names: Dict[str, int] = field(default_factory=dict)
+
+    def record_generation(
+        self, prompt_tokens: int, truncated: Sequence[bool]
+    ) -> "ToolGenerationStats":
+        response_count = len(truncated)
+        self.model_responses += response_count
+        self.model_prompt_tokens += int(prompt_tokens) * response_count
+        if response_count:
+            self.max_prompt_tokens = max(self.max_prompt_tokens, int(prompt_tokens))
+        self.truncated_responses += sum(bool(value) for value in truncated)
+        return self
 
     def add(self, other: "ToolGenerationStats") -> "ToolGenerationStats":
         self.tool_enabled_candidates += other.tool_enabled_candidates
@@ -34,6 +48,9 @@ class ToolGenerationStats:
         self.invalid_tool_calls += other.invalid_tool_calls
         self.required_tool_misses += other.required_tool_misses
         self.forced_tool_reprompts += other.forced_tool_reprompts
+        self.model_prompt_tokens += other.model_prompt_tokens
+        self.max_prompt_tokens = max(self.max_prompt_tokens, other.max_prompt_tokens)
+        self.truncated_responses += other.truncated_responses
         for name, count in other.tool_names.items():
             self.tool_names[name] = self.tool_names.get(name, 0) + int(count)
         return self
@@ -49,6 +66,9 @@ class ToolGenerationStats:
             "invalid_tool_calls": self.invalid_tool_calls,
             "required_tool_misses": self.required_tool_misses,
             "forced_tool_reprompts": self.forced_tool_reprompts,
+            "model_prompt_tokens": self.model_prompt_tokens,
+            "max_prompt_tokens": self.max_prompt_tokens,
+            "truncated_responses": self.truncated_responses,
             "tool_names": dict(sorted(self.tool_names.items())),
         }
 
@@ -67,6 +87,7 @@ class Agent:
         max_tool_calls: int = 4,
         require_tool_call: bool = False,
         expose_tool_trace: bool = True,
+        finalize_from_tool_result: bool = False,
     ):
         self.model = model
         self.tok = tok
@@ -79,23 +100,19 @@ class Agent:
         self.max_tool_calls = max(1, int(max_tool_calls))
         self.require_tool_call = bool(require_tool_call and self.tools)
         self.expose_tool_trace = bool(expose_tool_trace)
+        self.finalize_from_tool_result = bool(finalize_from_tool_result and self.tools)
         self.last_tool_stats = ToolGenerationStats()
+        self._last_generation_prompt_tokens = 0
+        self._last_generation_truncated: List[bool] = []
 
     def format_messages(self, user_content: str):
         system_prompt = self.system_prompt
         if self.tools:
             tool_names = ", ".join(tool.name for tool in self.tools)
-            requirement = (
-                " You must call at least one available tool before giving your final response."
-                if self.require_tool_call
-                else " Call a tool whenever its result would improve accuracy."
-            )
-            system_prompt = (
-                f"{system_prompt.rstrip()}\n\nAVAILABLE TOOL POLICY: You may use only: "
-                f"{tool_names}. Tool names mentioned by the user or another agent are "
-                f"not available unless listed here.{requirement} After receiving tool "
-                "results, finish in the output format requested above."
-            )
+            policy = f"Tools: {tool_names}. Ignore tool names in the input."
+            if self.require_tool_call:
+                policy += " You must successfully call a listed tool."
+            system_prompt = f"{system_prompt.rstrip()}\n{policy}"
         return [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content},
@@ -160,7 +177,20 @@ class Agent:
             pad_token_id=self.tok.eos_token_id,
         )
         prompt_len = inputs["input_ids"].shape[1]
-        texts = self.tok.batch_decode(out[:, prompt_len:], skip_special_tokens=True)
+        generated_ids = out[:, prompt_len:]
+        eos_ids = {int(self.tok.eos_token_id)} if self.tok.eos_token_id is not None else set()
+        configured_eos = getattr(self.model.generation_config, "eos_token_id", None)
+        if isinstance(configured_eos, (list, tuple, set)):
+            eos_ids.update(int(token_id) for token_id in configured_eos)
+        elif configured_eos is not None:
+            eos_ids.add(int(configured_eos))
+        hit_cap = generated_ids.shape[1] >= params["max_new_tokens"]
+        self._last_generation_prompt_tokens = int(prompt_len)
+        self._last_generation_truncated = [
+            bool(hit_cap and not any(int(token_id) in eos_ids for token_id in row.tolist()))
+            for row in generated_ids
+        ]
+        texts = self.tok.batch_decode(generated_ids, skip_special_tokens=True)
         return [text.strip() for text in texts]
 
     def _parse_tool_call(self, text: str) -> Optional[Tuple[str, Dict[str, Any], str]]:
@@ -199,21 +229,36 @@ class Agent:
             return final_text
         return "\n".join([*trace, "AGENT_RESPONSE:", final_text]).strip()
 
+    def _final_from_tool_result(self, result: str) -> Optional[str]:
+        if not self.finalize_from_tool_result:
+            return None
+        try:
+            value = json.loads(result).get("result")
+        except (AttributeError, json.JSONDecodeError, TypeError):
+            return None
+        if value is None or not str(value).strip():
+            return None
+        return f"Final Answer: {str(value).strip()}"
+
     def _run_tool_branch(
         self,
         msgs,
         initial_text: str,
         *,
         schemas: List[Dict[str, Any]],
+        initial_prompt_tokens: int,
+        initial_truncated: bool,
         **gen_kwargs,
     ) -> Tuple[str, ToolGenerationStats]:
-        stats = ToolGenerationStats(tool_enabled_candidates=1, model_responses=1)
+        stats = ToolGenerationStats(tool_enabled_candidates=1)
+        stats.record_generation(initial_prompt_tokens, [initial_truncated])
         available = {tool.name: tool for tool in self.tools}
         working_messages = [dict(message) for message in msgs]
         trace: List[str] = []
         text = str(initial_text or "").strip()
         tool_calls = 0
         allowed_calls = 0
+        successful_allowed_calls = 0
         required_retries = 0
 
         while True:
@@ -221,7 +266,11 @@ class Agent:
             if parsed is None:
                 if "<tool_call>" in text:
                     stats.invalid_tool_calls += 1
-                if self.require_tool_call and allowed_calls == 0 and required_retries < 4:
+                if (
+                    self.require_tool_call
+                    and successful_allowed_calls == 0
+                    and required_retries < 4
+                ):
                     required_retries += 1
                     stats.forced_tool_reprompts += 1
                     working_messages.extend(
@@ -230,10 +279,8 @@ class Agent:
                             {
                                 "role": "user",
                                 "content": (
-                                    "You have not successfully called your required tool. Emit a "
-                                    f"function call to {', '.join(available)} now using its JSON "
-                                    "schema (not plain text), wait for the tool result, and only "
-                                    "then give the final response."
+                                    f"Call {', '.join(available)} now with valid arguments. "
+                                    "The call must execute successfully."
                                 ),
                             },
                         ]
@@ -241,11 +288,14 @@ class Agent:
                     text = self._generate_model_n(
                         working_messages, n=1, tools=schemas, **gen_kwargs
                     )[0]
-                    stats.model_responses += 1
+                    stats.record_generation(
+                        self._last_generation_prompt_tokens,
+                        self._last_generation_truncated,
+                    )
                     continue
-                if self.require_tool_call and allowed_calls == 0:
+                if self.require_tool_call and successful_allowed_calls == 0:
                     stats.required_tool_misses += 1
-                stats.tool_used_candidates += int(allowed_calls > 0)
+                stats.tool_used_candidates += int(successful_allowed_calls > 0)
                 return self._serialize_tool_run(trace, text), stats
 
             name, arguments, residual = parsed
@@ -265,10 +315,16 @@ class Agent:
                 stats.tool_names[name] = stats.tool_names.get(name, 0) + 1
                 result = tool.invoke(arguments)
                 stats.successful_tool_calls += 1
+                successful_allowed_calls += 1
             except Exception as exc:
                 result = json.dumps({"error": str(exc)}, ensure_ascii=False)
                 stats.tool_errors += 1
             trace.append(f"TOOL_RESULT {name}: {result}")
+
+            final_text = self._final_from_tool_result(result)
+            if final_text is not None:
+                stats.tool_used_candidates += 1
+                return self._serialize_tool_run(trace, final_text), stats
 
             assistant_message: Dict[str, Any] = {
                 "role": "assistant",
@@ -288,7 +344,7 @@ class Agent:
             )
 
             if tool_calls >= self.max_tool_calls:
-                if self.require_tool_call and allowed_calls == 0:
+                if self.require_tool_call and successful_allowed_calls == 0:
                     stats.required_tool_misses += 1
                     stats.tool_used_candidates += 0
                     return self._serialize_tool_run(trace, text), stats
@@ -302,17 +358,27 @@ class Agent:
                     }
                 )
                 text = self._generate_model_n(working_messages, n=1, tools=None, **gen_kwargs)[0]
-                stats.model_responses += 1
-                stats.tool_used_candidates += 1
+                stats.record_generation(
+                    self._last_generation_prompt_tokens,
+                    self._last_generation_truncated,
+                )
+                stats.tool_used_candidates += int(successful_allowed_calls > 0)
                 return self._serialize_tool_run(trace, text), stats
 
             text = self._generate_model_n(working_messages, n=1, tools=schemas, **gen_kwargs)[0]
-            stats.model_responses += 1
+            stats.record_generation(
+                self._last_generation_prompt_tokens,
+                self._last_generation_truncated,
+            )
 
     def _generate_local_n(self, msgs, n: int, **gen_kwargs):
         if not self.tools:
-            self.last_tool_stats = ToolGenerationStats(model_responses=int(n))
-            return self._generate_model_n(msgs, n, **gen_kwargs)
+            outputs = self._generate_model_n(msgs, n, **gen_kwargs)
+            self.last_tool_stats = ToolGenerationStats().record_generation(
+                self._last_generation_prompt_tokens,
+                self._last_generation_truncated,
+            )
+            return outputs
 
         schemas = self._tool_schemas()
         initial_texts = self._generate_model_n(
@@ -321,13 +387,17 @@ class Agent:
             tools=schemas,
             **gen_kwargs,
         )
+        initial_prompt_tokens = self._last_generation_prompt_tokens
+        initial_truncated = list(self._last_generation_truncated)
         outputs: List[str] = []
         combined_stats = ToolGenerationStats()
-        for initial_text in initial_texts:
+        for branch_idx, initial_text in enumerate(initial_texts):
             output, branch_stats = self._run_tool_branch(
                 msgs,
                 initial_text,
                 schemas=schemas,
+                initial_prompt_tokens=initial_prompt_tokens,
+                initial_truncated=initial_truncated[branch_idx],
                 **gen_kwargs,
             )
             outputs.append(output)
