@@ -3,7 +3,9 @@ import json
 import math
 from dataclasses import dataclass
 from fractions import Fraction
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional
+from typing import Any, Callable, Dict, Iterable, List, Mapping
+
+from smolagents import LocalPythonExecutor
 
 
 class ToolExecutionError(ValueError):
@@ -16,15 +18,7 @@ def _bounded_fraction(value: Fraction) -> Fraction:
     return value
 
 
-def _eval_arithmetic_node(
-    node: ast.AST,
-    variables: Optional[Mapping[str, Fraction]] = None,
-) -> Fraction:
-    if isinstance(node, ast.Name) and variables is not None:
-        if node.id not in variables:
-            raise ToolExecutionError(f"Unknown variable {node.id!r}.")
-        return variables[node.id]
-
+def _eval_arithmetic_node(node: ast.AST) -> Fraction:
     if isinstance(node, ast.Constant) and not isinstance(node.value, bool):
         if isinstance(node.value, int):
             return _bounded_fraction(Fraction(node.value))
@@ -33,14 +27,14 @@ def _eval_arithmetic_node(
         raise ToolExecutionError("Only finite numeric literals are allowed.")
 
     if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
-        value = _eval_arithmetic_node(node.operand, variables)
+        value = _eval_arithmetic_node(node.operand)
         return value if isinstance(node.op, ast.UAdd) else -value
 
     if not isinstance(node, ast.BinOp):
         raise ToolExecutionError("Only arithmetic operators are allowed.")
 
-    left = _eval_arithmetic_node(node.left, variables)
-    right = _eval_arithmetic_node(node.right, variables)
+    left = _eval_arithmetic_node(node.left)
+    right = _eval_arithmetic_node(node.right)
     try:
         if isinstance(node.op, ast.Add):
             result = left + right
@@ -172,63 +166,35 @@ def _verify_arithmetic(arguments: Mapping[str, Any]) -> str:
 
 
 def _run_numeric_python(arguments: Mapping[str, Any]) -> str:
-    """Run a tiny, deterministic Python subset for numeric scratch work.
-
-    Model-produced code is untrusted, so this deliberately interprets only numeric
-    assignments and ``print(...)`` instead of passing text to Python's ``exec``.
-    """
+    """Execute model-written code with smolagents and capture its terminal log."""
     code = arguments.get("code")
     if not isinstance(code, str):
         raise ToolExecutionError("'code' must be a string.")
     code = code.strip()
-    if not code or len(code) > 512:
-        raise ToolExecutionError("Code must contain between 1 and 512 characters.")
+    if not code or len(code) > 1024:
+        raise ToolExecutionError("Code must contain between 1 and 1024 characters.")
+
+    executor = LocalPythonExecutor(
+        additional_authorized_imports=[],
+        max_print_outputs_length=2000,
+        timeout_seconds=2,
+    )
+    executor.send_tools({})
     try:
-        parsed = ast.parse(code, mode="exec")
-    except (SyntaxError, ValueError) as exc:
-        raise ToolExecutionError("Code is not valid Python.") from exc
-    if len(parsed.body) > 32:
-        raise ToolExecutionError("Code may contain at most 32 statements.")
+        output = executor(code)
+    except Exception as exc:
+        raise ToolExecutionError(str(exc)) from exc
 
-    variables: Dict[str, Fraction] = {}
-    stdout: List[str] = []
-    last_result: Optional[Fraction] = None
-    for statement in parsed.body:
-        if isinstance(statement, ast.Assign):
-            if (
-                len(statement.targets) != 1
-                or not isinstance(statement.targets[0], ast.Name)
-                or statement.targets[0].id.startswith("_")
-            ):
-                raise ToolExecutionError("Assignments require one simple variable name.")
-            variables[statement.targets[0].id] = _eval_arithmetic_node(
-                statement.value, variables
-            )
-            continue
-
-        if (
-            isinstance(statement, ast.Expr)
-            and isinstance(statement.value, ast.Call)
-            and isinstance(statement.value.func, ast.Name)
-            and statement.value.func.id == "print"
-        ):
-            call = statement.value
-            if not call.args or call.keywords:
-                raise ToolExecutionError("print requires numeric positional arguments.")
-            values = [_eval_arithmetic_node(arg, variables) for arg in call.args]
-            stdout.append(" ".join(_format_fraction(value) for value in values))
-            last_result = values[-1]
-            continue
-
-        raise ToolExecutionError(
-            "Only numeric assignments and print(arithmetic) are allowed; imports, "
-            "loops, functions, attributes, and file access are disabled."
-        )
-
-    if last_result is None:
+    logs = str(output.logs or "")
+    printed_lines = [line.strip() for line in logs.splitlines() if line.strip()]
+    if not printed_lines:
         raise ToolExecutionError("Code must print the final numeric answer.")
+    try:
+        result = _format_fraction(_parse_claimed_number(printed_lines[-1]))
+    except ToolExecutionError as exc:
+        raise ToolExecutionError("The final printed line must be only a number.") from exc
     return json.dumps(
-        {"stdout": "\n".join(stdout), "result": _format_fraction(last_result)},
+        {"logs": logs, "result": result},
         ensure_ascii=False,
     )
 
@@ -239,6 +205,7 @@ class ToolSpec:
     description: str
     parameters: Dict[str, Any]
     handler: Callable[[Mapping[str, Any]], str]
+    call_style: str = "function"
 
     @property
     def schema(self) -> Dict[str, Any]:
@@ -271,6 +238,7 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
             "additionalProperties": False,
         },
         handler=_run_numeric_python,
+        call_style="python",
     ),
     "verifier_python": ToolSpec(
         name="verifier_python",
@@ -285,6 +253,7 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
             "additionalProperties": False,
         },
         handler=_run_numeric_python,
+        call_style="python",
     ),
     "calculate": ToolSpec(
         name="calculate",
