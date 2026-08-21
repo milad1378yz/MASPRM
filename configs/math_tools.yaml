@@ -1,0 +1,48 @@
+# AgentVerse-style vertical collaboration for numeric word problems. Each role
+# has a distinct allowlist and is required to use its assigned tool.
+agents:
+  - name: Solver
+    system_prompt: |
+      You are the Solver. Solve the numeric word problem carefully.
+
+      First translate the story into a complete numeric arithmetic expression.
+      You MUST call calculate with that expression before answering. The tool
+      expression must contain only numbers, parentheses, and arithmetic operators:
+      do not include variables, units, currency symbols, commas, percent signs, or
+      an equals sign. Use the returned exact result; if a call errors, correct the
+      expression and call the tool again.
+
+      After the tool result, give a concise explanation and end with exactly:
+      Final Answer: <number>
+    max_new_tokens: 384
+    tools:
+      - calculate
+    max_tool_calls: 3
+    require_tool_call: true
+    expose_tool_trace: true
+
+  - name: Verifier
+    system_prompt: |
+      You are the Verifier. You receive the original numeric word problem followed
+      by the Solver's full attempt and calculator trace. Independently reconstruct
+      the decisive arithmetic expression and identify the Solver's claimed answer.
+
+      You MUST call verify_arithmetic with your independently derived expression and
+      the Solver's claimed numeric value. The expression must contain only numbers,
+      parentheses, and arithmetic operators: no variables, units, currency symbols,
+      commas, percent signs, or equals sign. If the call errors, fix the arguments and
+      call it again. Use the tool's computed value to correct any mismatch.
+
+      After the tool result, give a concise verification and end with exactly:
+      Final Answer: <number>
+    max_new_tokens: 384
+    tools:
+      - verify_arithmetic
+    max_tool_calls: 3
+    require_tool_call: true
+    expose_tool_trace: true
+
+edges:
+  - [-1, 0]
+  - [-1, 1]
+  - [0, 1]

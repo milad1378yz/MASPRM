@@ -616,6 +616,7 @@ def evaluate_conditions_ray(
                     usage.generated,
                     usage.prm_calls,
                     usage.agent_runs,
+                    {"tool_usage": usage.tool_usage()},
                 )
 
             if kind == "sbs_prm":
@@ -913,6 +914,9 @@ def evaluate_conditions_ray(
                 source_root / "handoff_mas.py",
                 source_root / "agent.py",
                 source_root / "answer_utils.py",
+                source_root / "dataset_handler.py",
+                source_root / "mas.py",
+                source_root / "tooling.py",
             )
         )
     ).hexdigest()
@@ -1249,6 +1253,8 @@ def evaluate_conditions_ray(
         latencies: List[float] = []
         judge_calls_total = 0
         judge_parse_failures_total = 0
+        tool_usage_totals: Counter = Counter()
+        tool_names_total: Counter = Counter()
         pbar = tqdm(total=len(data), desc=f"Evaluating: {spec.name}")
         while finished < len(workers):
             try:
@@ -1327,6 +1333,13 @@ def evaluate_conditions_ray(
             if isinstance(metadata, dict) and metadata.get("judge_calls"):
                 judge_calls_total += int(metadata.get("judge_calls", 0))
                 judge_parse_failures_total += int(metadata.get("judge_parse_failures", 0))
+            if isinstance(metadata, dict) and isinstance(metadata.get("tool_usage"), dict):
+                tool_usage = metadata["tool_usage"]
+                for key, value in tool_usage.items():
+                    if key != "tool_names":
+                        tool_usage_totals[str(key)] += int(value)
+                for tool_name, count in tool_usage.get("tool_names", {}).items():
+                    tool_names_total[str(tool_name)] += int(count)
             if isinstance(metadata, dict) and metadata.get("error"):
                 decoder_errors += 1
 
@@ -1367,6 +1380,8 @@ def evaluate_conditions_ray(
                     f"p@{i+1}={pass_counts[i]/max(1, seen):.4f}" for i in range(MAX_PASS_K)
                 )
                 with open(results_path, "a") as f:
+                    tool_enabled = tool_usage_totals["tool_enabled_candidates"]
+                    tool_used = tool_usage_totals["tool_used_candidates"]
                     f.write(
                         "[progress] "
                         f"{seen}/{N_TOTAL} "
@@ -1376,7 +1391,8 @@ def evaluate_conditions_ray(
                         f"prm_calls_total={prm_calls_total} "
                         f"agent_runs_total={agent_runs_total} "
                         f"prm_calls_mean={prm_calls_total/max(1, seen):.2f} "
-                        f"agent_runs_mean={agent_runs_total/max(1, seen):.2f}\n"
+                        f"agent_runs_mean={agent_runs_total/max(1, seen):.2f} "
+                        f"tool_use={tool_used/max(1, tool_enabled):.4f}\n"
                     )
 
         pbar.close()
@@ -1396,6 +1412,30 @@ def evaluate_conditions_ray(
         processed = len(totals)
         mean = float(statistics.mean(totals)) if totals else 0.0
         std = float(statistics.pstdev(totals)) if len(totals) > 1 else 0.0
+        tool_enabled = int(tool_usage_totals["tool_enabled_candidates"])
+        tool_used = int(tool_usage_totals["tool_used_candidates"])
+        tool_calls = int(tool_usage_totals["tool_calls"])
+        successful_tool_calls = int(tool_usage_totals["successful_tool_calls"])
+        tool_summary = {
+            "tool_enabled_candidates_total": tool_enabled,
+            "tool_used_candidates_total": tool_used,
+            "tool_use_rate": tool_used / tool_enabled if tool_enabled else 0.0,
+            "tool_model_responses_total": int(tool_usage_totals["model_responses"]),
+            "tool_calls_total": tool_calls,
+            "successful_tool_calls_total": successful_tool_calls,
+            "successful_tool_call_rate": (
+                successful_tool_calls / tool_calls if tool_calls else 0.0
+            ),
+            "tool_errors_total": int(tool_usage_totals["tool_errors"]),
+            "invalid_tool_calls_total": int(tool_usage_totals["invalid_tool_calls"]),
+            "required_tool_misses_total": int(
+                tool_usage_totals["required_tool_misses"]
+            ),
+            "forced_tool_reprompts_total": int(
+                tool_usage_totals["forced_tool_reprompts"]
+            ),
+            "tool_names": dict(sorted(tool_names_total.items())),
+        }
 
         if worker_crashed or processed != len(data) or decoder_errors:
             with open(results_path, "a") as f:
@@ -1416,6 +1456,7 @@ def evaluate_conditions_ray(
                 "agent_runs_total": int(agent_runs_total),
                 "prm_calls_mean": float("nan"),
                 "agent_runs_mean": float("nan"),
+                **tool_summary,
             }
             for i in range(1, MAX_PASS_K + 1):
                 results[spec.name][f"pass_at_{i}"] = float("nan")
@@ -1440,6 +1481,7 @@ def evaluate_conditions_ray(
             "prm_calls_mean": float(prm_calls_total) / n,
             "prm_evaluations_mean": float(prm_evaluations_total) / n,
             "agent_runs_mean": float(agent_runs_total) / n,
+            **tool_summary,
         }
         correct_by_kind[spec.kind] = condition_correct
         if handoff_examples:
@@ -1536,6 +1578,27 @@ def evaluate_conditions_ray(
             f.write(f"Total Agent runs: {agent_runs_total}\n")
             f.write(f"Mean PRM calls per example: {results[spec.name]['prm_calls_mean']:.2f}\n")
             f.write(f"Mean Agent runs per example: {results[spec.name]['agent_runs_mean']:.2f}\n")
+            if tool_enabled:
+                f.write(
+                    "Required-tool use: "
+                    f"{tool_used}/{tool_enabled} "
+                    f"({results[spec.name]['tool_use_rate']:.4f})\n"
+                )
+                f.write(
+                    "Successful tool calls: "
+                    f"{successful_tool_calls}/{tool_calls} "
+                    f"({results[spec.name]['successful_tool_call_rate']:.4f})\n"
+                )
+                f.write(
+                    f"Tool calls by name: {dict(sorted(tool_names_total.items()))}\n"
+                )
+                f.write(
+                    "Tool errors / invalid calls / required misses / forced reprompts: "
+                    f"{tool_summary['tool_errors_total']} / "
+                    f"{tool_summary['invalid_tool_calls_total']} / "
+                    f"{tool_summary['required_tool_misses_total']} / "
+                    f"{tool_summary['forced_tool_reprompts_total']}\n"
+                )
             if handoff_examples:
                 f.write(f"Hit@1 at 4 messages: {results[spec.name]['hit_at_4']:.4f}\n")
                 f.write(f"Hit@1 at 8 messages: {results[spec.name]['hit_at_8']:.4f}\n")
