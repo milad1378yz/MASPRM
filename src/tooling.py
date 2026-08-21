@@ -186,9 +186,11 @@ def _run_numeric_python(arguments: Mapping[str, Any]) -> str:
         raise ToolExecutionError(str(exc)) from exc
 
     logs = str(output.logs or "")
+    if not logs.strip() and output.output is not None:
+        logs = f"{output.output}\n"
     printed_lines = [line.strip() for line in logs.splitlines() if line.strip()]
     if not printed_lines:
-        raise ToolExecutionError("Code must print the final numeric answer.")
+        raise ToolExecutionError("Code must output the final numeric answer.")
     try:
         result = _format_fraction(_parse_claimed_number(printed_lines[-1]))
     except ToolExecutionError as exc:
@@ -228,8 +230,8 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
     "solver_python": ToolSpec(
         name="solver_python",
         description=(
-            "Run a restricted numeric Python scratchpad. Use numeric assignments and "
-            "print only; for example: total = 12 * 3; print(total)."
+            "Run Python arithmetic and return its execution log. End with the final "
+            "numeric expression or print the final number."
         ),
         parameters={
             "type": "object",
@@ -243,8 +245,8 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
     "verifier_python": ToolSpec(
         name="verifier_python",
         description=(
-            "Run a restricted numeric Python scratchpad to independently verify an "
-            "answer. Use numeric assignments and print only."
+            "Run Python arithmetic to independently verify an answer and return its "
+            "execution log. End with the final numeric expression or print it."
         ),
         parameters={
             "type": "object",

@@ -465,6 +465,7 @@ def build_mas_from_specs(
       - max_tool_calls (int, default 4)
       - require_tool_call (bool, default false)
       - expose_tool_trace (bool, default true)
+      - finalize_from_tool_result (bool, default false)
     """
     agents = []
     for spec in agent_specs:
@@ -479,6 +480,9 @@ def build_mas_from_specs(
                 max_tool_calls=int(spec.get("max_tool_calls", 4)),
                 require_tool_call=bool(spec.get("require_tool_call", False)),
                 expose_tool_trace=bool(spec.get("expose_tool_trace", True)),
+                finalize_from_tool_result=bool(
+                    spec.get("finalize_from_tool_result", False)
+                ),
             )
         )
     return MAS(edges, agents)

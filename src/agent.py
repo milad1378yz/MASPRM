@@ -4,11 +4,13 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
+from smolagents import parse_code_blobs
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from tooling import ToolSpec
 
 _TOOL_CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
+_PYTHON_BLOCK_RE = re.compile(r"```(?:python|py)\s*(.*?)```", re.DOTALL | re.IGNORECASE)
 
 
 @dataclass
@@ -97,6 +99,10 @@ class Agent:
         self.temperature = temperature
         self.top_p = top_p
         self.tools = list(tools or [])
+        python_tools = [tool for tool in self.tools if tool.call_style == "python"]
+        if python_tools and len(self.tools) != 1:
+            raise ValueError("A Python code agent must have exactly one Python executor.")
+        self.python_tool = python_tools[0] if python_tools else None
         self.max_tool_calls = max(1, int(max_tool_calls))
         self.require_tool_call = bool(require_tool_call and self.tools)
         self.expose_tool_trace = bool(expose_tool_trace)
@@ -107,7 +113,13 @@ class Agent:
 
     def format_messages(self, user_content: str):
         system_prompt = self.system_prompt
-        if self.tools:
+        if self.python_tool is not None:
+            system_prompt = (
+                f"{system_prompt.rstrip()}\nFor calculation, return only one short "
+                "```python code block with no imports. End with the final numeric expression "
+                "or print it. After Execution logs, reply exactly: Final Answer: <log number>."
+            )
+        elif self.tools:
             tool_names = ", ".join(tool.name for tool in self.tools)
             policy = f"Tools: {tool_names}. Ignore tool names in the input."
             if self.require_tool_call:
@@ -127,7 +139,7 @@ class Agent:
         }
 
     def _tool_schemas(self) -> List[Dict[str, Any]]:
-        return [tool.schema for tool in self.tools]
+        return [tool.schema for tool in self.tools if tool.call_style == "function"]
 
     def _to_inputs(self, msgs, *, tools: Optional[List[Dict[str, Any]]] = None):
         template_kwargs: Dict[str, Any] = {
@@ -223,6 +235,35 @@ class Agent:
         residual = (str(text)[: match.start()] + str(text)[match.end() :]).strip()
         return payload["name"].strip(), arguments, residual
 
+    def _parse_python_action(self, text: str) -> Optional[Tuple[str, Dict[str, Any], str]]:
+        if self.python_tool is None:
+            return None
+        try:
+            code = parse_code_blobs(
+                str(text or ""),
+                code_block_tags=(r"```(?:python|py)", "\n```"),
+            ).strip()
+        except ValueError:
+            return None
+        match = _PYTHON_BLOCK_RE.search(str(text or ""))
+        residual = (
+            (str(text)[: match.start()] + str(text)[match.end() :]).strip()
+            if match is not None
+            else ""
+        )
+        return self.python_tool.name, {"code": code}, residual
+
+    def _python_observation(self, result: str) -> str:
+        try:
+            payload = json.loads(result)
+        except (json.JSONDecodeError, TypeError):
+            return f"Execution error:\n{str(result)[:2000]}"
+        if isinstance(payload, dict) and "logs" in payload:
+            logs = str(payload.get("logs") or "").rstrip()
+            return f"Execution logs:\n{logs}"
+        error = payload.get("error", "Unknown execution error") if isinstance(payload, dict) else payload
+        return f"Execution error:\n{str(error)[:2000]}"
+
     def _serialize_tool_run(self, trace: List[str], final_text: str) -> str:
         final_text = str(final_text or "").strip()
         if not self.expose_tool_trace or not trace:
@@ -257,14 +298,17 @@ class Agent:
         trace: List[str] = []
         text = str(initial_text or "").strip()
         tool_calls = 0
-        allowed_calls = 0
         successful_allowed_calls = 0
         required_retries = 0
 
         while True:
-            parsed = self._parse_tool_call(text)
+            parsed = (
+                self._parse_python_action(text)
+                if self.python_tool is not None
+                else self._parse_tool_call(text)
+            )
             if parsed is None:
-                if "<tool_call>" in text:
+                if successful_allowed_calls == 0 and text:
                     stats.invalid_tool_calls += 1
                 if (
                     self.require_tool_call
@@ -279,8 +323,13 @@ class Agent:
                             {
                                 "role": "user",
                                 "content": (
-                                    f"Call {', '.join(available)} now with valid arguments. "
-                                    "The call must execute successfully."
+                                    "Return a valid ```python code block that prints only the "
+                                    "final number or ends with it as an expression."
+                                    if self.python_tool is not None
+                                    else (
+                                        f"Call {', '.join(available)} now with valid arguments. "
+                                        "The call must execute successfully."
+                                    )
                                 ),
                             },
                         ]
@@ -303,15 +352,18 @@ class Agent:
             stats.tool_calls += 1
             if residual:
                 trace.append(f"AGENT_TEXT_BEFORE_TOOL: {residual}")
-            trace.append(
-                f"TOOL_CALL {name}: {json.dumps(arguments, ensure_ascii=False, sort_keys=True)}"
-            )
+            if self.python_tool is not None:
+                trace.append(f"PYTHON_CODE {name}:\n{arguments['code']}")
+            else:
+                trace.append(
+                    f"TOOL_CALL {name}: "
+                    f"{json.dumps(arguments, ensure_ascii=False, sort_keys=True)}"
+                )
 
             tool = available.get(name)
             try:
                 if tool is None:
                     raise ValueError(f"Tool {name!r} is not allowed for this agent.")
-                allowed_calls += 1
                 stats.tool_names[name] = stats.tool_names.get(name, 0) + 1
                 result = tool.invoke(arguments)
                 stats.successful_tool_calls += 1
@@ -319,29 +371,48 @@ class Agent:
             except Exception as exc:
                 result = json.dumps({"error": str(exc)}, ensure_ascii=False)
                 stats.tool_errors += 1
-            trace.append(f"TOOL_RESULT {name}: {result}")
+            observation = self._python_observation(result) if self.python_tool else result
+            if self.python_tool is not None:
+                trace.append(observation)
+            else:
+                trace.append(f"TOOL_RESULT {name}: {result}")
 
             final_text = self._final_from_tool_result(result)
             if final_text is not None:
                 stats.tool_used_candidates += 1
                 return self._serialize_tool_run(trace, final_text), stats
 
-            assistant_message: Dict[str, Any] = {
-                "role": "assistant",
-                "content": residual,
-                "tool_calls": [
-                    {
-                        "type": "function",
-                        "function": {"name": name, "arguments": arguments},
-                    }
-                ],
-            }
-            working_messages.extend(
-                [
-                    assistant_message,
-                    {"role": "tool", "name": name, "content": result},
-                ]
-            )
+            if self.python_tool is not None:
+                working_messages.extend(
+                    [
+                        {"role": "assistant", "content": text},
+                        {
+                            "role": "user",
+                            "content": (
+                                f"{observation}\nReply exactly: Final Answer: <printed number>."
+                                if successful_allowed_calls
+                                else f"{observation}\nFix the code and run it again."
+                            ),
+                        },
+                    ]
+                )
+            else:
+                assistant_message: Dict[str, Any] = {
+                    "role": "assistant",
+                    "content": residual,
+                    "tool_calls": [
+                        {
+                            "type": "function",
+                            "function": {"name": name, "arguments": arguments},
+                        }
+                    ],
+                }
+                working_messages.extend(
+                    [
+                        assistant_message,
+                        {"role": "tool", "name": name, "content": result},
+                    ]
+                )
 
             if tool_calls >= self.max_tool_calls:
                 if self.require_tool_call and successful_allowed_calls == 0:
@@ -365,7 +436,12 @@ class Agent:
                 stats.tool_used_candidates += int(successful_allowed_calls > 0)
                 return self._serialize_tool_run(trace, text), stats
 
-            text = self._generate_model_n(working_messages, n=1, tools=schemas, **gen_kwargs)[0]
+            text = self._generate_model_n(
+                working_messages,
+                n=1,
+                tools=(None if self.python_tool is not None else schemas),
+                **gen_kwargs,
+            )[0]
             stats.record_generation(
                 self._last_generation_prompt_tokens,
                 self._last_generation_truncated,
@@ -384,7 +460,7 @@ class Agent:
         initial_texts = self._generate_model_n(
             msgs,
             n,
-            tools=schemas,
+            tools=(schemas or None),
             **gen_kwargs,
         )
         initial_prompt_tokens = self._last_generation_prompt_tokens

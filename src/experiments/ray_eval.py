@@ -1337,7 +1337,12 @@ def evaluate_conditions_ray(
                 tool_usage = metadata["tool_usage"]
                 for key, value in tool_usage.items():
                     if key != "tool_names":
-                        tool_usage_totals[str(key)] += int(value)
+                        if key == "max_prompt_tokens":
+                            tool_usage_totals[str(key)] = max(
+                                tool_usage_totals[str(key)], int(value)
+                            )
+                        else:
+                            tool_usage_totals[str(key)] += int(value)
                 for tool_name, count in tool_usage.get("tool_names", {}).items():
                     tool_names_total[str(tool_name)] += int(count)
             if isinstance(metadata, dict) and metadata.get("error"):
@@ -1382,6 +1387,8 @@ def evaluate_conditions_ray(
                 with open(results_path, "a") as f:
                     tool_enabled = tool_usage_totals["tool_enabled_candidates"]
                     tool_used = tool_usage_totals["tool_used_candidates"]
+                    model_responses = tool_usage_totals["model_responses"]
+                    truncated_responses = tool_usage_totals["truncated_responses"]
                     f.write(
                         "[progress] "
                         f"{seen}/{N_TOTAL} "
@@ -1392,7 +1399,8 @@ def evaluate_conditions_ray(
                         f"agent_runs_total={agent_runs_total} "
                         f"prm_calls_mean={prm_calls_total/max(1, seen):.2f} "
                         f"agent_runs_mean={agent_runs_total/max(1, seen):.2f} "
-                        f"tool_use={tool_used/max(1, tool_enabled):.4f}\n"
+                        f"tool_use={tool_used/max(1, tool_enabled):.4f} "
+                        f"trunc={truncated_responses/max(1, model_responses):.4f}\n"
                     )
 
         pbar.close()
@@ -1416,11 +1424,23 @@ def evaluate_conditions_ray(
         tool_used = int(tool_usage_totals["tool_used_candidates"])
         tool_calls = int(tool_usage_totals["tool_calls"])
         successful_tool_calls = int(tool_usage_totals["successful_tool_calls"])
+        model_responses = int(tool_usage_totals["model_responses"])
+        model_prompt_tokens = int(tool_usage_totals["model_prompt_tokens"])
+        truncated_responses = int(tool_usage_totals["truncated_responses"])
         tool_summary = {
             "tool_enabled_candidates_total": tool_enabled,
             "tool_used_candidates_total": tool_used,
             "tool_use_rate": tool_used / tool_enabled if tool_enabled else 0.0,
-            "tool_model_responses_total": int(tool_usage_totals["model_responses"]),
+            "tool_model_responses_total": model_responses,
+            "model_prompt_tokens_total": model_prompt_tokens,
+            "model_prompt_tokens_mean": (
+                model_prompt_tokens / model_responses if model_responses else 0.0
+            ),
+            "max_prompt_tokens": int(tool_usage_totals["max_prompt_tokens"]),
+            "truncated_responses_total": truncated_responses,
+            "response_truncation_rate": (
+                truncated_responses / model_responses if model_responses else 0.0
+            ),
             "tool_calls_total": tool_calls,
             "successful_tool_calls_total": successful_tool_calls,
             "successful_tool_call_rate": (
@@ -1428,12 +1448,8 @@ def evaluate_conditions_ray(
             ),
             "tool_errors_total": int(tool_usage_totals["tool_errors"]),
             "invalid_tool_calls_total": int(tool_usage_totals["invalid_tool_calls"]),
-            "required_tool_misses_total": int(
-                tool_usage_totals["required_tool_misses"]
-            ),
-            "forced_tool_reprompts_total": int(
-                tool_usage_totals["forced_tool_reprompts"]
-            ),
+            "required_tool_misses_total": int(tool_usage_totals["required_tool_misses"]),
+            "forced_tool_reprompts_total": int(tool_usage_totals["forced_tool_reprompts"]),
             "tool_names": dict(sorted(tool_names_total.items())),
         }
 
@@ -1578,6 +1594,17 @@ def evaluate_conditions_ray(
             f.write(f"Total Agent runs: {agent_runs_total}\n")
             f.write(f"Mean PRM calls per example: {results[spec.name]['prm_calls_mean']:.2f}\n")
             f.write(f"Mean Agent runs per example: {results[spec.name]['agent_runs_mean']:.2f}\n")
+            f.write(
+                "Model prompt tokens (mean/max): "
+                f"{tool_summary['model_prompt_tokens_mean']:.1f}/"
+                f"{tool_summary['max_prompt_tokens']}\n"
+            )
+            f.write(
+                "Output truncations: "
+                f"{tool_summary['truncated_responses_total']}/"
+                f"{tool_summary['tool_model_responses_total']} "
+                f"({tool_summary['response_truncation_rate']:.4f})\n"
+            )
             if tool_enabled:
                 f.write(
                     "Required-tool use: "
@@ -1589,9 +1616,7 @@ def evaluate_conditions_ray(
                     f"{successful_tool_calls}/{tool_calls} "
                     f"({results[spec.name]['successful_tool_call_rate']:.4f})\n"
                 )
-                f.write(
-                    f"Tool calls by name: {dict(sorted(tool_names_total.items()))}\n"
-                )
+                f.write(f"Tool calls by name: {dict(sorted(tool_names_total.items()))}\n")
                 f.write(
                     "Tool errors / invalid calls / required misses / forced reprompts: "
                     f"{tool_summary['tool_errors_total']} / "

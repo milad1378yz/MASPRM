@@ -62,6 +62,9 @@ class TokenStats:
     invalid_tool_calls: int = 0
     required_tool_misses: int = 0
     forced_tool_reprompts: int = 0
+    model_prompt_tokens: int = 0
+    max_model_prompt_tokens: int = 0
+    truncated_model_responses: int = 0
     tool_names: Dict[str, int] = field(default_factory=dict)
 
     def add(self, other: "TokenStats") -> "TokenStats":
@@ -79,6 +82,11 @@ class TokenStats:
         self.invalid_tool_calls += other.invalid_tool_calls
         self.required_tool_misses += other.required_tool_misses
         self.forced_tool_reprompts += other.forced_tool_reprompts
+        self.model_prompt_tokens += other.model_prompt_tokens
+        self.max_model_prompt_tokens = max(
+            self.max_model_prompt_tokens, other.max_model_prompt_tokens
+        )
+        self.truncated_model_responses += other.truncated_model_responses
         for name, count in other.tool_names.items():
             self.tool_names[name] = self.tool_names.get(name, 0) + int(count)
         return self
@@ -95,6 +103,11 @@ class TokenStats:
         self.invalid_tool_calls += int(stats.invalid_tool_calls)
         self.required_tool_misses += int(stats.required_tool_misses)
         self.forced_tool_reprompts += int(stats.forced_tool_reprompts)
+        self.model_prompt_tokens += int(stats.model_prompt_tokens)
+        self.max_model_prompt_tokens = max(
+            self.max_model_prompt_tokens, int(stats.max_prompt_tokens)
+        )
+        self.truncated_model_responses += int(stats.truncated_responses)
         for name, count in stats.tool_names.items():
             self.tool_names[name] = self.tool_names.get(name, 0) + int(count)
         return self
@@ -110,6 +123,9 @@ class TokenStats:
             "invalid_tool_calls": self.invalid_tool_calls,
             "required_tool_misses": self.required_tool_misses,
             "forced_tool_reprompts": self.forced_tool_reprompts,
+            "model_prompt_tokens": self.model_prompt_tokens,
+            "max_prompt_tokens": self.max_model_prompt_tokens,
+            "truncated_responses": self.truncated_model_responses,
             "tool_names": dict(sorted(self.tool_names.items())),
         }
 
@@ -423,8 +439,7 @@ def sbs_decode2(
             cands = mas.sample_candidates(agent_idx, inbox, n_candidates=B2, **gen_kwargs)
             usage.agent_runs += B2
             agent = mas.agents[agent_idx]
-            if getattr(agent, "tools", None):
-                usage.add_tool_stats(getattr(agent, "last_tool_stats", None))
+            usage.add_tool_stats(getattr(agent, "last_tool_stats", None))
 
             # Account policy tokens (prompt + generated)
             usage.prompt += p_len
