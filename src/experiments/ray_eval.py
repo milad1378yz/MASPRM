@@ -599,7 +599,7 @@ def evaluate_conditions_ray(
             #  SBS variants
             if kind == "sbs_none":
                 finals: List[str] = []
-                pred, usage = sbs_decode2(
+                pred, usage, trace = sbs_decode2(
                     mas0,
                     q,
                     score_type="none",
@@ -608,15 +608,26 @@ def evaluate_conditions_ray(
                     gen_kwargs=sbs_kwargs,
                     step_separator=self.step_sep,
                     final_answers_out=finals,
+                    return_trace=True,
                 )
                 candidates = finals[:pass_k] if finals else [pred]
+                tool_traces = [
+                    {
+                        "agent_idx": int(step["agent_idx"]),
+                        "agent_name": mas0.agents[int(step["agent_idx"])].name,
+                        "trace": str(step["chosen_text"]),
+                    }
+                    for step in trace
+                    if step.get("chosen_text")
+                    and mas0.agents[int(step["agent_idx"])].python_tool is not None
+                ]
                 return (
                     pred,
                     candidates,
                     usage.generated,
                     usage.prm_calls,
                     usage.agent_runs,
-                    {"tool_usage": usage.tool_usage()},
+                    {"tool_usage": usage.tool_usage(), "tool_traces": tool_traces},
                 )
 
             if kind == "sbs_prm":

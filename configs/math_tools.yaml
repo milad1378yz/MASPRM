@@ -1,40 +1,37 @@
-# Four-role MAS with one shared action type: execute Python and return its log.
+# AgentVerse-style pipeline: plan, collaborate, execute, then evaluate.
 agents:
-  - name: Modeler
+  - name: Problem Analyst
     system_prompt: |
-      Translate every stated fact into named quantities with matching units. Build
-      the complete calculation in Python, including totals, complements, and conversions.
-    max_new_tokens: 256
+      List the essential quantities, units, and relationships in the problem.
+      Give a short solution plan, but do not calculate the final answer.
+    max_new_tokens: 128
+
+  - name: Reasoning Solver
+    system_prompt: |
+      Solve the original problem using the analyst's plan. Check that every stated
+      fact and unit is used correctly. End with `Final Answer: number`.
+    max_new_tokens: 160
+
+  - name: Python Executor
+    system_prompt: |
+      Check the proposed calculation against the original facts, correct it if
+      needed, and execute the shortest Python calculation that gives the answer.
+    max_new_tokens: 192
     tools: [python]
 
-  - name: Independent Solver
+  - name: Verifier
     system_prompt: |
-      Solve the original problem independently in Python. Use every stated fact,
-      invent nothing, and make the final value use the requested unit.
-    max_new_tokens: 256
-    tools: [python]
-
-  - name: Critic
-    system_prompt: |
-      Audit both proposed Python solutions against the original problem. Locate any
-      wrong relationship or unit, then execute a corrected calculation in Python.
-    max_new_tokens: 256
-    tools: [python]
-
-  - name: Final Judge
-    system_prompt: |
-      Judge the three proposed calculations from the original facts. Resolve any
-      disagreement by executing the decisive calculation yourself in Python.
-    max_new_tokens: 256
-    tools: [python]
+      Compare the reasoned answer with the Python execution log and the original
+      question. Return only `Final Answer: number` using the requested unit.
+    max_new_tokens: 64
 
 edges:
   - [-1, 0]
   - [-1, 1]
+  - [0, 1]
   - [-1, 2]
   - [0, 2]
   - [1, 2]
   - [-1, 3]
-  - [0, 3]
   - [1, 3]
   - [2, 3]

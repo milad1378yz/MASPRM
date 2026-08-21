@@ -2,23 +2,23 @@ import re
 from dataclasses import dataclass
 from typing import Iterable, List
 
-from smolagents import LocalPythonExecutor
+from pydantic_monty import CollectString, Monty
 
-
-class ToolExecutionError(ValueError):
-    pass
-
-
-_NUMBER_RE = re.compile(
-    r"(?:[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)|(?:[-+]?\d+/\d+)"
+_CODE_BLOCK_RE = re.compile(
+    r"\A```(?:python|py)?[ \t]*\r?\n(?P<code>.*?)(?:\r?\n)?```[ \t]*\Z",
+    re.DOTALL | re.IGNORECASE,
 )
+_MAX_CODE_LENGTH = 4096
+_MAX_LOG_BYTES = 2000
+_MAX_MEMORY_BYTES = 64 * 1024 * 1024
+_TIMEOUT_SECONDS = 2
 
 
 @dataclass(frozen=True)
 class PythonExecution:
     code: str
     logs: str
-    result: str
+    succeeded: bool
 
 
 @dataclass(frozen=True)
@@ -27,31 +27,39 @@ class ToolSpec:
 
     def invoke(self, code: str) -> PythonExecution:
         code = str(code or "").strip()
-        if not code or len(code) > 1024:
-            raise ToolExecutionError("Python code must contain 1 to 1024 characters.")
+        match = _CODE_BLOCK_RE.fullmatch(code)
+        if match is not None:
+            code = match.group("code").strip()
+        if not code or len(code) > _MAX_CODE_LENGTH:
+            return PythonExecution(
+                code=code,
+                logs=f"Python code must contain 1 to {_MAX_CODE_LENGTH} characters.\n",
+                succeeded=False,
+            )
 
-        executor = LocalPythonExecutor(
-            additional_authorized_imports=[],
-            max_print_outputs_length=2000,
-            timeout_seconds=2,
-        )
-        executor.send_tools({})
+        terminal = CollectString(max_bytes=_MAX_LOG_BYTES)
         try:
-            output = executor(code)
+            with Monty(request_timeout=_TIMEOUT_SECONDS + 1) as pool:
+                with pool.checkout(
+                    limits={
+                        "max_duration_secs": _TIMEOUT_SECONDS,
+                        "max_memory": _MAX_MEMORY_BYTES,
+                    }
+                ) as session:
+                    session.feed_run(code, print_callback=terminal)
         except Exception as exc:
-            raise ToolExecutionError(str(exc)) from exc
+            display = getattr(exc, "display", None)
+            error = str(display() if callable(display) else exc)
+            return PythonExecution(
+                code=code,
+                logs=f"{terminal.output}{error.rstrip()}\n",
+                succeeded=False,
+            )
 
-        logs = str(output.logs or "")
-        if not logs.strip() and output.output is not None:
-            logs = f"{output.output}\n"
-        lines = [line.strip() for line in logs.splitlines() if line.strip()]
-        if not lines:
-            raise ToolExecutionError("Python must output the final numeric answer.")
-
-        result = lines[-1].replace(",", "").lstrip("$").rstrip("%")
-        if _NUMBER_RE.fullmatch(result) is None:
-            raise ToolExecutionError("The final execution-log line must be only a number.")
-        return PythonExecution(code=code, logs=logs, result=result)
+        logs = (
+            terminal.output or "Python exited successfully with no terminal output.\n"
+        )
+        return PythonExecution(code=code, logs=logs, succeeded=True)
 
 
 PYTHON_TOOL = ToolSpec()

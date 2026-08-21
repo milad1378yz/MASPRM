@@ -1,14 +1,10 @@
-import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence
 
 import torch
-from smolagents import parse_code_blobs
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from tooling import ToolSpec
-
-_PYTHON_BLOCK_RE = re.compile(r"```(?:python|py)\s*(.*?)```", re.DOTALL | re.IGNORECASE)
 
 
 @dataclass
@@ -38,26 +34,6 @@ class ToolGenerationStats:
         self.truncated_responses += sum(bool(value) for value in truncated)
         return self
 
-    def add(self, other: "ToolGenerationStats") -> "ToolGenerationStats":
-        for field_name in (
-            "tool_enabled_candidates",
-            "tool_used_candidates",
-            "model_responses",
-            "tool_calls",
-            "successful_tool_calls",
-            "tool_errors",
-            "invalid_tool_calls",
-            "required_tool_misses",
-            "forced_tool_reprompts",
-            "model_prompt_tokens",
-            "truncated_responses",
-        ):
-            setattr(self, field_name, getattr(self, field_name) + getattr(other, field_name))
-        self.max_prompt_tokens = max(self.max_prompt_tokens, other.max_prompt_tokens)
-        for name, count in other.tool_names.items():
-            self.tool_names[name] = self.tool_names.get(name, 0) + int(count)
-        return self
-
 
 class Agent:
     def __init__(
@@ -70,7 +46,6 @@ class Agent:
         top_p: float = 0.95,
         name: Optional[str] = None,
         tools: Optional[Sequence[ToolSpec]] = None,
-        max_tool_calls: int = 3,
     ):
         self.model = model
         self.tok = tok
@@ -83,7 +58,6 @@ class Agent:
         if len(self.tools) > 1 or (self.tools and self.tools[0].name != "python"):
             raise ValueError("An agent may use only the single 'python' tool.")
         self.python_tool = self.tools[0] if self.tools else None
-        self.max_tool_calls = max(1, int(max_tool_calls))
         self.last_tool_stats = ToolGenerationStats()
         self._last_generation_prompt_tokens = 0
         self._last_generation_truncated: List[bool] = []
@@ -92,8 +66,8 @@ class Agent:
         system_prompt = self.system_prompt.rstrip()
         if self.python_tool is not None:
             system_prompt += (
-                "\nReturn one short ```python code block with no imports. Its last "
-                "expression or printed line must be the requested number."
+                "\nReturn only executable Python source without Markdown fences. "
+                "Print the requested answer; printed output becomes the terminal log."
             )
         return [
             {"role": "system", "content": system_prompt},
@@ -160,112 +134,31 @@ class Agent:
         texts = self.tok.batch_decode(generated_ids, skip_special_tokens=True)
         return [text.strip() for text in texts]
 
-    def _parse_python(self, text: str) -> Optional[Tuple[str, str]]:
-        try:
-            code = parse_code_blobs(
-                str(text or ""),
-                code_block_tags=(r"```(?:python|py)", "\n```"),
-            ).strip()
-        except ValueError:
-            return None
-        match = _PYTHON_BLOCK_RE.search(str(text or ""))
-        residual = (
-            (str(text)[: match.start()] + str(text)[match.end() :]).strip()
-            if match is not None
-            else ""
-        )
-        return code, residual
-
-    def _run_python_branch(
-        self,
-        msgs,
-        initial_text: str,
-        initial_prompt_tokens: int,
-        initial_truncated: bool,
-        **gen_kwargs,
-    ) -> Tuple[str, ToolGenerationStats]:
-        stats = ToolGenerationStats(tool_enabled_candidates=1)
-        stats.record_generation(initial_prompt_tokens, [initial_truncated])
-        working_messages = [dict(message) for message in msgs]
-        text = str(initial_text or "").strip()
-        trace: List[str] = []
-
-        for attempt in range(self.max_tool_calls):
-            parsed = self._parse_python(text)
-            if parsed is None:
-                stats.invalid_tool_calls += 1
-                error = "No valid Python code block was found."
-            else:
-                code, residual = parsed
-                if residual:
-                    trace.append(f"AGENT_TEXT_BEFORE_PYTHON: {residual}")
-                trace.append(f"PYTHON_CODE:\n{code}")
-                stats.tool_calls += 1
-                stats.tool_names["python"] = stats.tool_names.get("python", 0) + 1
-                try:
-                    execution = self.python_tool.invoke(code)
-                except Exception as exc:
-                    stats.tool_errors += 1
-                    error = str(exc)
-                    trace.append(f"EXECUTION_ERROR:\n{error}")
-                else:
-                    stats.successful_tool_calls += 1
-                    stats.tool_used_candidates += 1
-                    trace.append(f"EXECUTION_LOGS:\n{execution.logs.rstrip()}")
-                    return (
-                        "\n".join([*trace, "AGENT_RESPONSE:", f"Final Answer: {execution.result}"]),
-                        stats,
-                    )
-
-            if attempt + 1 >= self.max_tool_calls:
-                stats.required_tool_misses += 1
-                return "\n".join([*trace, "AGENT_RESPONSE:", text]).strip(), stats
-
-            stats.forced_tool_reprompts += 1
-            working_messages.extend(
-                [
-                    {"role": "assistant", "content": text},
-                    {
-                        "role": "user",
-                        "content": (
-                            f"Python execution failed: {error[:1200]}\n"
-                            "Return corrected Python that outputs only the requested number."
-                        ),
-                    },
-                ]
-            )
-            text = self._generate_model_n(working_messages, n=1, **gen_kwargs)[0]
-            stats.record_generation(
-                self._last_generation_prompt_tokens,
-                self._last_generation_truncated,
-            )
-
-        raise AssertionError("unreachable")
-
     def _generate_local_n(self, msgs, n: int, **gen_kwargs):
-        initial_texts = self._generate_model_n(msgs, n, **gen_kwargs)
-        initial_prompt_tokens = self._last_generation_prompt_tokens
-        initial_truncated = list(self._last_generation_truncated)
+        texts = self._generate_model_n(msgs, n, **gen_kwargs)
+        stats = ToolGenerationStats().record_generation(
+            self._last_generation_prompt_tokens,
+            self._last_generation_truncated,
+        )
         if self.python_tool is None:
-            self.last_tool_stats = ToolGenerationStats().record_generation(
-                initial_prompt_tokens,
-                initial_truncated,
-            )
-            return initial_texts
+            self.last_tool_stats = stats
+            return texts
 
         outputs: List[str] = []
-        combined_stats = ToolGenerationStats()
-        for index, initial_text in enumerate(initial_texts):
-            output, branch_stats = self._run_python_branch(
-                msgs,
-                initial_text,
-                initial_prompt_tokens,
-                initial_truncated[index],
-                **gen_kwargs,
+        stats.tool_enabled_candidates = len(texts)
+        for text in texts:
+            execution = self.python_tool.invoke(text)
+            stats.tool_calls += 1
+            stats.tool_names["python"] = stats.tool_names.get("python", 0) + 1
+            stats.successful_tool_calls += int(execution.succeeded)
+            stats.tool_used_candidates += int(execution.succeeded)
+            stats.tool_errors += int(not execution.succeeded)
+            stats.required_tool_misses += int(not execution.succeeded)
+            outputs.append(
+                f"PYTHON_CODE:\n{execution.code}\n"
+                f"TERMINAL_LOG:\n{execution.logs.rstrip()}"
             )
-            outputs.append(output)
-            combined_stats.add(branch_stats)
-        self.last_tool_stats = combined_stats
+        self.last_tool_stats = stats
         return outputs
 
     def generate(self, msgs, **gen_kwargs) -> str:
