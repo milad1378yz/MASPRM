@@ -9,6 +9,7 @@ import os
 import queue
 import random
 import statistics
+import time
 from pathlib import Path
 
 import torch
@@ -24,9 +25,13 @@ from mas import MAS, build_mas_from_specs
 from core import (
     _seed_everything,
     TokenStats,
+    _cluster_answers,
     handoff_sbs_decode,
     sbs_decode2,
     make_scored_voter,
+    make_llm_judge_voter,
+    make_llm_action_ranker,
+    score_pooled_runs,
     load_prm_scorer,
     ensure_separator_token,
     align_model_to_tokenizer,
@@ -34,6 +39,21 @@ from core import (
     MCTSInfer,
     _majority_by_numbers_equal,
 )
+
+# Experiment 2: selectors that consume one shared, cached SC candidate pool.
+POOLED_KINDS = {
+    "pooled_sc",
+    "pooled_logprob",
+    "pooled_orm",
+    "pooled_prm",
+    "pooled_judge",
+}
+HANDOFF_KINDS = {
+    "handoff_fixed",
+    "handoff_random",
+    "handoff_policy",
+    "handoff_prm",
+}
 
 
 @dataclass
@@ -49,7 +69,10 @@ class WorkerInit:
     prm_dir: Optional[str] = None
     prm_base_model_id: Optional[str] = None
     orm_dir: Optional[str] = None
+    judge_model_id: Optional[str] = None
+    judge_load_in_4bit: bool = False
     prm_max_length: int = 2048
+    attn_impl: str = "sdpa"
 
     # dtype options: "float16" | "bfloat16" | "float32"
     dtype: str = "float16"
@@ -74,13 +97,39 @@ def _dtype_from_str(s: str) -> torch.dtype:
     return torch.float16
 
 
-def _paired_handoff_comparison(
+def _binary_auc(scores: List[float], labels: List[bool]) -> float:
+    """Rank-based (Mann-Whitney) AUC with average ranks for ties."""
+    positives = sum(labels)
+    negatives = len(labels) - positives
+    if not positives or not negatives:
+        return float("nan")
+    order = sorted(range(len(scores)), key=lambda i: scores[i])
+    ranks = [0.0] * len(scores)
+    i = 0
+    while i < len(order):
+        j = i
+        while j + 1 < len(order) and scores[order[j + 1]] == scores[order[i]]:
+            j += 1
+        average_rank = (i + j) / 2 + 1
+        for t in range(i, j + 1):
+            ranks[order[t]] = average_rank
+        i = j + 1
+    rank_sum_positive = sum(r for r, label in zip(ranks, labels) if label)
+    return (rank_sum_positive - positives * (positives + 1) / 2) / (positives * negatives)
+
+
+def _paired_condition_comparison(
     policy_correct: Dict[int, bool],
     prm_correct: Dict[int, bool],
     *,
     seed: int,
     bootstrap_samples: int = 10000,
 ) -> Dict[str, float]:
+    """Paired bootstrap CI and exact McNemar between two conditions.
+
+    Keys keep the policy/prm naming: `policy` is the baseline argument and
+    `prm` the treatment (delta = treatment - baseline).
+    """
     common = sorted(set(policy_correct).intersection(prm_correct))
     if not common:
         return {}
@@ -165,6 +214,46 @@ def _cached_correctness(records_path: str):
     return correct, prefixes
 
 
+def _completed_cache_is_valid(
+    results_path: str,
+    summary_path: str,
+    records_path: str,
+    *,
+    manifest_hash: str,
+    expected_count: int,
+) -> bool:
+    """Require a complete, manifest-matched record set before skipping a run."""
+    try:
+        result_lines = Path(results_path).read_text().splitlines()
+        summary = json.loads(Path(summary_path).read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(summary, dict) or not any(
+        line.strip() == "COMPLETED" for line in result_lines
+    ):
+        return False
+
+    seen = set()
+    try:
+        with Path(records_path).open() as records_file:
+            for line in records_file:
+                if not line.strip():
+                    continue
+                record = json.loads(line)
+                idx = int(record["index"])
+                if (
+                    idx in seen
+                    or idx < 0
+                    or idx >= int(expected_count)
+                    or record.get("manifest_hash") != manifest_hash
+                ):
+                    return False
+                seen.add(idx)
+    except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError):
+        return False
+    return seen == set(range(int(expected_count)))
+
+
 def evaluate_conditions_ray(
     data: List[Dict[str, str]],
     worker_init: WorkerInit,
@@ -190,10 +279,12 @@ def evaluate_conditions_ray(
             "PYTHONPATH": f"{existing}:{src_dir}" if existing else src_dir,
             # Pass the cache location to the workers
             "HF_HOME": os.environ.get("HF_HOME", "/tmp/hf"),
-            "HF_HUB_CACHE": os.environ.get("HF_HUB_CACHE", ""),
             # Pass the offline mode setting
             "HF_HUB_OFFLINE": os.environ.get("HF_HUB_OFFLINE", "0"),
         }
+        hf_hub_cache = os.environ.get("HF_HUB_CACHE")
+        if hf_hub_cache:
+            env_vars_to_pass["HF_HUB_CACHE"] = hf_hub_cache
 
         runtime_env = {
             "env_vars": env_vars_to_pass,
@@ -240,6 +331,7 @@ def evaluate_conditions_ray(
                     max_length=int(init.prm_max_length),
                     torch_dtype=self.dtype,
                     step_separator=self.step_sep,
+                    attn_impl=init.attn_impl,
                 )
 
                 # modify the PRM tokenizer/model with the separator
@@ -254,6 +346,7 @@ def evaluate_conditions_ray(
                 # policy LM must not change tokenizer when the PRM row is present.
                 tokenizer=None if self.handoff_config else self.prm_tok,
                 torch_dtype=self.dtype,
+                attn_impl=init.attn_impl,
             )
             self.handoff_mas = (
                 build_handoff_mas_from_specs(
@@ -265,6 +358,24 @@ def evaluate_conditions_ray(
                 else None
             )
 
+            # 3) LLM judge (optional): a second causal LM with deterministic
+            # decoding. One runtime backs both judge modes: pooled listwise
+            # reranking (pooled_judge) and stepwise action ranking (mcts_judge).
+            self.judge = None
+            self.judge_ranker = None
+            if init.judge_model_id:
+                judge_runtime = build_runtime(
+                    init.judge_model_id,
+                    tokenizer=None,
+                    torch_dtype=self.dtype,
+                    load_in_4bit=bool(init.judge_load_in_4bit),
+                    attn_impl=init.attn_impl,
+                )
+                self.judge = make_llm_judge_voter(judge_runtime.model, judge_runtime.tokenizer)
+                self.judge_ranker = make_llm_action_ranker(
+                    judge_runtime.model, judge_runtime.tokenizer
+                )
+
             # 4) ORM scorer (optional) — same API as PRM loader
             self.orm_score_fn = None
             self.orm_tok = None
@@ -275,6 +386,7 @@ def evaluate_conditions_ray(
                     base_model_id=None,  # read from adapter config
                     torch_dtype=self.dtype,
                     step_separator=self.step_sep,
+                    attn_impl=init.attn_impl,
                 )
                 added = ensure_separator_token(self.orm_tok, self.step_sep)
                 print(f"[Worker {self.rank}] Added {added} special tokens for ORM separator.")
@@ -282,7 +394,13 @@ def evaluate_conditions_ray(
                     align_model_to_tokenizer(self.orm_model, self.orm_tok)
 
         # --- decoders by spec.kind
-        def _decode_by_spec(self, q: str, spec: ConditionSpec, example_seed: Optional[int] = None):
+        def _decode_by_spec(
+            self,
+            q: str,
+            spec: ConditionSpec,
+            example_seed: Optional[int] = None,
+            extra: Optional[Dict[str, Any]] = None,
+        ):
             kind = spec.kind
             p = spec.params or {}
 
@@ -308,12 +426,7 @@ def evaluate_conditions_ray(
             # "local" = only what the scored agent itself received + produced.
             view_mode = str(p.get("view_mode", "full")).lower()
 
-            if kind in {
-                "handoff_fixed",
-                "handoff_random",
-                "handoff_policy",
-                "handoff_prm",
-            }:
+            if kind in HANDOFF_KINDS:
                 if self.handoff_mas is None:
                     raise ValueError(
                         "A handoff condition requires a config with a handoff section."
@@ -388,10 +501,105 @@ def evaluate_conditions_ray(
             # Build MAS for the first run
             mas0 = build_mas()
 
+            # Experiment 2: build the shared SC candidate pool. Mirrors
+            # voter_plain's sampling exactly (first run on mas0, fresh MAS
+            # afterwards) so the cached pool is what SC@k would have drawn.
+            if kind == "pool_build":
+                total = TokenStats()
+                runs: List[Dict[str, Any]] = []
+                mas_list = [mas0] + [build_mas() for _ in range(max(0, k - 1))]
+                for mas_i in mas_list:
+                    pred_i, u_i, tr = base_policy_with_trace(mas_i, q)
+                    total.add(u_i)
+                    tr_run = [e for e in (tr or []) if e.get("chosen_text") not in (None, "")]
+                    runs.append(
+                        {
+                            "steps": [str(e["chosen_text"]) for e in tr_run],
+                            "agent_ids": [int(e["agent_idx"]) for e in tr_run],
+                            "answer": str(pred_i),
+                        }
+                    )
+                answers = [run["answer"] for run in runs]
+                pred = _majority_by_numbers_equal(answers)
+                return (
+                    pred,
+                    answers,
+                    total.generated,
+                    total.prm_calls,
+                    total.agent_runs,
+                    {"pool_runs": runs},
+                )
+
+            # Experiment 2: selectors over the identical cached pool.
+            if kind in POOLED_KINDS:
+                entry = extra or {}
+                runs = list(entry.get("runs") or [])
+                if not runs:
+                    raise ValueError("Pooled condition received no cached candidate pool entry.")
+                answers = [str(run.get("answer", "")) for run in runs]
+                start_time = time.perf_counter()
+                judge_meta: Dict[str, Any] = {}
+                if kind == "pooled_judge":
+                    if self.judge is None:
+                        raise ValueError("pooled_judge requires judge_model_id.")
+                    weights, info = self.judge(
+                        q, [[str(s) for s in run.get("steps", [])] for run in runs]
+                    )
+                    total = TokenStats()
+                    total.scorer += int(info.get("prompt_tokens", 0)) + int(
+                        info.get("generated_tokens", 0)
+                    )
+                    judge_meta = {
+                        "judge_calls": 1,
+                        "judge_parse_failures": int(not info.get("parsed")),
+                        "judge_prompt_tokens": int(info.get("prompt_tokens", 0)),
+                        "judge_generated_tokens": int(info.get("generated_tokens", 0)),
+                    }
+                else:
+                    score_mode = {
+                        "pooled_sc": "sc",
+                        "pooled_logprob": "logprob",
+                        "pooled_orm": "orm",
+                        "pooled_prm": "prm",
+                    }[kind]
+                    score_fn = (
+                        self.prm_score_fn
+                        if score_mode == "prm"
+                        else (self.orm_score_fn if score_mode == "orm" else None)
+                    )
+                    weights, total = score_pooled_runs(
+                        mas0,
+                        q,
+                        runs,
+                        score_mode=score_mode,
+                        score_fn=score_fn,
+                        prm_tokenizer=self.prm_tok if score_mode == "prm" else None,
+                        orm_tokenizer=self.orm_tok if score_mode == "orm" else None,
+                        step_separator=self.step_sep,
+                        logprob_agg=str(p.get("logprob_agg", "sum")),
+                        view_mode=view_mode,
+                    )
+                latency = time.perf_counter() - start_time
+                pred = _cluster_answers(list(zip(answers, weights)))
+                metadata = {
+                    "pool_answers": answers,
+                    "pool_weights": [float(w) for w in weights],
+                    "latency_s": float(latency),
+                    **judge_meta,
+                }
+                return (
+                    pred,
+                    answers,
+                    total.generated,
+                    total.prm_calls,
+                    total.agent_runs,
+                    metadata,
+                )
+
             #  SBS variants
             if kind == "sbs_none":
                 finals: List[str] = []
-                pred, usage = sbs_decode2(
+                pred, usage, trace = sbs_decode2(
                     mas0,
                     q,
                     score_type="none",
@@ -400,14 +608,45 @@ def evaluate_conditions_ray(
                     gen_kwargs=sbs_kwargs,
                     step_separator=self.step_sep,
                     final_answers_out=finals,
+                    return_trace=True,
                 )
                 candidates = finals[:pass_k] if finals else [pred]
+                agent_traces = [
+                    {
+                        "agent_idx": int(step["agent_idx"]),
+                        "agent_name": mas0.agents[int(step["agent_idx"])].name,
+                        "trace": str(step["chosen_text"]),
+                    }
+                    for step in trace
+                    if step.get("chosen_text")
+                ]
+                tool_traces = [
+                    step
+                    for step in agent_traces
+                    if mas0.agents[step["agent_idx"]].python_tool is not None
+                ]
+                agent_stats = [
+                    {
+                        "agent_idx": idx,
+                        "agent_name": agent.name,
+                        "model_responses": agent.last_tool_stats.model_responses,
+                        "max_prompt_tokens": agent.last_tool_stats.max_prompt_tokens,
+                        "truncated_responses": agent.last_tool_stats.truncated_responses,
+                    }
+                    for idx, agent in enumerate(mas0.agents)
+                ]
                 return (
                     pred,
                     candidates,
                     usage.generated,
                     usage.prm_calls,
                     usage.agent_runs,
+                    {
+                        "tool_usage": usage.tool_usage(),
+                        "agent_traces": agent_traces,
+                        "tool_traces": tool_traces,
+                        "agent_stats": agent_stats,
+                    },
                 )
 
             if kind == "sbs_prm":
@@ -457,12 +696,15 @@ def evaluate_conditions_ray(
                 )
 
             #  MCTS variants
-            if kind in ("mcts_prm", "mcts_logprob", "mcts_orm"):
+            if kind in ("mcts_prm", "mcts_logprob", "mcts_orm", "mcts_judge"):
                 score_type = {
                     "mcts_prm": "prm",
                     "mcts_logprob": "logprob",
                     "mcts_orm": "orm",
+                    "mcts_judge": "judge",
                 }[kind]
+                if score_type == "judge" and self.judge_ranker is None:
+                    raise ValueError("mcts_judge requires judge_model_id.")
                 score_fn = (
                     self.prm_score_fn
                     if score_type == "prm"
@@ -494,20 +736,31 @@ def evaluate_conditions_ray(
                     logprob_agg=p.get("logprob_agg", "sum"),
                     leaf_score_fn=leaf_fn,
                     view_mode=view_mode,
+                    action_ranker=(self.judge_ranker if score_type == "judge" else None),
                 )
+                start_time = time.perf_counter()
                 pred, usage = infer.decode(n_simulations=n_sims)
+                latency = time.perf_counter() - start_time
                 try:
                     candidates = infer.get_topk_answers(k=pass_k)
                 except Exception:
                     candidates = []
                 if not candidates:
                     candidates = [pred]
+                metadata: Dict[str, Any] = {}
+                if infer.judge_calls:
+                    metadata = {
+                        "judge_calls": int(infer.judge_calls),
+                        "judge_parse_failures": int(infer.judge_parse_failures),
+                        "latency_s": float(latency),
+                    }
                 return (
                     pred,
                     candidates,
                     usage.generated,
                     usage.prm_calls,
                     usage.agent_runs,
+                    metadata,
                 )
 
             #  Majority voters
@@ -612,11 +865,11 @@ def evaluate_conditions_ray(
                     item = in_q.get()
                     if item is None:
                         break
-                    idx, q, gold, ex_seed = item
+                    idx, q, gold, ex_seed, extra = item
                     _seed_everything(int(ex_seed))
                     metadata: Dict[str, Any] = {}
                     try:
-                        res = self._decode_by_spec(q, spec, example_seed=int(ex_seed))
+                        res = self._decode_by_spec(q, spec, example_seed=int(ex_seed), extra=extra)
                         # normalize length (be paranoid)
                         if isinstance(res, tuple):
                             if len(res) == 6:
@@ -691,6 +944,9 @@ def evaluate_conditions_ray(
                 source_root / "handoff_mas.py",
                 source_root / "agent.py",
                 source_root / "answer_utils.py",
+                source_root / "dataset_handler.py",
+                source_root / "mas.py",
+                source_root / "tooling.py",
             )
         )
     ).hexdigest()
@@ -707,30 +963,175 @@ def evaluate_conditions_ray(
         "prm_base_model_id": worker_init.prm_base_model_id,
         "orm": _checkpoint_identity(worker_init.orm_dir),
         "dtype": worker_init.dtype,
+        "attn_implementation": worker_init.attn_impl,
         "seed": worker_init.seed,
         "implementation_sha256": implementation_sha256,
     }
-    handoff_kinds = {
-        "handoff_fixed",
-        "handoff_random",
-        "handoff_policy",
-        "handoff_prm",
-    }
+    handoff_kinds = HANDOFF_KINDS
     handoff_bundle_needs_prm = any(spec.kind == "handoff_prm" for spec in conditions)
     handoff_workers = None
+
+    # ---- Experiment 2: one cached SC candidate pool shared by every pooled
+    # selector, so all of them rank byte-identical trajectories.
+    pooled_specs = [spec for spec in conditions if spec.kind in POOLED_KINDS]
+    pool_entries: Dict[int, Dict[str, Any]] = {}
+    pool_path: Optional[Path] = None
+    if pooled_specs:
+        pool_sizes = {int(spec.params.get("k", 5)) for spec in pooled_specs}
+        if len(pool_sizes) != 1:
+            raise ValueError("All pooled conditions must share the same pool size k.")
+        pool_k = pool_sizes.pop()
+        pool_gen_kwargs = pooled_specs[0].params.get(
+            "gen_kwargs",
+            {"temperature": 1.0, "top_p": 0.95, "max_new_tokens": 1024},
+        )
+        pool_manifest = {
+            "dataset": name_dataset,
+            "data_count": N_TOTAL,
+            "data_sha256": _stable_hash(data),
+            "agent_specs": worker_init.agent_specs,
+            "edges": worker_init.edges,
+            "step_separator": worker_init.step_separator,
+            "gen_model_id": worker_init.gen_model_id,
+            "seed": worker_init.seed,
+            "k": pool_k,
+            "gen_kwargs": pool_gen_kwargs,
+        }
+        pool_hash = _stable_hash(pool_manifest)
+        pool_dir = Path("cache/pools")
+        pool_dir.mkdir(parents=True, exist_ok=True)
+        model_tail = worker_init.gen_model_id.split("/")[-1]
+        pool_path = pool_dir / f"sc{pool_k}_{name_dataset}_{model_tail}_{pool_hash[:12]}.jsonl"
+        if pool_path.exists():
+            lines = pool_path.read_text().splitlines()
+            header = json.loads(lines[0]) if lines else {}
+            if header.get("pool_hash") != pool_hash:
+                raise RuntimeError(f"Candidate pool {pool_path} does not match this configuration.")
+            for line in lines[1:]:
+                if line.strip():
+                    entry = json.loads(line)
+                    pool_entries[int(entry["index"])] = entry
+            print(
+                f"[pool] Loaded {len(pool_entries)} cached SC@{pool_k} pools " f"from {pool_path}."
+            )
+        else:
+            print(f"[pool] Building SC@{pool_k} candidate pools -> {pool_path}")
+            build_spec = ConditionSpec(
+                "SC pool build",
+                "pool_build",
+                {"k": pool_k, "gen_kwargs": pool_gen_kwargs},
+            )
+            build_init = WorkerInit(
+                agent_specs=worker_init.agent_specs,
+                edges=worker_init.edges,
+                handoff_config=None,
+                step_separator=worker_init.step_separator,
+                gen_model_id=worker_init.gen_model_id,
+                attn_impl=worker_init.attn_impl,
+                dtype=worker_init.dtype,
+                seed=worker_init.seed,
+            )
+            workers = [
+                EvalWorker.remote(build_init, worker_init.dtype, rank=i) for i in range(num_workers)
+            ]
+            in_q = Queue()
+            out_q = Queue()
+            consume_refs = [w.consume.remote(build_spec, in_q, out_q) for w in workers]
+            base_seed = int(worker_init.seed or 0)
+            for idx, ex in enumerate(data):
+                in_q.put((idx, ex["question"], ex["answer"], base_seed + idx, None))
+            for _ in workers:
+                in_q.put(None)
+            build_errors = 0
+            finished = 0
+            pbar = tqdm(total=len(data), desc="Building SC pool")
+            while finished < len(workers):
+                try:
+                    item = out_q.get(timeout=5)
+                except queue.Empty:
+                    ready_refs, _ = ray.wait(consume_refs, timeout=0)
+                    for ref in ready_refs:
+                        try:
+                            ray.get(ref)
+                        except Exception as e:
+                            print(f"\n[CRITICAL] A pool-build worker crashed! {e}")
+                            finished += 1
+                            consume_refs.remove(ref)
+                            build_errors += 1
+                    continue
+                if item is None:
+                    finished += 1
+                    continue
+                idx = int(item[0])
+                metadata = item[6]
+                if (
+                    not isinstance(metadata, dict)
+                    or metadata.get("error")
+                    or not metadata.get("pool_runs")
+                ):
+                    build_errors += 1
+                else:
+                    pool_entries[idx] = {
+                        "index": idx,
+                        "question_sha256": hashlib.sha256(
+                            data[idx]["question"].encode("utf-8")
+                        ).hexdigest(),
+                        "runs": metadata["pool_runs"],
+                    }
+                pbar.update(1)
+            pbar.close()
+            if consume_refs:
+                ray.get(consume_refs)
+            for w in workers:
+                ray.kill(w, no_restart=True)
+            for queue_actor in (in_q, out_q):
+                try:
+                    queue_actor.shutdown()
+                except Exception:
+                    pass
+            if build_errors or len(pool_entries) != len(data):
+                raise RuntimeError(
+                    f"Candidate-pool build failed: {len(pool_entries)}/{len(data)} "
+                    f"pools, {build_errors} errors."
+                )
+            payload = [
+                json.dumps(
+                    {"pool_hash": pool_hash, "manifest": pool_manifest},
+                    ensure_ascii=False,
+                    default=str,
+                )
+            ]
+            payload.extend(
+                json.dumps(pool_entries[idx], ensure_ascii=False) for idx in sorted(pool_entries)
+            )
+            pool_path.write_text("\n".join(payload) + "\n")
+            print(f"[pool] Wrote {len(pool_entries)} pools to {pool_path}.")
+
+        # Belt and braces: the pool must match this exact dataset selection.
+        for idx, ex in enumerate(data):
+            entry = pool_entries.get(idx)
+            expected = hashlib.sha256(ex["question"].encode("utf-8")).hexdigest()
+            if entry is None or entry.get("question_sha256") != expected:
+                raise RuntimeError(
+                    f"Candidate pool {pool_path} does not cover example {idx}; "
+                    "delete the file to rebuild it."
+                )
+
     for spec in conditions:
         condition_needs_prm = spec.kind in {
             "sbs_prm",
             "mcts_prm",
             "voter_prm",
             "handoff_prm",
+            "pooled_prm",
         } or (str(spec.params.get("leaf_score_type", "")).lower() == "prm")
         worker_needs_prm = condition_needs_prm or (
             spec.kind in handoff_kinds and handoff_bundle_needs_prm
         )
-        needs_orm = spec.kind in {"mcts_orm", "voter_orm"} or (
+        needs_orm = spec.kind in {"mcts_orm", "voter_orm", "pooled_orm"} or (
             str(spec.params.get("leaf_score_type", "")).lower() == "orm"
         )
+        needs_judge = spec.kind in {"pooled_judge", "mcts_judge"}
         spec_worker_init = WorkerInit(
             agent_specs=worker_init.agent_specs,
             edges=worker_init.edges,
@@ -738,9 +1139,12 @@ def evaluate_conditions_ray(
             step_separator=worker_init.step_separator,
             gen_model_id=worker_init.gen_model_id,
             prm_dir=worker_init.prm_dir if worker_needs_prm else None,
-            prm_base_model_id=worker_init.prm_base_model_id if worker_needs_prm else None,
+            prm_base_model_id=(worker_init.prm_base_model_id if worker_needs_prm else None),
             orm_dir=worker_init.orm_dir if needs_orm else None,
+            judge_model_id=worker_init.judge_model_id if needs_judge else None,
+            judge_load_in_4bit=worker_init.judge_load_in_4bit,
             prm_max_length=int(spec.params.get("prm_context_length", worker_init.prm_max_length)),
+            attn_impl=worker_init.attn_impl,
             dtype=worker_init.dtype,
             seed=worker_init.seed,
         )
@@ -788,29 +1192,31 @@ def evaluate_conditions_ray(
             )
             + "\n"
         )
-        # If file already contains a COMPLETED marker, skip this condition
+        if _completed_cache_is_valid(
+            results_path,
+            summary_path,
+            records_path,
+            manifest_hash=manifest_hash,
+            expected_count=N_TOTAL,
+        ):
+            results[spec.name] = json.loads(Path(summary_path).read_text())
+            cached_correct, cached_prefixes = _cached_correctness(records_path)
+            correct_by_kind[spec.kind] = cached_correct
+            if any(cached_prefixes[threshold] for threshold in cached_prefixes):
+                prefix_correct_by_kind[spec.kind] = cached_prefixes
+            print(f"[skip] Loaded completed '{spec.name}' from {results_path}.")
+            continue
         if Path(results_path).exists():
-            try:
-                txt = Path(results_path).read_text()
-            except Exception:
-                txt = ""
-            if "COMPLETED" in txt:
-                if Path(summary_path).exists() and Path(records_path).exists():
-                    results[spec.name] = json.loads(Path(summary_path).read_text())
-                    cached_correct, cached_prefixes = _cached_correctness(records_path)
-                    correct_by_kind[spec.kind] = cached_correct
-                    if any(cached_prefixes[threshold] for threshold in cached_prefixes):
-                        prefix_correct_by_kind[spec.kind] = cached_prefixes
-                    print(f"[skip] Loaded completed '{spec.name}' from {results_path}.")
-                    continue
-                print(f"[rerun] Completed text log for '{spec.name}' lacks cache sidecars.")
-        # Write a start header (append if rerunning)
-        with open(results_path, "a") as f:
+            print(f"[rerun] Resetting incomplete cache for '{spec.name}'.")
+
+        # A rerun must not retain a stale COMPLETED marker or summary.
+        with open(results_path, "w") as f:
             f.write(
                 f"=== START {spec.name} | dataset={name_dataset} | N={N_TOTAL} "
                 f"| manifest={manifest_hash} ===\n"
             )
         Path(records_path).write_text("")
+        Path(summary_path).unlink(missing_ok=True)
 
         if spec.kind not in handoff_kinds and handoff_workers is not None:
             for worker in handoff_workers:
@@ -830,9 +1236,18 @@ def evaluate_conditions_ray(
         consume_refs = [w.consume.remote(spec, in_q, out_q) for w in workers]
 
         base_seed = int(getattr(worker_init, "seed", 0) or 0)
+        needs_pool_entry = spec.kind in POOLED_KINDS
         for idx, ex in enumerate(data):
             ex_seed = base_seed + idx
-            in_q.put((idx, ex["question"], ex["answer"], ex_seed))
+            in_q.put(
+                (
+                    idx,
+                    ex["question"],
+                    ex["answer"],
+                    ex_seed,
+                    pool_entries.get(idx) if needs_pool_entry else None,
+                )
+            )
         for _ in range(len(workers)):
             in_q.put(None)
 
@@ -857,7 +1272,19 @@ def evaluate_conditions_ray(
         context_truncations = 0
         parse_failures_total = 0
         proposals_total = 0
+        prm_evaluations_total = 0
         decoder_errors = 0
+        pooled_examples = 0
+        oracle_hits = 0
+        solvable_examples = 0
+        solvable_and_correct = 0
+        candidate_scores: List[float] = []
+        candidate_labels: List[bool] = []
+        latencies: List[float] = []
+        judge_calls_total = 0
+        judge_parse_failures_total = 0
+        tool_usage_totals: Counter = Counter()
+        tool_names_total: Counter = Counter()
         pbar = tqdm(total=len(data), desc=f"Evaluating: {spec.name}")
         while finished < len(workers):
             try:
@@ -919,6 +1346,35 @@ def evaluate_conditions_ray(
                 context_truncations += int(metadata.get("prm_truncations", 0))
                 parse_failures_total += int(metadata.get("parse_failures", 0))
                 proposals_total += int(metadata.get("agent_proposals", 0))
+                prm_evaluations_total += int(metadata.get("prm_evaluations", 0))
+            if isinstance(metadata, dict) and "pool_answers" in metadata:
+                pooled_examples += 1
+                pool_answers = [str(answer) for answer in metadata.get("pool_answers", [])]
+                pool_weights = [float(weight) for weight in metadata.get("pool_weights", [])]
+                labels = [bool(is_correct(answer, gold)) for answer in pool_answers]
+                oracle_hits += int(any(labels))
+                if any(labels):
+                    solvable_examples += 1
+                    solvable_and_correct += int(top_correct)
+                candidate_scores.extend(pool_weights)
+                candidate_labels.extend(labels)
+            if isinstance(metadata, dict) and "latency_s" in metadata:
+                latencies.append(float(metadata["latency_s"]))
+            if isinstance(metadata, dict) and metadata.get("judge_calls"):
+                judge_calls_total += int(metadata.get("judge_calls", 0))
+                judge_parse_failures_total += int(metadata.get("judge_parse_failures", 0))
+            if isinstance(metadata, dict) and isinstance(metadata.get("tool_usage"), dict):
+                tool_usage = metadata["tool_usage"]
+                for key, value in tool_usage.items():
+                    if key != "tool_names":
+                        if key == "max_prompt_tokens":
+                            tool_usage_totals[str(key)] = max(
+                                tool_usage_totals[str(key)], int(value)
+                            )
+                        else:
+                            tool_usage_totals[str(key)] += int(value)
+                for tool_name, count in tool_usage.get("tool_names", {}).items():
+                    tool_names_total[str(tool_name)] += int(count)
             if isinstance(metadata, dict) and metadata.get("error"):
                 decoder_errors += 1
 
@@ -959,6 +1415,10 @@ def evaluate_conditions_ray(
                     f"p@{i+1}={pass_counts[i]/max(1, seen):.4f}" for i in range(MAX_PASS_K)
                 )
                 with open(results_path, "a") as f:
+                    tool_enabled = tool_usage_totals["tool_enabled_candidates"]
+                    tool_used = tool_usage_totals["tool_used_candidates"]
+                    model_responses = tool_usage_totals["model_responses"]
+                    truncated_responses = tool_usage_totals["truncated_responses"]
                     f.write(
                         "[progress] "
                         f"{seen}/{N_TOTAL} "
@@ -968,7 +1428,9 @@ def evaluate_conditions_ray(
                         f"prm_calls_total={prm_calls_total} "
                         f"agent_runs_total={agent_runs_total} "
                         f"prm_calls_mean={prm_calls_total/max(1, seen):.2f} "
-                        f"agent_runs_mean={agent_runs_total/max(1, seen):.2f}\n"
+                        f"agent_runs_mean={agent_runs_total/max(1, seen):.2f} "
+                        f"tool_use={tool_used/max(1, tool_enabled):.4f} "
+                        f"trunc={truncated_responses/max(1, model_responses):.4f}\n"
                     )
 
         pbar.close()
@@ -979,10 +1441,47 @@ def evaluate_conditions_ray(
         if spec.kind not in handoff_kinds:
             for w in workers:
                 ray.kill(w, no_restart=True)
+        for queue_actor in (in_q, out_q):
+            try:
+                queue_actor.shutdown()
+            except Exception:
+                pass
 
         processed = len(totals)
         mean = float(statistics.mean(totals)) if totals else 0.0
         std = float(statistics.pstdev(totals)) if len(totals) > 1 else 0.0
+        tool_enabled = int(tool_usage_totals["tool_enabled_candidates"])
+        tool_used = int(tool_usage_totals["tool_used_candidates"])
+        tool_calls = int(tool_usage_totals["tool_calls"])
+        successful_tool_calls = int(tool_usage_totals["successful_tool_calls"])
+        model_responses = int(tool_usage_totals["model_responses"])
+        model_prompt_tokens = int(tool_usage_totals["model_prompt_tokens"])
+        truncated_responses = int(tool_usage_totals["truncated_responses"])
+        tool_summary = {
+            "tool_enabled_candidates_total": tool_enabled,
+            "tool_used_candidates_total": tool_used,
+            "tool_use_rate": tool_used / tool_enabled if tool_enabled else 0.0,
+            "tool_model_responses_total": model_responses,
+            "model_prompt_tokens_total": model_prompt_tokens,
+            "model_prompt_tokens_mean": (
+                model_prompt_tokens / model_responses if model_responses else 0.0
+            ),
+            "max_prompt_tokens": int(tool_usage_totals["max_prompt_tokens"]),
+            "truncated_responses_total": truncated_responses,
+            "response_truncation_rate": (
+                truncated_responses / model_responses if model_responses else 0.0
+            ),
+            "tool_calls_total": tool_calls,
+            "successful_tool_calls_total": successful_tool_calls,
+            "successful_tool_call_rate": (
+                successful_tool_calls / tool_calls if tool_calls else 0.0
+            ),
+            "tool_errors_total": int(tool_usage_totals["tool_errors"]),
+            "invalid_tool_calls_total": int(tool_usage_totals["invalid_tool_calls"]),
+            "required_tool_misses_total": int(tool_usage_totals["required_tool_misses"]),
+            "forced_tool_reprompts_total": int(tool_usage_totals["forced_tool_reprompts"]),
+            "tool_names": dict(sorted(tool_names_total.items())),
+        }
 
         if worker_crashed or processed != len(data) or decoder_errors:
             with open(results_path, "a") as f:
@@ -999,9 +1498,11 @@ def evaluate_conditions_ray(
                 "tok_mean": mean,
                 "tok_std": std,
                 "prm_calls_total": int(prm_calls_total),
+                "prm_evaluations_total": int(prm_evaluations_total),
                 "agent_runs_total": int(agent_runs_total),
                 "prm_calls_mean": float("nan"),
                 "agent_runs_mean": float("nan"),
+                **tool_summary,
             }
             for i in range(1, MAX_PASS_K + 1):
                 results[spec.name][f"pass_at_{i}"] = float("nan")
@@ -1021,9 +1522,12 @@ def evaluate_conditions_ray(
             "tok_mean": mean,
             "tok_std": std,
             "prm_calls_total": int(prm_calls_total),
+            "prm_evaluations_total": int(prm_evaluations_total),
             "agent_runs_total": int(agent_runs_total),
             "prm_calls_mean": float(prm_calls_total) / n,
+            "prm_evaluations_mean": float(prm_evaluations_total) / n,
             "agent_runs_mean": float(agent_runs_total) / n,
+            **tool_summary,
         }
         correct_by_kind[spec.kind] = condition_correct
         if handoff_examples:
@@ -1083,6 +1587,29 @@ def evaluate_conditions_ray(
             )
             results[spec.name].update(handoff_summary)
 
+        if pooled_examples:
+            results[spec.name].update(
+                {
+                    "oracle_hit_at_k": oracle_hits / pooled_examples,
+                    "selection_accuracy_given_solvable": (
+                        solvable_and_correct / solvable_examples
+                        if solvable_examples
+                        else float("nan")
+                    ),
+                    "candidate_auc": _binary_auc(candidate_scores, candidate_labels),
+                }
+            )
+        if latencies:
+            results[spec.name]["latency_mean_s"] = float(statistics.mean(latencies))
+        if judge_calls_total:
+            results[spec.name].update(
+                {
+                    "judge_calls_total": judge_calls_total,
+                    "judge_calls_mean": judge_calls_total / n,
+                    "judge_parse_failure_rate": (judge_parse_failures_total / judge_calls_total),
+                }
+            )
+
         Path(summary_path).write_text(
             json.dumps(results[spec.name], indent=2, sort_keys=True) + "\n"
         )
@@ -1097,6 +1624,36 @@ def evaluate_conditions_ray(
             f.write(f"Total Agent runs: {agent_runs_total}\n")
             f.write(f"Mean PRM calls per example: {results[spec.name]['prm_calls_mean']:.2f}\n")
             f.write(f"Mean Agent runs per example: {results[spec.name]['agent_runs_mean']:.2f}\n")
+            f.write(
+                "Model prompt tokens (mean/max): "
+                f"{tool_summary['model_prompt_tokens_mean']:.1f}/"
+                f"{tool_summary['max_prompt_tokens']}\n"
+            )
+            f.write(
+                "Output truncations: "
+                f"{tool_summary['truncated_responses_total']}/"
+                f"{tool_summary['tool_model_responses_total']} "
+                f"({tool_summary['response_truncation_rate']:.4f})\n"
+            )
+            if tool_enabled:
+                f.write(
+                    "Required-tool use: "
+                    f"{tool_used}/{tool_enabled} "
+                    f"({results[spec.name]['tool_use_rate']:.4f})\n"
+                )
+                f.write(
+                    "Successful tool calls: "
+                    f"{successful_tool_calls}/{tool_calls} "
+                    f"({results[spec.name]['successful_tool_call_rate']:.4f})\n"
+                )
+                f.write(f"Tool calls by name: {dict(sorted(tool_names_total.items()))}\n")
+                f.write(
+                    "Tool errors / invalid calls / required misses / forced reprompts: "
+                    f"{tool_summary['tool_errors_total']} / "
+                    f"{tool_summary['invalid_tool_calls_total']} / "
+                    f"{tool_summary['required_tool_misses_total']} / "
+                    f"{tool_summary['forced_tool_reprompts_total']}\n"
+                )
             if handoff_examples:
                 f.write(f"Hit@1 at 4 messages: {results[spec.name]['hit_at_4']:.4f}\n")
                 f.write(f"Hit@1 at 8 messages: {results[spec.name]['hit_at_8']:.4f}\n")
@@ -1132,6 +1689,30 @@ def evaluate_conditions_ray(
                     f"{results[spec.name]['agent_runs_mean']:.2f}/"
                     f"{results[spec.name]['agent_proposals_mean']:.2f}\n"
                 )
+                f.write(
+                    "Batched PRM calls / successor evaluations per example: "
+                    f"{results[spec.name]['prm_calls_mean']:.2f}/"
+                    f"{results[spec.name]['prm_evaluations_mean']:.2f}\n"
+                )
+            if pooled_examples:
+                f.write(
+                    f"Oracle Hit@k on shared pool: "
+                    f"{results[spec.name]['oracle_hit_at_k']:.4f}\n"
+                )
+                f.write(
+                    "Selection accuracy given solvable pool: "
+                    f"{results[spec.name]['selection_accuracy_given_solvable']:.4f}\n"
+                )
+                f.write(f"Candidate AUC: {results[spec.name]['candidate_auc']:.4f}\n")
+            if latencies:
+                f.write(
+                    f"Selector latency mean (s): " f"{results[spec.name]['latency_mean_s']:.3f}\n"
+                )
+            if judge_calls_total:
+                f.write(
+                    f"Judge calls: {judge_calls_total} | parse-failure rate: "
+                    f"{results[spec.name]['judge_parse_failure_rate']:.4f}\n"
+                )
             f.write("COMPLETED\n")
 
         pass_str = " ".join(f"p@{i+1}={pass_at[i]:.4f}" for i in range(MAX_PASS_K))
@@ -1146,7 +1727,7 @@ def evaluate_conditions_ray(
 
     if "handoff_policy" in prefix_correct_by_kind and "handoff_prm" in prefix_correct_by_kind:
         comparisons = {
-            threshold: _paired_handoff_comparison(
+            threshold: _paired_condition_comparison(
                 prefix_correct_by_kind["handoff_policy"][threshold],
                 prefix_correct_by_kind["handoff_prm"][threshold],
                 seed=worker_init.seed + threshold,
@@ -1181,5 +1762,39 @@ def evaluate_conditions_ray(
                 Path(comparison_path).with_suffix(".summary.json").write_text(
                     json.dumps(results[prm_name], indent=2, sort_keys=True) + "\n"
                 )
+
+    # Paired stats against the MASPRM-guided variant of the same family:
+    # every pooled selector vs pooled_prm, and judge-guided vs PRM-guided MCTS.
+    comparison_pairs = [
+        (kind, "pooled_prm")
+        for kind in correct_by_kind
+        if kind in POOLED_KINDS and kind != "pooled_prm"
+    ]
+    comparison_pairs.append(("mcts_judge", "mcts_prm"))
+    for kind, reference_kind in comparison_pairs:
+        if kind not in correct_by_kind or reference_kind not in correct_by_kind:
+            continue
+        comparison = _paired_condition_comparison(
+            correct_by_kind[kind],
+            correct_by_kind[reference_kind],
+            seed=worker_init.seed,
+        )
+        name = result_name_by_kind.get(kind)
+        if not comparison or name not in results:
+            continue
+        results[name].update({f"vs_masprm_{key}": value for key, value in comparison.items()})
+        row_path = result_path_by_kind.get(kind)
+        if row_path:
+            with open(row_path, "a") as f:
+                f.write(
+                    "Paired MASPRM-vs-this accuracy delta (95% bootstrap CI): "
+                    f"{comparison['paired_accuracy_delta']:.4f} "
+                    f"[{comparison['paired_bootstrap_ci_low']:.4f}, "
+                    f"{comparison['paired_bootstrap_ci_high']:.4f}] | "
+                    f"McNemar p={comparison['mcnemar_exact_p']:.6f}\n"
+                )
+            Path(row_path).with_suffix(".summary.json").write_text(
+                json.dumps(results[name], indent=2, sort_keys=True) + "\n"
+            )
 
     return results

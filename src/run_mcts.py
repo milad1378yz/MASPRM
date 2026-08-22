@@ -73,9 +73,7 @@ def node_to_dict(node: Node, max_children: int = 8) -> Dict[str, Any]:
         "visits": node.visits,
         "q_sum": node.q_sum,
         "q_mean": node.q_mean,
-        "children": [
-            node_to_dict(ch, max_children) for ch in node.children[:max_children]
-        ],
+        "children": [node_to_dict(ch, max_children) for ch in node.children[:max_children]],
         "node_text": node.node_text,
     }
 
@@ -141,9 +139,7 @@ def print_top_rollouts(root: Node, truth: str, k: int = 3):
         for step_idx, a in enumerate(actions, 1):
             print(f"Step {step_idx}: {a}")
         print(f"Final answer: {leaf.final_answer}")
-        print(
-            f"Reward score: {score}   (visits={leaf.visits}, q_mean={leaf.q_mean:.3f})"
-        )
+        print(f"Reward score: {score}   (visits={leaf.visits}, q_mean={leaf.q_mean:.3f})")
 
 
 @ray.remote(num_gpus=1)
@@ -171,9 +167,7 @@ class RayWorker:
             attn_impl=attn_impl,
             compile_model=compile_model,
         )
-        self.mas = build_mas_from_specs(
-            runtime.model, runtime.tokenizer, agent_specs, edges
-        )
+        self.mas = build_mas_from_specs(runtime.model, runtime.tokenizer, agent_specs, edges)
 
     def run_one(
         self,
@@ -222,6 +216,7 @@ def main():
             "aqua_rat",
             "svamp",
             "gsm8k",
+            "mgsm",
             "mmlu",
             "gpqa",
             "logiqa",
@@ -251,11 +246,18 @@ def main():
         help="Enable 4-bit quantization (bitsandbytes).",
     )
     ap.add_argument("--attn_impl", type=str, default="sdpa")
-    ap.add_argument(
-        "--no_compile", action="store_true", help="Disable torch.compile()."
-    )
+    ap.add_argument("--no_compile", action="store_true", help="Disable torch.compile().")
 
     ap.add_argument("--n_rollouts", type=int, default=64)
+    ap.add_argument(
+        "--search_c",
+        type=float,
+        default=None,
+        help="MCTS exploration constant. Defaults to 8 with Ray and 4 otherwise.",
+    )
+    ap.add_argument("--n_candidates", type=int, default=4)
+    ap.add_argument("--temperature", type=float, default=0.7)
+    ap.add_argument("--top_p", type=float, default=0.95)
 
     ap.add_argument(
         "--mas_config",
@@ -265,9 +267,7 @@ def main():
     )
 
     # Ray parallelism flags (optional)
-    ap.add_argument(
-        "--ray", action="store_true", help="Parallelize across GPUs using Ray actors."
-    )
+    ap.add_argument("--ray", action="store_true", help="Parallelize across GPUs using Ray actors.")
     ap.add_argument(
         "--actors",
         type=int,
@@ -282,26 +282,31 @@ def main():
     )
 
     args = ap.parse_args()
+    if args.n_rollouts < 1:
+        ap.error("--n_rollouts must be at least 1")
+    if args.n_candidates < 1:
+        ap.error("--n_candidates must be at least 1")
+    if args.search_c is not None and args.search_c < 0:
+        ap.error("--search_c cannot be negative")
+    if args.temperature <= 0:
+        ap.error("--temperature must be greater than zero")
+    if not 0 < args.top_p <= 1:
+        ap.error("--top_p must be in the interval (0, 1]")
 
     # Load dataset
     data, q_fn, gold_fn = load_hard_dataset(args.dataset, args.split, args.n, args.seed)
 
     # Load MAS graph (agents + edges) from YAML
     cfg_path = (
-        Path(args.mas_config)
-        if args.mas_config
-        else Path("configs") / f"{args.dataset}.yaml"
+        Path(args.mas_config) if args.mas_config else Path("configs") / f"{args.dataset}.yaml"
     )
     cfg = yaml.safe_load(cfg_path.read_text())
     agent_specs = cfg["agents"]
     edges = cfg["edges"]
 
-    if args.ray:
-        search_c = 8.0
-    else:
-        search_c = 4.0
-    search_n_candidates = 4
-    search_gen_kwargs = dict(temperature=0.7, top_p=0.95)
+    search_c = args.search_c if args.search_c is not None else (8.0 if args.ray else 4.0)
+    search_n_candidates = args.n_candidates
+    search_gen_kwargs = dict(temperature=args.temperature, top_p=args.top_p)
     result_path = _result_path(
         args.dataset,
         args.split,
@@ -329,13 +334,9 @@ def main():
 
         # Decide number of actors
         num_gpus = max(1, torch.cuda.device_count())
-        default_actors = max(
-            1, int(math.floor(num_gpus / max(args.gpus_per_actor, 1e-6)))
-        )
+        default_actors = max(1, int(math.floor(num_gpus / max(args.gpus_per_actor, 1e-6))))
         num_actors = args.actors or default_actors
-        tqdm.write(
-            f"Ray init: {num_actors} actor(s), gpus_per_actor={args.gpus_per_actor}"
-        )
+        tqdm.write(f"Ray init: {num_actors} actor(s), gpus_per_actor={args.gpus_per_actor}")
 
         # IMPORTANT: silence worker stdout/stderr to driver
         ray.init(ignore_reinit_error=True, include_dashboard=False, log_to_driver=False)
@@ -419,9 +420,7 @@ def main():
 
     print("Running MAS-MCTS...")
 
-    remaining_idxs = [
-        i for i in range(len(data)) if not (result_path / f"{i}.json").exists()
-    ]
+    remaining_idxs = [i for i in range(len(data)) if not (result_path / f"{i}.json").exists()]
     pbar_sp = tqdm(
         total=len(remaining_idxs),
         desc="All data (single proc)",

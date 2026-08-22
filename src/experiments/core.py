@@ -1,6 +1,7 @@
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Callable, Dict, List, Sequence, Tuple, Any
+import json
 import os
 import random
 import math
@@ -52,6 +53,19 @@ class TokenStats:
     scorer: int = 0  # tokens processed by scoring models (PRM/logprob/ORM)
     prm_calls: int = 0  # how many times PRM was called
     agent_runs: int = 0  # how many times we ran a single agent (one step decode)
+    tool_enabled_candidates: int = 0
+    tool_used_candidates: int = 0
+    tool_model_responses: int = 0
+    tool_calls: int = 0
+    successful_tool_calls: int = 0
+    tool_errors: int = 0
+    invalid_tool_calls: int = 0
+    required_tool_misses: int = 0
+    forced_tool_reprompts: int = 0
+    model_prompt_tokens: int = 0
+    max_model_prompt_tokens: int = 0
+    truncated_model_responses: int = 0
+    tool_names: Dict[str, int] = field(default_factory=dict)
 
     def add(self, other: "TokenStats") -> "TokenStats":
         self.prompt += other.prompt
@@ -59,7 +73,61 @@ class TokenStats:
         self.scorer += other.scorer
         self.prm_calls += other.prm_calls
         self.agent_runs += other.agent_runs
+        self.tool_enabled_candidates += other.tool_enabled_candidates
+        self.tool_used_candidates += other.tool_used_candidates
+        self.tool_model_responses += other.tool_model_responses
+        self.tool_calls += other.tool_calls
+        self.successful_tool_calls += other.successful_tool_calls
+        self.tool_errors += other.tool_errors
+        self.invalid_tool_calls += other.invalid_tool_calls
+        self.required_tool_misses += other.required_tool_misses
+        self.forced_tool_reprompts += other.forced_tool_reprompts
+        self.model_prompt_tokens += other.model_prompt_tokens
+        self.max_model_prompt_tokens = max(
+            self.max_model_prompt_tokens, other.max_model_prompt_tokens
+        )
+        self.truncated_model_responses += other.truncated_model_responses
+        for name, count in other.tool_names.items():
+            self.tool_names[name] = self.tool_names.get(name, 0) + int(count)
         return self
+
+    def add_tool_stats(self, stats: Any) -> "TokenStats":
+        if stats is None:
+            return self
+        self.tool_enabled_candidates += int(stats.tool_enabled_candidates)
+        self.tool_used_candidates += int(stats.tool_used_candidates)
+        self.tool_model_responses += int(stats.model_responses)
+        self.tool_calls += int(stats.tool_calls)
+        self.successful_tool_calls += int(stats.successful_tool_calls)
+        self.tool_errors += int(stats.tool_errors)
+        self.invalid_tool_calls += int(stats.invalid_tool_calls)
+        self.required_tool_misses += int(stats.required_tool_misses)
+        self.forced_tool_reprompts += int(stats.forced_tool_reprompts)
+        self.model_prompt_tokens += int(stats.model_prompt_tokens)
+        self.max_model_prompt_tokens = max(
+            self.max_model_prompt_tokens, int(stats.max_prompt_tokens)
+        )
+        self.truncated_model_responses += int(stats.truncated_responses)
+        for name, count in stats.tool_names.items():
+            self.tool_names[name] = self.tool_names.get(name, 0) + int(count)
+        return self
+
+    def tool_usage(self) -> Dict[str, Any]:
+        return {
+            "tool_enabled_candidates": self.tool_enabled_candidates,
+            "tool_used_candidates": self.tool_used_candidates,
+            "model_responses": self.tool_model_responses,
+            "tool_calls": self.tool_calls,
+            "successful_tool_calls": self.successful_tool_calls,
+            "tool_errors": self.tool_errors,
+            "invalid_tool_calls": self.invalid_tool_calls,
+            "required_tool_misses": self.required_tool_misses,
+            "forced_tool_reprompts": self.forced_tool_reprompts,
+            "model_prompt_tokens": self.model_prompt_tokens,
+            "max_prompt_tokens": self.max_model_prompt_tokens,
+            "truncated_responses": self.truncated_model_responses,
+            "tool_names": dict(sorted(self.tool_names.items())),
+        }
 
 
 # ======================
@@ -68,9 +136,20 @@ class TokenStats:
 
 
 def _text_token_len_tok(tok, text: str) -> int:
-    return int(
-        tok(text, return_tensors="pt", add_special_tokens=False)["input_ids"].shape[1]
-    )
+    return int(tok(text, return_tensors="pt", add_special_tokens=False)["input_ids"].shape[1])
+
+
+def _encode_prompt_ids(tokenizer: Any, messages: Any) -> List[int]:
+    """Chat-template prompt ids (generation prompt included) as a flat list."""
+    encoded = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)
+    if isinstance(encoded, torch.Tensor):
+        return encoded.flatten().tolist()
+    if isinstance(encoded, list):
+        if encoded and isinstance(encoded[0], list):
+            return list(encoded[0])
+        return [int(token_id) for token_id in encoded]
+    rendered = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    return tokenizer(rendered, add_special_tokens=False)["input_ids"]
 
 
 def _agent_order(mas: Any) -> List[int]:
@@ -108,33 +187,17 @@ def compute_logprob_and_token_counts(
 
     # Resolve prompt_ids (B=1)
     if prompt_ids is None:
-        enc = tok.apply_chat_template(msgs, tokenize=True, add_generation_prompt=True)
-        if isinstance(enc, list):
-            prompt_ids = torch.tensor(enc, dtype=torch.long).unsqueeze(0).to(device)
-        elif isinstance(enc, torch.Tensor):
-            prompt_ids = (enc.unsqueeze(0) if enc.dim() == 1 else enc).to(device)
-        else:
-            s = tok.apply_chat_template(
-                msgs, tokenize=False, add_generation_prompt=True
-            )
-            prompt_ids = tok(s, return_tensors="pt", add_special_tokens=False)[
-                "input_ids"
-            ].to(device)
+        prompt_ids = _encode_prompt_ids(tok, msgs)
+    if isinstance(prompt_ids, torch.Tensor):
+        prompt_ids = (prompt_ids.unsqueeze(0) if prompt_ids.dim() == 1 else prompt_ids).to(device)
+    elif isinstance(prompt_ids, list):
+        prompt_ids = torch.tensor(prompt_ids, dtype=torch.long).unsqueeze(0).to(device)
     else:
-        if isinstance(prompt_ids, list):
-            prompt_ids = (
-                torch.tensor(prompt_ids, dtype=torch.long).unsqueeze(0).to(device)
-            )
-        elif isinstance(prompt_ids, torch.Tensor):
-            prompt_ids = (
-                prompt_ids.unsqueeze(0) if prompt_ids.dim() == 1 else prompt_ids
-            ).to(device)
-        else:
-            raise TypeError("prompt_ids must be list[int] or torch.Tensor")
+        raise TypeError("prompt_ids must be list[int] or torch.Tensor")
 
-    comp_ids = tok(completion, return_tensors="pt", add_special_tokens=False)[
-        "input_ids"
-    ].to(device)
+    comp_ids = tok(completion, return_tensors="pt", add_special_tokens=False)["input_ids"].to(
+        device
+    )
     input_ids = torch.cat([prompt_ids, comp_ids], dim=1)  # [1, L]
     attn = torch.ones_like(input_ids, device=device)
 
@@ -160,6 +223,8 @@ def compute_batch_logprob_and_token_counts(
     agent: Agent,
     msgs,
     completions: Sequence[str],
+    *,
+    prompt_ids: Optional[Sequence[int]] = None,  # reuse a pre-encoded prompt
 ) -> tuple[List[float], int, List[int]]:
     """Score same-prompt completions in one teacher-forced model call."""
     if not completions:
@@ -168,20 +233,14 @@ def compute_batch_logprob_and_token_counts(
     tok = agent.tok
     model = agent.model
     device = next(model.parameters()).device
-    prompt = tok.apply_chat_template(msgs, tokenize=True, add_generation_prompt=True)
-    if isinstance(prompt, torch.Tensor):
-        prompt_ids = prompt.flatten().tolist()
-    elif isinstance(prompt, list):
-        prompt_ids = list(prompt)
+    if prompt_ids is None:
+        prompt_ids = _encode_prompt_ids(tok, msgs)
+    elif isinstance(prompt_ids, torch.Tensor):
+        prompt_ids = prompt_ids.flatten().tolist()
     else:
-        rendered = tok.apply_chat_template(
-            msgs, tokenize=False, add_generation_prompt=True
-        )
-        prompt_ids = tok(rendered, add_special_tokens=False)["input_ids"]
+        prompt_ids = list(prompt_ids)
 
-    completion_ids = [
-        tok(str(text), add_special_tokens=False)["input_ids"] for text in completions
-    ]
+    completion_ids = [tok(str(text), add_special_tokens=False)["input_ids"] for text in completions]
     prompt_len = len(prompt_ids)
     lengths = [len(ids) for ids in completion_ids]
     max_len = prompt_len + max(lengths, default=0)
@@ -202,9 +261,7 @@ def compute_batch_logprob_and_token_counts(
         sequence = [*prompt_ids, *ids]
         seq_len = len(sequence)
         if sequence:
-            input_ids[row, :seq_len] = torch.tensor(
-                sequence, dtype=torch.long, device=device
-            )
+            input_ids[row, :seq_len] = torch.tensor(sequence, dtype=torch.long, device=device)
             attention_mask[row, :seq_len] = 1
     max_completion_len = max(lengths, default=0)
     if max_completion_len == 0:
@@ -229,10 +286,9 @@ def compute_batch_logprob_and_token_counts(
         logits = model(**forward_kwargs).logits[:, logit_positions, :]
 
     targets = input_ids[:, prompt_len : prompt_len + max_completion_len]
-    completion_mask = (
-        torch.arange(max_completion_len, device=device).unsqueeze(0)
-        < torch.tensor(lengths, device=device).unsqueeze(1)
-    )
+    completion_mask = torch.arange(max_completion_len, device=device).unsqueeze(0) < torch.tensor(
+        lengths, device=device
+    ).unsqueeze(1)
     scores = torch.zeros(len(completions), dtype=torch.float32, device=device)
     # Upcast a small time slice at once; upcasting the full B x T x vocab
     # tensor can otherwise consume several extra GB for Qwen's large vocabulary.
@@ -240,9 +296,7 @@ def compute_batch_logprob_and_token_counts(
         end = min(max_completion_len, start + 32)
         logits_chunk = logits[:, start:end, :].float()
         targets_chunk = targets[:, start:end]
-        target_logits = logits_chunk.gather(
-            -1, targets_chunk.unsqueeze(-1)
-        ).squeeze(-1)
+        target_logits = logits_chunk.gather(-1, targets_chunk.unsqueeze(-1)).squeeze(-1)
         token_logprobs = target_logits - torch.logsumexp(logits_chunk, dim=-1)
         scores += (token_logprobs * completion_mask[:, start:end]).sum(dim=1)
     return [float(value) for value in scores.tolist()], prompt_len, lengths
@@ -270,9 +324,7 @@ def score_path_logprob(
         agent_idx, inbox = result
         msgs = mas.agent_messages(agent_idx, inbox)
 
-        lp, p_len, g_len = compute_logprob_and_token_counts(
-            mas.agents[agent_idx], msgs, text
-        )
+        lp, p_len, g_len = compute_logprob_and_token_counts(mas.agents[agent_idx], msgs, text)
         usage.scorer += p_len + g_len
         s_total += lp
         token_total += max(0, g_len)
@@ -355,9 +407,7 @@ def sbs_decode2(
     gen_kwargs = gen_kwargs or {}
     agent_order = _agent_order(mas)
     beams: List[Tuple[Dict[int, List[str]], float]] = [({}, 0.0)]
-    local_trace: List[Dict[str, Any]] = (
-        [] if (trace is not None or return_trace) else None
-    )
+    local_trace: List[Dict[str, Any]] = [] if (trace is not None or return_trace) else None
 
     # Walk agent_order (topological). For each agent, only beams that have
     # its required parents delivered (is_runnable) actually produce
@@ -382,34 +432,20 @@ def sbs_decode2(
             msgs = mas.agent_messages(agent_idx, inbox)
 
             # PRE-ENCODE prompt once; reuse for accounting and logprob scoring
-            enc = mas.agents[agent_idx].tok.apply_chat_template(
-                msgs, tokenize=True, add_generation_prompt=True
-            )
-            p_len = (
-                len(enc)
-                if isinstance(enc, list)
-                else (
-                    int(
-                        enc.numel()
-                        if isinstance(enc, torch.Tensor) and enc.dim() == 1
-                        else enc.shape[1]
-                    )
-                )
-            )
+            enc = _encode_prompt_ids(mas.agents[agent_idx].tok, msgs)
+            p_len = len(enc)
 
             # Generate candidates
-            cands = mas.sample_candidates(
-                agent_idx, inbox, n_candidates=B2, **gen_kwargs
-            )
+            cands = mas.sample_candidates(agent_idx, inbox, n_candidates=B2, **gen_kwargs)
             usage.agent_runs += B2
+            agent = mas.agents[agent_idx]
+            usage.add_tool_stats(getattr(agent, "last_tool_stats", None))
 
             # Account policy tokens (prompt + generated)
             usage.prompt += p_len
             for outs in cands:
                 if outs:
-                    usage.generated += _text_token_len_tok(
-                        mas.agents[agent_idx].tok, outs[0]
-                    )
+                    usage.generated += _text_token_len_tok(mas.agents[agent_idx].tok, outs[0])
 
             scored_cands = cands[:1] if score_type == "none" else cands
             cand_infos: List[Tuple[List[str], float]] = []
@@ -558,9 +594,7 @@ def render_handoff_state_text(
         candidate = join(start)
         candidate_ids = _token_ids(tokenizer, candidate)
         if len(candidate_ids) <= limit:
-            return RenderedHandoffState(
-                candidate, len(candidate_ids), original_count, True
-            )
+            return RenderedHandoffState(candidate, len(candidate_ids), original_count, True)
 
     # An unusually large question plus newest turn cannot both fit in full.
     # Retain a non-empty question prefix and the newest suffix rather than
@@ -611,9 +645,7 @@ class HandoffDecodeResult:
         speakers = [turn.speaker for turn in turns]
         active_roles = list(dict.fromkeys(speakers))
         role_edges = [
-            (turn.speaker, turn.recipient)
-            for turn in turns
-            if turn.recipient != FINAL_RECIPIENT
+            (turn.speaker, turn.recipient) for turn in turns if turn.recipient != FINAL_RECIPIENT
         ]
         edge_counts = Counter(role_edges)
         edge_total = sum(edge_counts.values())
@@ -631,9 +663,7 @@ class HandoffDecodeResult:
         return {
             "answer": self.answer,
             "prefix_answers": {str(k): value for k, value in prefix_answers.items()},
-            "prefix_depths": {
-                str(int(k)): min(int(k), self.run.depth) for k in thresholds
-            },
+            "prefix_depths": {str(int(k)): min(int(k), self.run.depth) for k in thresholds},
             "depth": self.run.depth,
             "stop_reason": self.run.stop_reason,
             "active_roles": active_roles,
@@ -647,9 +677,7 @@ class HandoffDecodeResult:
                 else 0.0
             ),
             "route_entropy_bits": route_entropy,
-            "route_entropy_normalized": (
-                route_entropy / max_entropy if max_entropy > 0 else 0.0
-            ),
+            "route_entropy_normalized": (route_entropy / max_entropy if max_entropy > 0 else 0.0),
             "generated_tokens": self.usage.generated,
             "prompt_tokens": self.usage.prompt,
             "scorer_tokens": self.usage.scorer,
@@ -658,9 +686,7 @@ class HandoffDecodeResult:
             "prm_calls": self.usage.prm_calls,
             "prm_evaluations": self.prm_evaluations,
             "parse_failures": self.parse_failures,
-            "parse_failure_rate": (
-                self.parse_failures / self.proposals if self.proposals else 0.0
-            ),
+            "parse_failure_rate": (self.parse_failures / self.proposals if self.proposals else 0.0),
             "prm_context_tokens": context_tokens,
             "prm_original_context_tokens": original_context_tokens,
             "prm_context_token_median": (
@@ -684,24 +710,6 @@ class HandoffDecodeResult:
         }
 
 
-def _prompt_token_length(tokenizer: Any, messages: Any) -> int:
-    encoded = tokenizer.apply_chat_template(
-        messages,
-        tokenize=True,
-        add_generation_prompt=True,
-    )
-    if isinstance(encoded, list):
-        return len(encoded)
-    if isinstance(encoded, torch.Tensor):
-        return int(encoded.numel())
-    rendered = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
-    )
-    return len(_token_ids(tokenizer, rendered))
-
-
 def _fallback_routed_turn(
     raw: str,
     context: HandoffContext,
@@ -717,9 +725,7 @@ def _fallback_routed_turn(
         r"(?ims)^\s*MESSAGE\s*:\s*(.*?)(?=^\s*CURRENT_ANSWER\s*:|\Z)",
         raw or "",
     )
-    message = (
-        message_match.group(1).strip() if message_match else str(raw or "").strip()
-    )
+    message = message_match.group(1).strip() if message_match else str(raw or "").strip()
     if not message:
         message = "No valid structured proposal was generated."
     return RoutedTurn(
@@ -736,12 +742,8 @@ def _default_fixed_schedule(role_names: Sequence[str], max_turns: int) -> List[s
         (role for role in role_names if role.casefold() == "finalizer"),
         role_names[-1],
     )
-    working_roles = [role for role in role_names if role != finalizer] or list(
-        role_names
-    )
-    schedule = [
-        working_roles[idx % len(working_roles)] for idx in range(max(0, max_turns - 1))
-    ]
+    working_roles = [role for role in role_names if role != finalizer] or list(role_names)
+    schedule = [working_roles[idx % len(working_roles)] for idx in range(max(0, max_turns - 1))]
     schedule.append(finalizer)
     return schedule
 
@@ -772,7 +774,9 @@ def handoff_sbs_decode(
     ``route_mode`` is ``fixed``, ``random``, or ``agent``. Fixed and random
     routing force the same recipient across a turn's candidate pool; agent
     routing lets each proposal choose its own recipient. Candidate generation
-    and PRM/logprob scoring are batched once per turn.
+    and PRM/logprob scoring are batched once per turn; duplicate proposals
+    are collapsed before scoring, and a turn with a single distinct valid
+    action skips the scorer entirely.
     """
     if route_mode not in {"fixed", "random", "agent"}:
         raise ValueError(f"Unknown handoff route mode: {route_mode!r}.")
@@ -783,15 +787,20 @@ def handoff_sbs_decode(
     if n_candidates < 1:
         raise ValueError("n_candidates must be at least 1.")
 
-    schedule = list(
-        fixed_schedule or _default_fixed_schedule(mas.role_names, max_turns)
-    )
+    schedule = list(fixed_schedule or _default_fixed_schedule(mas.role_names, max_turns))
     if route_mode == "fixed":
         if len(schedule) < max_turns:
             raise ValueError("fixed_schedule must contain at least max_turns roles.")
         schedule = schedule[:max_turns]
         for role in schedule:
             mas.role_index(role)
+        if not allow_self:
+            for previous, current in zip(schedule, schedule[1:]):
+                if mas.role_index(previous) == mas.role_index(current):
+                    raise ValueError(
+                        "fixed_schedule repeats a role on consecutive turns; "
+                        "pass allow_self=True to permit that."
+                    )
         initial_speaker = schedule[0]
 
     usage = TokenStats()
@@ -840,12 +849,19 @@ def handoff_sbs_decode(
         proposals += len(raw_candidates)
         usage.agent_runs += 1
         tokenizer = mas.agents[context.speaker_idx].tok
-        usage.prompt += _prompt_token_length(tokenizer, messages)
+        prompt_ids = _encode_prompt_ids(tokenizer, messages)
+        usage.prompt += len(prompt_ids)
+
+        # Identical proposals are one action: parse and score each distinct
+        # text once, while accounting (proposals, generated tokens, parse
+        # failures) stays per raw sample.
+        distinct_counts: Dict[str, int] = {}
         for raw in raw_candidates:
-            usage.generated += _text_token_len_tok(tokenizer, raw)
+            distinct_counts[raw] = distinct_counts.get(raw, 0) + 1
 
         valid_turns: List[RoutedTurn] = []
-        for raw in raw_candidates:
+        for raw, count in distinct_counts.items():
+            usage.generated += count * _text_token_len_tok(tokenizer, raw)
             try:
                 valid_turns.append(
                     parse_routed_turn(
@@ -857,7 +873,7 @@ def handoff_sbs_decode(
                     )
                 )
             except ValueError:
-                parse_failures += 1
+                parse_failures += count
 
         if not valid_turns:
             fallback_recipient = forced_recipient
@@ -873,6 +889,10 @@ def handoff_sbs_decode(
                     fallback_recipient,
                 )
             ]
+
+        # A single distinct action needs no scorer call to be selected.
+        if len(valid_turns) == 1 or score_type == "none":
+            return valid_turns[0]
 
         if score_type == "prm":
             rendered_candidates = [
@@ -899,26 +919,22 @@ def handoff_sbs_decode(
                 context_tokens.append(rendered.token_count)
                 original_context_tokens.append(rendered.original_token_count)
                 prm_truncations += int(rendered.truncated)
-        elif score_type == "logprob":
-            values, prompt_len, generated_lengths = (
-                compute_batch_logprob_and_token_counts(
-                    mas.agents[context.speaker_idx],
-                    messages,
-                    [turn.raw or turn.render() for turn in valid_turns],
-                )
+        else:  # "logprob"
+            values, prompt_len, generated_lengths = compute_batch_logprob_and_token_counts(
+                mas.agents[context.speaker_idx],
+                messages,
+                [turn.raw or turn.render() for turn in valid_turns],
+                prompt_ids=prompt_ids,
             )
             usage.scorer += sum(prompt_len + length for length in generated_lengths)
             if logprob_agg in {"avg_token", "avg", "mean_token"}:
                 values = [
-                    value / max(1, length)
-                    for value, length in zip(values, generated_lengths)
+                    value / max(1, length) for value, length in zip(values, generated_lengths)
                 ]
             elif logprob_agg in {"avg_step", "mean_step", "sum"}:
                 pass
             else:
                 raise ValueError(f"Unknown logprob aggregation: {logprob_agg!r}.")
-        else:
-            values = [0.0] * len(valid_turns)
 
         best_idx = max(range(len(valid_turns)), key=lambda idx: values[idx])
         return valid_turns[best_idx]
@@ -981,10 +997,86 @@ def _sigmoid(v: float) -> float:
     return 1.0 / (1.0 + _safe_exp(-v))
 
 
+def _cluster_answers(preds: Sequence[Tuple[str, float]]) -> str:
+    """Cluster answers by numeric equivalence, sum the weights, and return the
+    shortest member of the heaviest cluster (ties: more members, shorter rep)."""
+    clusters: List[Dict[str, Any]] = []
+    for ans, w in preds:
+        for c in clusters:
+            if numbers_equal(ans, c["rep"]):
+                c["weight"] += w
+                c["members"].append((ans, w))
+                break
+        else:
+            clusters.append({"rep": ans, "weight": w, "members": [(ans, w)]})
+    best = max(clusters, key=lambda c: (c["weight"], len(c["members"]), -len(c["rep"])))
+    return min((a for a, _ in best["members"]), key=len)
+
+
+def score_pooled_runs(
+    mas: Any,
+    question: str,
+    runs: Sequence[Dict[str, Any]],
+    *,
+    score_mode: str,  # "sc" | "prm" | "logprob" | "orm"
+    score_fn: Optional[Callable[[str], float]] = None,
+    prm_tokenizer=None,
+    orm_tokenizer=None,
+    step_separator: str = "</step>",
+    logprob_agg: str = "sum",
+    view_mode: str = "full",
+) -> tuple[List[float], TokenStats]:
+    """Selection weights for cached SC trajectories under one scorer.
+
+    Every selector receives the identical candidate pool; only the weights
+    differ. Each run is {"steps": [...], "agent_ids": [...]} in decision
+    order. Weight conventions match `make_scored_voter`: PRM step-product,
+    exp(sum-logprob), sigmoid(ORM end), or 1.0 for plain self-consistency.
+    """
+    usage = TokenStats()
+    weights: List[float] = []
+    for run in runs:
+        steps = [str(step) for step in run.get("steps", [])]
+        agent_ids = [int(agent_id) for agent_id in run.get("agent_ids", [])]
+        if score_mode == "prm":
+            w, u = score_path_prm_product(
+                score_fn,
+                mas,
+                question,
+                steps,
+                tokenizer=prm_tokenizer,
+                step_separator=step_separator,
+                view_mode=view_mode,
+            )
+        elif score_mode == "logprob":
+            raw_score, u = score_path_logprob(mas, question, steps, agg=logprob_agg)
+            w = _safe_exp(raw_score)
+        elif score_mode == "orm":
+            # ORM scores the final state; for local view, scope to the last
+            # decided agent on the path (typically the answer-producing sink).
+            traj = {agent_id: [text] for agent_id, text in zip(agent_ids, steps)}
+            last_idx = agent_ids[-1] if agent_ids else None
+            state_text = render_state_text(
+                mas,
+                question,
+                traj,
+                step_separator,
+                view=view_mode,
+                agent_idx=last_idx,
+            )
+            raw_score, u = score_orm_end(score_fn, state_text, tokenizer=orm_tokenizer)
+            w = _sigmoid(raw_score)
+        elif score_mode == "sc":
+            w, u = 1.0, TokenStats()
+        else:
+            raise ValueError(f"Unknown pooled score mode: {score_mode!r}.")
+        usage.add(u)
+        weights.append(float(w))
+    return weights, usage
+
+
 def make_scored_voter(
-    base_decoder_with_trace: Callable[
-        [Any, str], tuple[str, TokenStats, List[Dict[str, Any]]]
-    ],
+    base_decoder_with_trace: Callable[[Any, str], tuple[str, TokenStats, List[Dict[str, Any]]]],
     build_mas: Callable[[], Any],
     *,
     score_mode: str,  # "prm" | "logprob" | "orm"
@@ -1019,60 +1111,26 @@ def make_scored_voter(
             # this agent (chosen_text set). In dynamic graphs, some entries
             # correspond to beams that were never on the winning path.
             tr_run = [e for e in (tr or []) if e.get("chosen_text") not in (None, "")]
-            steps = [e["chosen_text"] for e in tr_run]
-            agent_ids = [e["agent_idx"] for e in tr_run]
-
-            if score_mode == "prm":
-                w, u2 = score_path_prm_product(
-                    score_fn,
-                    mas_i,
-                    q,
-                    steps,
-                    tokenizer=prm_tokenizer,
-                    step_separator=step_separator,
-                    view_mode=view_mode,
-                )
-            elif score_mode == "logprob":
-                raw_score, u2 = score_path_logprob(mas_i, q, steps, agg=logprob_agg)
-                w = _safe_exp(raw_score)
-            elif score_mode == "orm":
-                traj = {aid: [text] for aid, text in zip(agent_ids, steps)}
-                # ORM scores the final state; for local view, scope to the
-                # last decided agent on the winning path (typically the
-                # sink producing the final answer).
-                last_idx = agent_ids[-1] if agent_ids else None
-                state_text = render_state_text(
-                    mas_i,
-                    q,
-                    traj,
-                    step_separator,
-                    view=view_mode,
-                    agent_idx=last_idx,
-                )
-                raw_score, u2 = score_orm_end(
-                    score_fn, state_text, tokenizer=orm_tokenizer
-                )
-                w = _sigmoid(raw_score)
-            else:
-                w, u2 = 1.0, TokenStats()
+            run = {
+                "steps": [e["chosen_text"] for e in tr_run],
+                "agent_ids": [e["agent_idx"] for e in tr_run],
+            }
+            run_weights, u2 = score_pooled_runs(
+                mas_i,
+                q,
+                [run],
+                score_mode=(score_mode if score_mode in {"prm", "logprob", "orm"} else "sc"),
+                score_fn=score_fn,
+                prm_tokenizer=prm_tokenizer,
+                orm_tokenizer=orm_tokenizer,
+                step_separator=step_separator,
+                logprob_agg=logprob_agg,
+                view_mode=view_mode,
+            )
             usages.add(u2)
-            preds.append((ans, w))
+            preds.append((ans, run_weights[0]))
 
-        # Group by numeric equivalence and sum weights
-        clusters: List[Dict[str, Any]] = []
-        for ans, w in preds:
-            for c in clusters:
-                if numbers_equal(ans, c["rep"]):
-                    c["weight"] += w
-                    c["members"].append((ans, w))
-                    break
-            else:
-                clusters.append({"rep": ans, "weight": w, "members": [(ans, w)]})
-
-        best = max(
-            clusters, key=lambda c: (c["weight"], len(c["members"]), -len(c["rep"]))
-        )
-        chosen = min((a for a, _ in best["members"]), key=len)
+        chosen = _cluster_answers(preds)
         raw_answers = [ans for ans, _ in preds]
 
         if return_all_answers:
@@ -1080,6 +1138,233 @@ def make_scored_voter(
         return chosen, usages
 
     return decoder
+
+
+# =========================================================
+#  LLM-as-judge selection on cached SC pools (Experiment 2)
+# =========================================================
+
+
+JUDGE_SYSTEM_PROMPT = (
+    "You are a strict evaluator of multi-agent reasoning transcripts. You "
+    "assign per-message credits that reflect real problem-solving progress. "
+    "You never see the reference answer and must judge on reasoning quality "
+    "alone."
+)
+
+
+def render_judge_batch(question: str, trajectories: Sequence[Sequence[str]]) -> str:
+    """Listwise judge prompt over the shared candidate pool (no gold answer)."""
+    parts = [
+        "Evaluate every candidate trajectory produced for the problem below.",
+        f"PROBLEM:\n{question}",
+    ]
+    for t_idx, steps in enumerate(trajectories):
+        lines = [f"TRAJECTORY {t_idx + 1}:"]
+        for s_idx, step in enumerate(steps):
+            lines.append(f"[message {s_idx + 1}] {step}")
+        parts.append("\n".join(lines))
+    counts = ", ".join(str(len(steps)) for steps in trajectories)
+    parts.append(
+        "Assign one credit in [-1, 1] to every message. Reward substantive "
+        "progress toward a correct solution and genuine corrections of "
+        "earlier mistakes. Penalize misleading reasoning and incorrect "
+        "conclusions. Do not reward verbosity, confidence, or agreement. "
+        'Reply with exactly one JSON object of the form {"credits": '
+        "[[...], ...]} holding one list of numbers per trajectory with "
+        f"message counts {counts}, and no other text."
+    )
+    return "\n\n".join(parts)
+
+
+def parse_judge_credits(text: str, expected_lengths: Sequence[int]) -> Optional[List[List[float]]]:
+    """Extract per-trajectory credit lists, clamped to [-1, 1].
+
+    Returns None when the reply holds no JSON object with one non-empty
+    numeric list per trajectory. Inner lengths are not enforced: the mean
+    credit is what selection consumes, so a ragged but numeric reply is
+    still a usable judgment rather than a parse failure.
+    """
+    match = re.search(r"\{.*\}", str(text or ""), flags=re.S)
+    if not match:
+        return None
+    try:
+        payload = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return None
+    credits = payload.get("credits") if isinstance(payload, dict) else None
+    if not isinstance(credits, list) or len(credits) != len(expected_lengths):
+        return None
+    parsed: List[List[float]] = []
+    for row in credits:
+        if not isinstance(row, list) or not row:
+            return None
+        try:
+            parsed.append([min(1.0, max(-1.0, float(value))) for value in row])
+        except (TypeError, ValueError):
+            return None
+    return parsed
+
+
+def make_llm_judge_voter(
+    judge_model: Any,
+    judge_tokenizer: Any,
+    *,
+    max_new_tokens: int = 256,
+) -> Callable[[str, Sequence[Sequence[str]]], Tuple[List[float], Dict[str, Any]]]:
+    """One deterministic listwise judge call per pool.
+
+    Returns (weights, info): weights are (mean_credit + 1) / 2 per
+    trajectory; on a parse failure the weights fall back to uniform 0.5
+    (plain majority) and info["parsed"] is False.
+    """
+
+    @torch.inference_mode()
+    def judge(
+        question: str, trajectories: Sequence[Sequence[str]]
+    ) -> Tuple[List[float], Dict[str, Any]]:
+        messages = [
+            {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
+            {"role": "user", "content": render_judge_batch(question, trajectories)},
+        ]
+        prompt_ids = _encode_prompt_ids(judge_tokenizer, messages)
+        device = next(judge_model.parameters()).device
+        input_ids = torch.tensor([prompt_ids], dtype=torch.long, device=device)
+        pad_id = judge_tokenizer.pad_token_id
+        if pad_id is None:
+            pad_id = judge_tokenizer.eos_token_id
+        output = judge_model.generate(
+            input_ids=input_ids,
+            attention_mask=torch.ones_like(input_ids),
+            do_sample=False,
+            max_new_tokens=int(max_new_tokens),
+            use_cache=True,
+            pad_token_id=pad_id,
+        )
+        reply = judge_tokenizer.decode(output[0, input_ids.shape[1] :], skip_special_tokens=True)
+        credits = parse_judge_credits(reply, [len(steps) for steps in trajectories])
+        if credits is None:
+            weights = [0.5] * len(trajectories)
+        else:
+            weights = [(sum(row) / len(row) + 1.0) / 2.0 for row in credits]
+        info = {
+            "parsed": credits is not None,
+            "reply": reply,
+            "prompt_tokens": len(prompt_ids),
+            "generated_tokens": int(output.shape[1] - input_ids.shape[1]),
+        }
+        return weights, info
+
+    return judge
+
+
+def render_action_ranking(
+    question: str,
+    prefix_steps: Sequence[Tuple[str, str]],
+    speaker: str,
+    candidates: Sequence[str],
+) -> str:
+    """Stepwise judge prompt: rank candidate next actions at one search state."""
+    if prefix_steps:
+        transcript = "\n".join(
+            f"[step {idx + 1} | {role}] {text}" for idx, (role, text) in enumerate(prefix_steps)
+        )
+    else:
+        transcript = "(no steps yet)"
+    lines = [
+        "A multi-agent team is solving the problem below. Score each "
+        "candidate next action for the state shown.",
+        f"PROBLEM:\n{question}",
+        f"TRANSCRIPT SO FAR:\n{transcript}",
+        f"CANDIDATE NEXT ACTIONS by {speaker}:",
+    ]
+    for idx, text in enumerate(candidates):
+        lines.append(f"[candidate {idx + 1}] {text}")
+    lines.append(
+        "Assign one score in [-1, 1] per candidate for how much it advances "
+        "a correct solution from this state. Reward correct, verifiable "
+        "progress and genuine error corrections; penalize mistakes, "
+        "contradictions, and misleading conclusions; do not reward "
+        "verbosity, confidence, or agreement. Reply with exactly one JSON "
+        'object of the form {"scores": [...]} containing '
+        f"{len(candidates)} numbers, and no other text."
+    )
+    return "\n\n".join(lines)
+
+
+def parse_action_scores(text: str, n_candidates: int) -> Optional[List[float]]:
+    """Extract exactly n candidate scores, clamped to [-1, 1]; None on failure."""
+    match = re.search(r"\{.*\}", str(text or ""), flags=re.S)
+    if not match:
+        return None
+    try:
+        payload = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return None
+    scores = payload.get("scores") if isinstance(payload, dict) else None
+    if not isinstance(scores, list) or len(scores) != int(n_candidates):
+        return None
+    try:
+        return [min(1.0, max(-1.0, float(value))) for value in scores]
+    except (TypeError, ValueError):
+        return None
+
+
+def make_llm_action_ranker(
+    judge_model: Any,
+    judge_tokenizer: Any,
+    *,
+    max_new_tokens: int = 256,
+) -> Callable[
+    [str, Sequence[Tuple[str, str]], str, Sequence[str]],
+    Tuple[List[float], Dict[str, Any]],
+]:
+    """One deterministic listwise ranking call per expanded search state.
+
+    Returns (scores, info): scores lie in [-1, 1] like the PRM, so search
+    behaves identically under either scorer. On a parse failure the scores
+    fall back to all zeros (uninformative) and info["parsed"] is False.
+    """
+
+    @torch.inference_mode()
+    def rank(
+        question: str,
+        prefix_steps: Sequence[Tuple[str, str]],
+        speaker: str,
+        candidates: Sequence[str],
+    ) -> Tuple[List[float], Dict[str, Any]]:
+        messages = [
+            {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": render_action_ranking(question, prefix_steps, speaker, candidates),
+            },
+        ]
+        prompt_ids = _encode_prompt_ids(judge_tokenizer, messages)
+        device = next(judge_model.parameters()).device
+        input_ids = torch.tensor([prompt_ids], dtype=torch.long, device=device)
+        pad_id = judge_tokenizer.pad_token_id
+        if pad_id is None:
+            pad_id = judge_tokenizer.eos_token_id
+        output = judge_model.generate(
+            input_ids=input_ids,
+            attention_mask=torch.ones_like(input_ids),
+            do_sample=False,
+            max_new_tokens=int(max_new_tokens),
+            use_cache=True,
+            pad_token_id=pad_id,
+        )
+        reply = judge_tokenizer.decode(output[0, input_ids.shape[1] :], skip_special_tokens=True)
+        scores = parse_action_scores(reply, len(candidates))
+        info = {
+            "parsed": scores is not None,
+            "reply": reply,
+            "prompt_tokens": len(prompt_ids),
+            "generated_tokens": int(output.shape[1] - input_ids.shape[1]),
+        }
+        return (scores if scores is not None else [0.0] * len(candidates)), info
+
+    return rank
 
 
 # ===========================
@@ -1121,12 +1406,40 @@ def build_runtime(
     return Runtime(model=model, tokenizer=tok)
 
 
+def _last_scored_positions(
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    sep_ids: Sequence[int],
+) -> torch.Tensor:
+    """Per row, the position whose logit the scorer reads: the last token of
+    the last fully-attended separator occurrence, else the last attended
+    position. Vectorized replacement for a per-token Python scan."""
+    positions = torch.arange(input_ids.shape[1], device=input_ids.device)
+    mask = attention_mask.to(torch.bool)
+    idx = torch.where(mask, positions, positions.new_full((), -1)).max(dim=1).values
+    idx = idx.clamp(min=0)
+
+    n = len(sep_ids)
+    if n and input_ids.shape[1] >= n:
+        sep = torch.tensor(list(sep_ids), device=input_ids.device).to(input_ids.dtype)
+        token_windows = input_ids.unfold(1, n, 1)
+        mask_windows = mask.unfold(1, n, 1)
+        hits = (token_windows == sep).all(dim=-1) & mask_windows.all(dim=-1)
+        window_ends = positions[n - 1 :].unsqueeze(0)
+        last_sep_end = (
+            torch.where(hits, window_ends, window_ends.new_full((), -1)).max(dim=1).values
+        )
+        idx = torch.where(last_sep_end >= 0, last_sep_end, idx)
+    return idx
+
+
 def load_prm_scorer(
     prm_dir: str,
     base_model_id: str = None,
     max_length: int = 2048,
     torch_dtype: torch.dtype = torch.float16,
     step_separator: str = "</step>",
+    attn_impl: str = "sdpa",
 ):
     """
     Returns: (score: Callable[[str], float], tokenizer, model)
@@ -1135,9 +1448,7 @@ def load_prm_scorer(
     """
     adapter_dir = Path(prm_dir)
     if not (adapter_dir / "adapter_config.json").exists():
-        ckpts = sorted(
-            adapter_dir.glob("checkpoint-*"), key=lambda p: p.stat().st_mtime
-        )
+        ckpts = sorted(adapter_dir.glob("checkpoint-*"), key=lambda p: p.stat().st_mtime)
         if ckpts and (ckpts[-1] / "adapter_config.json").exists():
             adapter_dir = ckpts[-1]
     adapter_dir = adapter_dir.resolve()
@@ -1145,14 +1456,10 @@ def load_prm_scorer(
     # Resolve base model if not supplied
     if base_model_id is None:
         cfg = PeftConfig.from_pretrained(str(adapter_dir))
-        base_model_id = (
-            getattr(cfg, "base_model_name_or_path", None) or "Qwen/Qwen2.5-7B-Instruct"
-        )
+        base_model_id = getattr(cfg, "base_model_name_or_path", None) or "Qwen/Qwen2.5-7B-Instruct"
 
     # Tokenizer: prefer saved with adapter; else base
-    tok_src = (
-        str(adapter_dir) if (adapter_dir / "tokenizer.json").exists() else base_model_id
-    )
+    tok_src = str(adapter_dir) if (adapter_dir / "tokenizer.json").exists() else base_model_id
     tok = _ensure_pad_token(
         AutoTokenizer.from_pretrained(tok_src, use_fast=True, trust_remote_code=True)
     )
@@ -1171,10 +1478,12 @@ def load_prm_scorer(
         device_map="auto",
         trust_remote_code=True,
         quantization_config=bnb_cfg,
+        torch_dtype=torch_dtype,
+        attn_implementation=attn_impl,
     )
 
     # Align embeddings to tokenizer before loading adapter
-    if len(tok) != base.get_input_embeddings().weight.size(0):
+    if len(tok) > base.get_input_embeddings().weight.size(0):
         base.resize_token_embeddings(len(tok))
 
     # Attach LoRA adapter
@@ -1195,19 +1504,15 @@ def load_prm_scorer(
         )
         inputs = {k: v.to(device) for k, v in inputs.items()}
         out = model(**inputs, use_cache=False)  # logits: (batch, T, 1)
+        # Encode the separator per call: `ensure_separator_token` may extend
+        # the tokenizer after this loader returns.
         sep_ids = tok.encode(step_separator, add_special_tokens=False)
-        values: List[float] = []
-        for row in range(inputs["input_ids"].shape[0]):
-            valid_positions = inputs["attention_mask"][row].nonzero(as_tuple=True)[0]
-            idx = int(valid_positions[-1].item())
-            valid_ids = inputs["input_ids"][row, valid_positions].tolist()
-            if sep_ids:
-                for start in range(0, len(valid_ids) - len(sep_ids) + 1):
-                    if valid_ids[start : start + len(sep_ids)] == sep_ids:
-                        idx = int(valid_positions[start + len(sep_ids) - 1].item())
-            z = out.logits[row, idx, 0].float()
-            values.append(float(torch.tanh(z).item()))
-        return values
+        idx = _last_scored_positions(inputs["input_ids"], inputs["attention_mask"], sep_ids).to(
+            out.logits.device
+        )
+        rows = torch.arange(idx.shape[0], device=out.logits.device)
+        z = out.logits[rows, idx, 0].float()
+        return [float(value) for value in torch.tanh(z).tolist()]
 
     @torch.inference_mode()
     def score(text: str) -> float:
@@ -1248,9 +1553,7 @@ def load_generation_model(
         kwargs["attn_implementation"] = attn_impl
     if load_in_4bit:
         compute_dtype = (
-            torch_dtype
-            if torch_dtype in (torch.float16, torch.bfloat16)
-            else torch.float16
+            torch_dtype if torch_dtype in (torch.float16, torch.bfloat16) else torch.float16
         )
         kwargs["quantization_config"] = BitsAndBytesConfig(
             load_in_4bit=True,
@@ -1263,7 +1566,7 @@ def load_generation_model(
         base_model_id,
         **kwargs,
     )
-    if len(tokenizer) != model.get_input_embeddings().weight.size(0):
+    if len(tokenizer) > model.get_input_embeddings().weight.size(0):
         model.resize_token_embeddings(len(tokenizer))
     model.eval()
 
@@ -1289,8 +1592,8 @@ def ensure_separator_token(tokenizer: AutoTokenizer, sep: str) -> int:
 
 
 def align_model_to_tokenizer(model, tokenizer) -> None:
-    """Resize model embeddings to match tokenizer size if needed."""
-    if len(tokenizer) != model.get_input_embeddings().weight.size(0):
+    """Grow model embeddings when the tokenizer exceeds the model vocabulary."""
+    if len(tokenizer) > model.get_input_embeddings().weight.size(0):
         model.resize_token_embeddings(len(tokenizer))
 
 
@@ -1340,17 +1643,13 @@ def render_state_text(
 
         cutoff = position[agent_idx]
         prior = {
-            idx: trajectory[idx]
-            for idx in order[:cutoff]
-            if idx in trajectory and trajectory[idx]
+            idx: trajectory[idx] for idx in order[:cutoff] if idx in trajectory and trajectory[idx]
         }
         inbox, _, _ = mas._replay(question, set(prior), prior)
 
         user_content = mas.agent_user_content(agent_idx, inbox)
         output = (
-            trajectory[agent_idx][0]
-            if agent_idx in trajectory and trajectory[agent_idx]
-            else ""
+            trajectory[agent_idx][0] if agent_idx in trajectory and trajectory[agent_idx] else ""
         )
         # Training records are {prompt=user_content, completions=[output], labels=[q]},
         # which TRL tokenizes as tok(user_content)+tok(output)+[sep] with no delimiter
@@ -1377,6 +1676,8 @@ class MCTSInfer(BaseMCTS):
       - "prm": V(s) from PRM on state text (step prefixes)
       - "logprob": value from policy logprob (per-step; path-level at leaf)
       - "orm": value only at terminal from ORM (end-of-answer)
+      - "judge": one listwise LLM call per expansion ranks the candidate
+        actions in [-1, 1] (requires `action_ranker`)
     Tracks token usage (prompt, generated, scorer).
     """
 
@@ -1386,7 +1687,7 @@ class MCTSInfer(BaseMCTS):
         question: str,
         score_fn: Optional[Callable[[str], float]] = None,  # PRM or ORM
         *,
-        score_type: str = "prm",  # "prm" | "logprob" | "orm"
+        score_type: str = "prm",  # "prm" | "logprob" | "orm" | "judge"
         prm_tokenizer: Optional[Any] = None,
         orm_tokenizer: Optional[Any] = None,
         max_children: int = 5,
@@ -1398,6 +1699,12 @@ class MCTSInfer(BaseMCTS):
         logprob_agg: str = "sum",  # "sum" | "avg_token" | "avg_step"
         leaf_score_fn: Optional[Callable[[str], float]] = None,  # leaf PRM/ORM
         view_mode: str = "full",  # "full" | "local" — scope of state text for PRM/ORM
+        action_ranker: Optional[
+            Callable[
+                [str, Sequence[Tuple[str, str]], str, Sequence[str]],
+                Tuple[List[float], Dict[str, Any]],
+            ]
+        ] = None,  # stepwise judge for score_type="judge"
     ):
         super().__init__(
             mas,
@@ -1415,12 +1722,40 @@ class MCTSInfer(BaseMCTS):
         self.c = float(c_uct)
         self.sep = step_separator
         self.leaf_score_fn = leaf_score_fn or score_fn
+        self.action_ranker = action_ranker
+        if score_type == "judge" and action_ranker is None:
+            raise ValueError('score_type="judge" requires an action_ranker.')
 
         self.uct_type = (uct_type or "uct").lower()
         self.leaf = (leaf_score_type or "").lower() or None
         self.logprob_agg = (logprob_agg or "sum").lower()
         self.view_mode = (view_mode or "full").lower()
         self.usage = TokenStats()
+        self.judge_calls = 0
+        self.judge_parse_failures = 0
+
+    def _agent_label(self, agent_idx: int) -> str:
+        name = getattr(self.mas.agents[agent_idx], "name", None)
+        return str(name) if name else f"Agent {agent_idx}"
+
+    def _rank_candidates(
+        self, node: Node, agent_idx: int, candidates: List[List[str]]
+    ) -> List[float]:
+        """One listwise judge call scoring every candidate action at a state."""
+        prefix_steps = [
+            (self._agent_label(idx), node.trajectory[idx][0])
+            for idx in self.order
+            if node.trajectory.get(idx)
+        ]
+        texts = [outs[0] if outs else "" for outs in candidates]
+        values, info = self.action_ranker(self.q, prefix_steps, self._agent_label(agent_idx), texts)
+        self.judge_calls += 1
+        self.judge_parse_failures += int(not info.get("parsed", False))
+        self.usage.prm_calls += 1
+        self.usage.scorer += int(info.get("prompt_tokens", 0)) + int(
+            info.get("generated_tokens", 0)
+        )
+        return [float(value) for value in values]
 
     def _uct(self, parent: Node, child: Node) -> float:
         Np = max(parent.visits + 1, 1)
@@ -1444,20 +1779,8 @@ class MCTSInfer(BaseMCTS):
             return
         agent_idx, inbox = self._expansion_context(node)
         msgs = self.mas.agent_messages(agent_idx, inbox)
-        enc = self.mas.agents[agent_idx].tok.apply_chat_template(
-            msgs, tokenize=True, add_generation_prompt=True
-        )
-        p_len = (
-            len(enc)
-            if isinstance(enc, list)
-            else (
-                int(
-                    enc.numel()
-                    if isinstance(enc, torch.Tensor) and enc.dim() == 1
-                    else enc.shape[1]
-                )
-            )
-        )
+        enc = _encode_prompt_ids(self.mas.agents[agent_idx].tok, msgs)
+        p_len = len(enc)
 
         candidates = self.mas.sample_candidates(
             agent_idx,
@@ -1481,14 +1804,15 @@ class MCTSInfer(BaseMCTS):
         self.usage.prompt += p_len
         for outs in candidates:
             if outs:
-                self.usage.generated += _text_token_len_tok(
-                    self.mas.agents[agent_idx].tok, outs[0]
-                )
+                self.usage.generated += _text_token_len_tok(self.mas.agents[agent_idx].tok, outs[0])
 
-        vals: List[float] = []
+        if self.score_type == "judge":
+            vals = self._rank_candidates(node, agent_idx, candidates)
+        else:
+            vals = []
 
-        # Compute values for each candidate
-        for outs in candidates:
+        # Compute values for each candidate (judge scored them all above)
+        for outs in [] if self.score_type == "judge" else candidates:
             traj2 = {**node.trajectory, agent_idx: outs}
 
             if self.score_type == "prm":
@@ -1566,40 +1890,30 @@ class MCTSInfer(BaseMCTS):
                 self._expand(node)
                 if not node.children:
                     break
-                node = max(
-                    node.children, key=lambda ch: self._select_score(path[-1], ch)
-                )
+                node = max(node.children, key=lambda ch: self._select_score(path[-1], ch))
                 path.append(node)
             else:
-                node = max(
-                    node.children, key=lambda ch: self._select_score(path[-1], ch)
-                )
+                node = max(node.children, key=lambda ch: self._select_score(path[-1], ch))
                 path.append(node)
 
         leaf_traj = path[-1].trajectory
         leaf_type = self.leaf or self.score_type
 
-        if leaf_type == "prm":
+        if leaf_type in ("prm", "judge"):
             v_leaf = path[-1].init_value  # cached score for this node
 
         elif leaf_type == "logprob":
             steps = [
-                leaf_traj[agent_idx][0]
-                for agent_idx in self.order
-                if leaf_traj.get(agent_idx)
+                leaf_traj[agent_idx][0] for agent_idx in self.order if leaf_traj.get(agent_idx)
             ]
-            v_leaf, u = score_path_logprob(
-                self.mas, self.q, steps, agg=self.logprob_agg
-            )
+            v_leaf, u = score_path_logprob(self.mas, self.q, steps, agg=self.logprob_agg)
             self.usage.add(u)
 
         else:  # "orm"
             # Pick the last decided agent in topological order (the sink of
             # the realized path), not just the highest index — different in
             # dynamic graphs where conditional edges can skip agents.
-            decided = [
-                agent_idx for agent_idx in self.order if leaf_traj.get(agent_idx)
-            ]
+            decided = [agent_idx for agent_idx in self.order if leaf_traj.get(agent_idx)]
             leaf_last = decided[-1] if decided else (self.mas.n - 1)
             state_text = render_state_text(
                 self.mas,

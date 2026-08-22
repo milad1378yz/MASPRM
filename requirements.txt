@@ -5,6 +5,7 @@ matplotlib==3.10.7
 networkx==3.4.2
 numpy==2.2.6
 peft==0.17.0
+pydantic-monty==0.0.21
 PyYAML==6.0.2
 ray==2.49.1
 torch==2.8.0

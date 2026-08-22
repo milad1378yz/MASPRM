@@ -13,3 +13,4 @@ logs/
 .*/
 .env
 *.md
+*log*

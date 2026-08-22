@@ -6,6 +6,13 @@ import random
 from answer_utils import _to_number
 
 
+_SOFT_NEWLINE_CODEPOINTS = dict.fromkeys((11, 12, 13, 0x85, 0x2028, 0x2029))
+
+
+def _remove_soft_newlines(value):
+    return str(value).translate(_SOFT_NEWLINE_CODEPOINTS)
+
+
 def _select_stratified(data, n, field, seed):
     if not n:
         return data
@@ -45,7 +52,9 @@ def _math_level_key(value):
     return int(match.group(0)) if match else None
 
 
-def load_hard_dataset(name, split, n, seed, *, levels=None, stratify_by=None):
+def load_hard_dataset(
+    name, split, n, seed, *, levels=None, stratify_by=None, require_parseable_gold=False
+):
     if name == "competition_math":
         ds = load_dataset("qwedsacf/competition_math")
         shuffled = ds["train"].shuffle(seed=seed)
@@ -64,6 +73,8 @@ def load_hard_dataset(name, split, n, seed, *, levels=None, stratify_by=None):
         if levels:
             allowed_levels = {int(level) for level in levels}
             data = data.filter(lambda ex: _math_level_key(ex.get("level")) in allowed_levels)
+        if require_parseable_gold:
+            data = data.filter(lambda ex: gold_competition_math(ex) is not None)
         if stratify_by:
             data = _select_stratified(data, n, stratify_by, seed)
         elif n:
@@ -82,6 +93,14 @@ def load_hard_dataset(name, split, n, seed, *, levels=None, stratify_by=None):
         ds = load_dataset("gsm8k", "main")
         data = ds[split].shuffle(seed=seed).select(range(n)) if n else ds[split]
         gold_fn = lambda ex: gold_from_gsm8k(ex["answer"])
+        q_fn = lambda ex: ex["question"]
+
+    elif name == "mgsm":
+        ds = load_dataset("juletxara/mgsm", "en")
+        if split not in ds:
+            raise ValueError(f"Unknown split for mgsm: {split}")
+        data = ds[split].shuffle(seed=seed).select(range(n)) if n else ds[split]
+        gold_fn = lambda ex: _to_number(str(ex["answer_number"]))
         q_fn = lambda ex: ex["question"]
 
     elif name == "svamp":
@@ -154,13 +173,17 @@ def load_hard_dataset(name, split, n, seed, *, levels=None, stratify_by=None):
 
     else:
         raise ValueError(
-            "Unsupported dataset. Choose from: competition_math, aqua_rat, svamp, gsm8k, mmlu, gpqa, logiqa"
+            "Unsupported dataset. Choose from: competition_math, aqua_rat, svamp, "
+            "gsm8k, mgsm, mmlu, gpqa, logiqa"
         )
 
-    if name != "competition_math" and (levels or stratify_by):
-        raise ValueError("levels and stratify_by are supported only for competition_math.")
+    if name != "competition_math" and (levels or stratify_by or require_parseable_gold):
+        raise ValueError(
+            "levels, stratify_by, and require_parseable_gold are supported only "
+            "for competition_math."
+        )
 
-    return data, q_fn, gold_fn
+    return data, lambda ex: _remove_soft_newlines(q_fn(ex)), gold_fn
 
 
 def format_logiqa_question(ex):

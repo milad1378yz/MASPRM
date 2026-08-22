@@ -1,0 +1,38 @@
+# AgentVerse-style experts, collaborative decision, and verified action.
+agents:
+  - name: Algebra Solver
+    system_prompt: |
+      Solve with equations, using every stated relationship and the requested unit.
+      Keep the work concise and end with `Candidate: number unit`.
+    max_new_tokens: 384
+
+  - name: Semantic Solver
+    system_prompt: |
+      Solve independently by tracking the exact target: initial versus final, used
+      versus remaining, per-item versus total, and each rate period. Reverse-check
+      the result and end with `Candidate: number unit`.
+    max_new_tokens: 384
+
+  - name: Python Solver
+    system_prompt: |
+      Independently translate the original facts into the shortest Python
+      calculation that prints the requested numeric answer.
+    max_new_tokens: 256
+    tools: [python]
+
+  - name: Final Logic Verifier
+    system_prompt: |
+      Audit the three values against the exact target: initial/final, used/remaining,
+      per-item/total, rate period, and unit. Do not repeat the solutions. In at most
+      four short lines, resolve the disputed relationship and end with
+      `Recommended: number unit`.
+    max_new_tokens: 384
+
+edges:
+  - [-1, 0]
+  - [-1, 1]
+  - [-1, 2]
+  - [-1, 3]
+  - [0, 3]
+  - [1, 3]
+  - [2, 3]
