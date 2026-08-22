@@ -3,7 +3,6 @@
 MASPRM is a process reward model for guiding search over routed transcripts in multi agent systems. It supports Monte Carlo Tree Search, stepwise beam search, outcome reward models, policy likelihood baselines, dynamic scheduling, and dynamic routing.
 
 - [Paper](https://arxiv.org/abs/2510.24803)
-- [Project page](https://milad1378yz.github.io/MASPRM)
 - License: MIT
 
 ## Repository Layout

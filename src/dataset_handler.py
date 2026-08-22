@@ -1,64 +1,24 @@
 from datasets import load_dataset
 import re
 from fractions import Fraction
-import random
 
 from answer_utils import _to_number
 
 
 _SOFT_NEWLINE_CODEPOINTS = dict.fromkeys((11, 12, 13, 0x85, 0x2028, 0x2029))
+_SPLIT_SEED = 42
 
 
 def _remove_soft_newlines(value):
     return str(value).translate(_SOFT_NEWLINE_CODEPOINTS)
 
 
-def _select_stratified(data, n, field, seed):
-    if not n:
-        return data
-    if field not in data.column_names:
-        raise ValueError(f"Cannot stratify by missing field {field!r}.")
-
-    groups = {}
-    for idx, value in enumerate(data[field]):
-        groups.setdefault(str(value), []).append(idx)
-    rng = random.Random(seed)
-    for indices in groups.values():
-        rng.shuffle(indices)
-
-    selected = []
-    positions = {key: 0 for key in groups}
-    keys = sorted(groups)
-    target = min(int(n), len(data))
-    while len(selected) < target:
-        progressed = False
-        for key in keys:
-            pos = positions[key]
-            if pos >= len(groups[key]):
-                continue
-            selected.append(groups[key][pos])
-            positions[key] += 1
-            progressed = True
-            if len(selected) == target:
-                break
-        if not progressed:
-            break
-    rng.shuffle(selected)
-    return data.select(selected)
-
-
-def _math_level_key(value):
-    match = re.search(r"\d+", str(value))
-    return int(match.group(0)) if match else None
-
-
-def load_hard_dataset(
-    name, split, n, seed, *, levels=None, stratify_by=None, require_parseable_gold=False
-):
+def load_hard_dataset(name, split, n, seed):
     if name == "competition_math":
         ds = load_dataset("qwedsacf/competition_math")
-        shuffled = ds["train"].shuffle(seed=seed)
-        # Define explicit train/test split
+        # The paper uses one fixed shuffle for this derived partition. Run
+        # seeds affect model sampling, not which examples belong to each split.
+        shuffled = ds["train"].shuffle(seed=_SPLIT_SEED)
         test_size = 2000
         train_data = shuffled.select(range(test_size, len(shuffled)))
         test_data = shuffled.select(range(test_size))
@@ -70,24 +30,11 @@ def load_hard_dataset(
         else:
             raise ValueError(f"Unknown split: {split}")
 
-        if levels:
-            allowed_levels = {int(level) for level in levels}
-            data = data.filter(lambda ex: _math_level_key(ex.get("level")) in allowed_levels)
-        if require_parseable_gold:
-            data = data.filter(lambda ex: gold_competition_math(ex) is not None)
-        if stratify_by:
-            data = _select_stratified(data, n, stratify_by, seed)
-        elif n:
+        if n:
             data = data.select(range(min(int(n), len(data))))
 
         gold_fn = gold_competition_math
         q_fn = lambda ex: ex["problem"]
-
-    elif name == "aqua_rat":
-        ds = load_dataset("aqua_rat")
-        data = ds[split].shuffle(seed=seed).select(range(n)) if n else ds[split]
-        gold_fn = gold_aqua_rat
-        q_fn = lambda ex: ex["question"]
 
     elif name == "gsm8k":
         ds = load_dataset("gsm8k", "main")
@@ -102,12 +49,6 @@ def load_hard_dataset(
         data = ds[split].shuffle(seed=seed).select(range(n)) if n else ds[split]
         gold_fn = lambda ex: _to_number(str(ex["answer_number"]))
         q_fn = lambda ex: ex["question"]
-
-    elif name == "svamp":
-        ds = load_dataset("svamp")
-        data = ds[split].shuffle(seed=seed).select(range(n)) if n else ds[split]
-        gold_fn = gold_svamp
-        q_fn = lambda ex: ex["Body"] + " " + ex["Question"]
 
     elif name == "mmlu":
 
@@ -125,31 +66,6 @@ def load_hard_dataset(
 
         gold_fn = gold_mmlu
         q_fn = format_mmlu_question
-
-    elif name == "gpqa":
-        # Official GPQA Main split from HuggingFace:
-        #   - HF id: "Idavidrein/gpqa"
-        #   - config: "gpqa_main"
-        #   - split: "train"
-        # Note: the dataset is gated – you must accept its terms on HF before
-        # this will download successfully.
-        ds = load_dataset("Idavidrein/gpqa", "gpqa_main")
-
-        shuffled = ds["train"].shuffle(seed=seed)
-        # Define explicit train/test split
-        test_size = 100
-        train_data = shuffled.select(range(test_size, len(shuffled)))
-        test_data = shuffled.select(range(test_size))
-
-        if split == "train":
-            data = train_data.select(range(n)) if n else train_data
-        elif split == "test":
-            data = test_data.select(range(n)) if n else test_data
-        else:
-            raise ValueError(f"Unknown split: {split}")
-
-        gold_fn = gold_gpqa
-        q_fn = format_gpqa_question
 
     elif name == "logiqa":
         # Supports both `lucasmccabe/logiqa` (correct_option) and the original
@@ -173,14 +89,8 @@ def load_hard_dataset(
 
     else:
         raise ValueError(
-            "Unsupported dataset. Choose from: competition_math, aqua_rat, svamp, "
-            "gsm8k, mgsm, mmlu, gpqa, logiqa"
-        )
-
-    if name != "competition_math" and (levels or stratify_by or require_parseable_gold):
-        raise ValueError(
-            "levels, stratify_by, and require_parseable_gold are supported only "
-            "for competition_math."
+            "Unsupported dataset. Choose from: competition_math, gsm8k, mgsm, "
+            "mmlu, logiqa"
         )
 
     return data, lambda ex: _remove_soft_newlines(q_fn(ex)), gold_fn
@@ -266,23 +176,6 @@ def gold_competition_math(example):
     return None
 
 
-def gold_aqua_rat(example):
-    # multiple choice; correct option index (e.g., 'A', 'B', ...) and options text.
-    key = example["correct"]
-    # Some entries store the final numeric inside options like "A) 42"
-    opts = example["options"]
-    # Map key to option string
-    label_to_idx = {c: i for i, c in enumerate("ABCDE")}
-    if key in label_to_idx and 0 <= label_to_idx[key] < len(opts):
-        return _to_number(re.sub(r"^[A-E]\)\s*", "", opts[label_to_idx[key]]))
-    return None
-
-
-def gold_svamp(example):
-    # short numeric answer in 'Answer'
-    return _to_number(str(example["Answer"]))
-
-
 def format_mmlu_question(ex):
     """Format a single MMLU item into a prompt with A-D options."""
     q = (ex.get("question") or ex.get("prompt") or ex.get("stem") or "").strip()
@@ -348,66 +241,3 @@ def gold_mmlu(ex):
 def _norm(s):
     return re.sub(r"\s+", " ", str(s)).strip().lower()
 
-
-def _gpqa_perm(ex):
-    """
-    Deterministically shuffle the 4 answer options so that:
-      - The model doesn't see 'correct is always A'.
-      - The same GPQA example always gets the same option order.
-    We derive a seed from Record ID (or fall back to Question text).
-    """
-    rid = ex.get("Record ID") or ex.get("Record_ID") or ex.get("Question") or ""
-    rid_str = str(rid)
-
-    # Simple deterministic seed: sum of character codes
-    seed = sum(ord(c) for c in rid_str)
-    rng = random.Random(seed)
-
-    idxs = [0, 1, 2, 3]
-    rng.shuffle(idxs)  # in-place
-    return idxs
-
-
-def format_gpqa_question(ex):
-    """
-    Turn a GPQA example into a multiple-choice prompt with A-D options.
-
-    Fields used (from Idavidrein/gpqa, gpqa_main):
-      - Question
-      - Correct Answer
-      - Incorrect Answer 1/2/3
-      - Record ID (for permutation)
-    """
-    q = (ex.get("Question") or "").strip()
-
-    # Original order: index 0 is the correct answer.
-    opts = [
-        ex.get("Correct Answer"),
-        ex.get("Incorrect Answer 1"),
-        ex.get("Incorrect Answer 2"),
-        ex.get("Incorrect Answer 3"),
-    ]
-
-    # Fallback in case any field is missing (defensive)
-    opts = ["" if o is None else str(o) for o in opts]
-
-    perm = _gpqa_perm(ex)  # permutation of [0,1,2,3]
-    labels = "ABCD"
-
-    lines = [q]
-    for new_i, old_i in enumerate(perm):
-        lines.append(f"{labels[new_i]}. {opts[old_i]}")
-
-    # Instruct the model to answer with a single letter, like for MMLU.
-    return "\n".join(lines)
-
-
-def gold_gpqa(ex):
-    """
-    Return the correct choice as a single uppercase letter A-D, consistent
-    with format_gpqa_question's permutation.
-    """
-    perm = _gpqa_perm(ex)
-    # In the original order, index 0 is the correct answer ('Correct Answer').
-    correct_pos = perm.index(0)  # where did index 0 end up after shuffling?
-    return "ABCD"[correct_pos]

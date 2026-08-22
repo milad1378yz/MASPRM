@@ -4,7 +4,6 @@ import argparse
 import json
 import os
 from pathlib import Path
-import pathlib
 import warnings
 
 import torch
@@ -16,7 +15,6 @@ from mas import build_mas_from_specs
 from mcts import Node, MAS_MCTS
 from dataset_handler import load_hard_dataset
 from experiments.core import build_runtime
-from show_tree import build_graph, draw_tree
 
 import ray
 from tqdm.auto import tqdm
@@ -64,7 +62,7 @@ def _result_path(
     )
 
 
-def node_to_dict(node: Node, max_children: int = 8) -> Dict[str, Any]:
+def node_to_dict(node: Node) -> Dict[str, Any]:
     return {
         "steps": node.steps,
         "action_text": node.action_text,
@@ -73,7 +71,7 @@ def node_to_dict(node: Node, max_children: int = 8) -> Dict[str, Any]:
         "visits": node.visits,
         "q_sum": node.q_sum,
         "q_mean": node.q_mean,
-        "children": [node_to_dict(ch, max_children) for ch in node.children[:max_children]],
+        "children": [node_to_dict(child) for child in node.children],
         "node_text": node.node_text,
     }
 
@@ -194,13 +192,10 @@ class RayWorker:
             os.makedirs(result_path, exist_ok=True)
             json_data = node_to_dict(root)
             json_file = f"{result_path}/{idx}.json"
-            png_file = f"{result_path}/{idx}.png"
-            pathlib.Path(json_file).write_text(json.dumps(json_data, indent=2))
-            G = build_graph(json_data, max_depth=6, max_children=4)
-            draw_tree(G, png_file, dpi=400, font_size=9)
+            Path(json_file).write_text(json.dumps(json_data, indent=2))
             if verbose:
                 print_top_rollouts(root, ground_truth_answer, k=3)
-            return {"idx": idx, "ok": True, "json": json_file, "png": png_file}
+            return {"idx": idx, "ok": True, "json": json_file}
         except Exception as e:
             return {"idx": idx, "ok": False, "err": str(e)}
 
@@ -213,12 +208,9 @@ def main():
         default="gsm8k",
         choices=[
             "competition_math",
-            "aqua_rat",
-            "svamp",
             "gsm8k",
             "mgsm",
             "mmlu",
-            "gpqa",
             "logiqa",
         ],
         help="Name of dataset; also used to select configs/<dataset>.yaml",
@@ -248,14 +240,14 @@ def main():
     ap.add_argument("--attn_impl", type=str, default="sdpa")
     ap.add_argument("--no_compile", action="store_true", help="Disable torch.compile().")
 
-    ap.add_argument("--n_rollouts", type=int, default=64)
+    ap.add_argument("--n_rollouts", type=int, default=40)
     ap.add_argument(
         "--search_c",
         type=float,
-        default=None,
-        help="MCTS exploration constant. Defaults to 8 with Ray and 4 otherwise.",
+        default=4.0,
+        help="MCTS exploration constant.",
     )
-    ap.add_argument("--n_candidates", type=int, default=4)
+    ap.add_argument("--n_candidates", type=int, default=3)
     ap.add_argument("--temperature", type=float, default=0.7)
     ap.add_argument("--top_p", type=float, default=0.95)
 
@@ -286,7 +278,7 @@ def main():
         ap.error("--n_rollouts must be at least 1")
     if args.n_candidates < 1:
         ap.error("--n_candidates must be at least 1")
-    if args.search_c is not None and args.search_c < 0:
+    if args.search_c < 0:
         ap.error("--search_c cannot be negative")
     if args.temperature <= 0:
         ap.error("--temperature must be greater than zero")
@@ -304,7 +296,7 @@ def main():
     agent_specs = cfg["agents"]
     edges = cfg["edges"]
 
-    search_c = args.search_c if args.search_c is not None else (8.0 if args.ray else 4.0)
+    search_c = args.search_c
     search_n_candidates = args.n_candidates
     search_gen_kwargs = dict(temperature=args.temperature, top_p=args.top_p)
     result_path = _result_path(
@@ -391,10 +383,7 @@ def main():
                 in_flight -= 1
                 if res.get("ok"):
                     with pbar.external_write_mode():
-                        print(
-                            f"✓ idx={res['idx']}  →  "
-                            f"{os.path.basename(res['json'])}, {os.path.basename(res['png'])}"
-                        )
+                        print(f"✓ idx={res['idx']}  →  {os.path.basename(res['json'])}")
                 else:
                     with pbar.external_write_mode():
                         print(f"✗ idx={res.get('idx')}  ERROR: {res.get('err')}")
@@ -430,7 +419,6 @@ def main():
     )
     for i, ex in enumerate(data):
         json_path = result_path / f"{i}.json"
-        png_path = result_path / f"{i}.png"
         if json_path.exists():
             with pbar_sp.external_write_mode():
                 print(f"Skipping existing example {i}")
@@ -456,9 +444,7 @@ def main():
 
         os.makedirs(result_path, exist_ok=True)
         json_data = node_to_dict(root)
-        pathlib.Path(json_path).write_text(json.dumps(json_data, indent=2))
-        G = build_graph(json_data, max_depth=6, max_children=4)
-        draw_tree(G, png_path, dpi=400, font_size=9)
+        json_path.write_text(json.dumps(json_data, indent=2))
         if args.verbose:
             with pbar_sp.external_write_mode():
                 print("Saved: ", json_path)
