@@ -55,8 +55,11 @@ def arg_parser():
     ap.add_argument(
         "--mode",
         choices=["prm", "ppm", "orm"],
-        default="prm",
-        help="prm: PRM/PQM regression; ppm: pairwise Process Preference Model; orm: PRM but only the last step.",
+        default="ppm",
+        help=(
+            "prm: pointwise MASPRM MSE head; ppm: pairwise Bradley-Terry "
+            "MASPRM head; orm: terminal BCE or MSE head."
+        ),
     )
     # Data
     ap.add_argument(
@@ -66,9 +69,9 @@ def arg_parser():
         help="Path to JSON/JSONL file",
     )
     # Model & training
-    ap.add_argument("--model-id", type=str, default="Qwen/Qwen2.5-1.5B-Instruct")
+    ap.add_argument("--model-id", type=str, default="Qwen/Qwen2.5-1.5B")
     ap.add_argument("--output-dir", type=Path, default=Path("checkpoints/Qwen2.5-1.5B-RM"))
-    ap.add_argument("--epochs", type=int, default=10)
+    ap.add_argument("--epochs", type=int, default=5)
     ap.add_argument(
         "--max-steps",
         type=int,
@@ -76,13 +79,6 @@ def arg_parser():
         help="Optional optimizer-step cap; useful for smoke tests. -1 uses --epochs.",
     )
     ap.add_argument("--lr", type=float, default=1e-5)
-    ap.add_argument(
-        "--init-adapter-dir",
-        type=Path,
-        default=None,
-        help="Warm-start: load LoRA adapter weights from this directory "
-        "instead of random adapter init (PPM mode only).",
-    )
     ap.add_argument("--weight-decay", type=float, default=0.01)
     ap.add_argument("--grad-accum", type=int, default=16)
     ap.add_argument("--train-batch-size", type=int, default=8)
@@ -105,8 +101,7 @@ def arg_parser():
     ap.add_argument(
         "--hub-logs",
         action="store_true",
-        default=True,
-        help="Report to tensorboard if set",
+        help="Report training metrics to TensorBoard.",
     )
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument(
@@ -131,13 +126,11 @@ def arg_parser():
         help="If using a sentinel like '<extra_0>', add it to tokenizer.",
     )
     # Loss (PRM/ORM only)
-    ap.add_argument("--loss", choices=["mse", "huber", "bce"], default="bce")
-    ap.add_argument("--huber-beta", type=float, default=0.1)
     ap.add_argument(
-        "--ppm-best-metric",
-        choices=["pair_acc", "loss"],
-        default="pair_acc",
-        help="Held-out metric used to select the best PPM checkpoint.",
+        "--loss",
+        choices=["mse", "bce"],
+        default=None,
+        help="Pointwise loss. Defaults to MSE for MASPRM and BCE for ORM.",
     )
     # LoRA
     ap.add_argument("--lora-r", type=int, default=256)
@@ -147,14 +140,6 @@ def arg_parser():
         "--no-lora",
         action="store_true",
         help="Disable LoRA/QLoRA and quantization; full finetune with standard AdamW.",
-    )
-    ap.add_argument(
-        "--train-new-token-only",
-        action="store_true",
-        help=(
-            "Train only newly added separator-token rows instead of the full "
-            "embedding matrix. This substantially reduces QLoRA memory use."
-        ),
     )
     ap.add_argument(
         "--no-resume",
@@ -230,18 +215,15 @@ def _grouped_train_eval_split(
 # PRM (regression) trainer
 class PRMRegressionTrainer(PRMTrainer):
     """
-    Continuous PRM in [-1, 1] using logit-space loss:
-      z_target = atanh(y)  (with clamp)
-      loss = MSE/Huber(z, z_target) on separator positions only
+    Continuous PRM in [-1, 1]. The scalar head is passed through tanh before
+    applying MSE at separator positions.
     """
 
-    def __init__(self, *args, loss_type: str = "mse", huber_beta: float = 0.1, **kwargs):
+    def __init__(self, *args, loss_type: str = "mse", **kwargs):
         super().__init__(*args, **kwargs)
         self._loss_type = loss_type
 
-        if loss_type == "huber":
-            self._loss = nn.SmoothL1Loss(beta=huber_beta)
-        elif loss_type == "mse":
+        if loss_type == "mse":
             self._loss = nn.MSELoss()
         elif loss_type == "bce":
             self._loss = nn.BCEWithLogitsLoss()
@@ -297,11 +279,11 @@ class PRMRegressionTrainer(PRMTrainer):
         # Labels are already float targets in [-1,1] from the collator
         y = labels.to(torch.float32)
 
-        # Stable logit-space targets (avoid tanh saturation / vanishing grads)
-        eps = 0.05  # keep away from ±1 so atanh is finite and well-conditioned
-        y = y.clamp(-1 + eps, 1 - eps)
-        z_target = torch.atanh(y)
-        loss = self._loss(z[mask], z_target[mask])
+        if self._loss_type == "bce":
+            targets = (y > 0).to(torch.float32)
+            loss = self._loss(z[mask], targets[mask])
+        else:
+            loss = self._loss(torch.tanh(z[mask]), y[mask])
         return (loss, out) if return_outputs else loss
 
     @staticmethod
@@ -402,11 +384,7 @@ class ORMRegressionTrainer(PRMRegressionTrainer):
             targets = (y > 0).to(torch.float32)
             loss = self._loss(z[mask], targets[mask])
         else:
-            # original regression-in-logit-space behavior
-            eps = 0.05
-            y = y.clamp(-1 + eps, 1 - eps)
-            z_target = torch.atanh(y)
-            loss = self._loss(z[mask], z_target[mask])
+            loss = self._loss(torch.tanh(z[mask]), y[mask])
         return (loss, out) if return_outputs else loss
 
     @staticmethod
@@ -593,48 +571,40 @@ def _last_sep_logits(
 
 def compute_ppm_metrics(eval_pred):
     arr = np.asarray(eval_pred.predictions)
-    # Backward compatibility if you keep the old path somewhere
-    if arr.ndim == 1:
-        d = arr
-        pos = neg = p_found = n_found = None
-    else:
-        d, pos, neg, p_found, n_found = (
-            arr[:, 0],
-            arr[:, 1],
-            arr[:, 2],
-            arr[:, 3],
-            arr[:, 4],
+    d, pos, neg, p_found, n_found = (
+        arr[:, 0],
+        arr[:, 1],
+        arr[:, 2],
+        arr[:, 3],
+        arr[:, 4],
+    )
+    auc = 0.0
+    if pos.size and neg.size:
+        scores = np.concatenate([pos, neg])
+        labels = np.concatenate(
+            [np.ones(pos.size, dtype=np.int8), np.zeros(neg.size, dtype=np.int8)]
         )
-
-    out = {}
-    if d.size:
-        out["pair_acc"] = float((d > 0).mean())
-        out["avg_margin"] = float(d.mean())
-        out["median_margin"] = float(np.median(d))
-        out["std_margin"] = float(d.std())
-        out["avg_bt_prob"] = float((1.0 / (1.0 + np.exp(-d))).mean())  # mean \sigma(diff)
-
-    if pos is not None:
-        out["pos_mean"] = float(pos.mean())
-        out["neg_mean"] = float(neg.mean())
-        raw_scores = np.concatenate(
-            [np.asarray(pos, dtype=np.float32), np.asarray(neg, dtype=np.float32)]
-        )
-        tanh_pos = torch.tanh(torch.from_numpy(np.asarray(pos, dtype=np.float32))).numpy()
-        tanh_neg = torch.tanh(torch.from_numpy(np.asarray(neg, dtype=np.float32))).numpy()
-        out["tanh_pair_acc"] = float((tanh_pos > tanh_neg).mean())
-        out["tanh_tie_rate"] = float((tanh_pos == tanh_neg).mean())
-        out["raw_score_abs_p95"] = float(np.quantile(np.abs(raw_scores), 0.95))
-        out["raw_score_abs_max"] = float(np.abs(raw_scores).max())
-        out["raw_score_abs_ge_9p011_rate"] = float((np.abs(raw_scores) >= 9.011).mean())
-
-    if p_found is not None:
-        out["fallback_rate_pos"] = float((1.0 - p_found).mean())
-        out["fallback_rate_neg"] = float((1.0 - n_found).mean())
-        out["fallback_rate_any"] = float(((p_found < 0.5) | (n_found < 0.5)).mean())
-
-    out["num_pairs"] = int(d.size)
-    return out
+        order = np.argsort(scores, kind="mergesort")
+        ranks = np.empty(scores.size, dtype=np.float64)
+        start = 0
+        while start < order.size:
+            end = start + 1
+            while end < order.size and scores[order[end]] == scores[order[start]]:
+                end += 1
+            ranks[order[start:end]] = (start + 1 + end) / 2.0
+            start = end
+        positive_rank_sum = float(ranks[labels == 1].sum())
+        auc = (positive_rank_sum - pos.size * (pos.size + 1) / 2.0) / (pos.size * neg.size)
+    return {
+        "pair_acc": float((d > 0).mean()) if d.size else 0.0,
+        "avg_margin": float(d.mean()) if d.size else 0.0,
+        "auc": float(auc),
+        "bt_loss": float(np.logaddexp(0.0, -d).mean()) if d.size else 0.0,
+        "pos_mean": float(pos.mean()) if pos.size else 0.0,
+        "neg_mean": float(neg.mean()) if neg.size else 0.0,
+        "fallback_rate_any": (float(((p_found < 0.5) | (n_found < 0.5)).mean()) if d.size else 0.0),
+        "num_pairs": int(d.size),
+    }
 
 
 def _last_sep_logits_with_flag(
@@ -684,11 +654,11 @@ class PPMTrainer(Trainer):
 
         out_pos = model(input_ids=pos_ids, attention_mask=pos_mask)
         out_neg = model(input_ids=neg_ids, attention_mask=neg_mask)
-        pos_score = _last_sep_logits(
-            out_pos.logits.to(torch.float32), pos_ids, self._sep_id, self._pad_id
+        pos_score = torch.tanh(
+            _last_sep_logits(out_pos.logits.to(torch.float32), pos_ids, self._sep_id, self._pad_id)
         )  # (B,)
-        neg_score = _last_sep_logits(
-            out_neg.logits.to(torch.float32), neg_ids, self._sep_id, self._pad_id
+        neg_score = torch.tanh(
+            _last_sep_logits(out_neg.logits.to(torch.float32), neg_ids, self._sep_id, self._pad_id)
         )  # (B,)
 
         diff = pos_score - neg_score
@@ -718,6 +688,8 @@ class PPMTrainer(Trainer):
             neg_score, neg_found = _last_sep_logits_with_flag(
                 out_neg.logits.to(torch.float32), neg_ids, self._sep_id, self._pad_id
             )
+            pos_score = torch.tanh(pos_score)
+            neg_score = torch.tanh(neg_score)
 
             diff = pos_score - neg_score
             loss = -F.logsigmoid(diff).mean()
@@ -793,10 +765,12 @@ def main():
     is_main = _is_main_process()
 
     args = arg_parser()
+    if args.loss is None:
+        args.loss = "bce" if args.mode == "orm" else "mse"
+    if args.mode == "prm" and args.loss != "mse":
+        raise ValueError("The pointwise MASPRM head uses --loss mse; BCE is ORM-only.")
     set_seed(args.seed)
     use_lora = not args.no_lora
-    if args.train_new_token_only and not use_lora:
-        raise ValueError("--train-new-token-only requires LoRA/QLoRA.")
     rank_zero_print(f"LoRA enabled: {use_lora}")
 
     # Load dataset
@@ -826,7 +800,6 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
 
     # Optionally ensure the step separator is a known/special token
-    tokenizer_size_before = len(tokenizer)
     if args.ensure_step_token:
         looks_like_special = bool(re.match(r"^<[^>\s]+>$", args.step_separator))
         if (
@@ -835,9 +808,6 @@ def main():
         ):
             tokenizer.add_special_tokens({"additional_special_tokens": [args.step_separator]})
             rank_zero_print(f"Added special token to tokenizer: {args.step_separator}")
-    new_token_indices = list(range(tokenizer_size_before, len(tokenizer)))
-    if args.train_new_token_only and not new_token_indices:
-        rank_zero_print("No new tokenizer rows were added; --train-new-token-only has no effect.")
     rank_zero_print(
         "Separator ids:",
         tokenizer.encode(args.step_separator, add_special_tokens=False),
@@ -862,8 +832,7 @@ def main():
         "post_attention_layernorm",
         "classifier",
     ]
-    if not args.train_new_token_only:
-        modules_to_save.append("embed_tokens")
+    modules_to_save.append("embed_tokens")
 
     lora_config = LoraConfig(
         task_type=TaskType.TOKEN_CLS,
@@ -883,9 +852,6 @@ def main():
         bias="all",
         # bias="none",
         modules_to_save=modules_to_save,
-        trainable_token_indices=(
-            new_token_indices if args.train_new_token_only and new_token_indices else None
-        ),
     )
 
     # Robust dtype/attention selection for V100-class GPUs (no BF16/FA2 support).
@@ -909,9 +875,7 @@ def main():
     else:
         attn_impl = "sdpa"
 
-    # Prefer BF16 on Ampere+ (including the LoRA path) to avoid FP16 grad-norm
-    # overflow spikes. Only fall back to FP16 on Volta/Turing.
-    chosen_dtype = torch.bfloat16 if ampere_or_newer else torch.float16
+    chosen_dtype = torch.float16
 
     device_map = "auto" if use_lora else None
 
@@ -977,7 +941,7 @@ def main():
         step_separator=args.step_separator,
         dataloader_num_workers=4,
         dataloader_persistent_workers=False,
-        report_to=("tensorboard" if args.hub_logs else None),
+        report_to=("tensorboard" if args.hub_logs else []),
         average_tokens_across_devices=True,
         seed=args.seed,
         ddp_find_unused_parameters=False,
@@ -1036,21 +1000,12 @@ def main():
         )
 
         if use_lora:
-            if args.init_adapter_dir is not None:
-                from peft import PeftModel
+            model = get_peft_model(model, lora_config)
 
-                model = PeftModel.from_pretrained(
-                    model, str(args.init_adapter_dir), is_trainable=True
-                )
-                rank_zero_print(f"Warm-started adapter from {args.init_adapter_dir}")
-            else:
-                model = get_peft_model(model, lora_config)
-
-        ppm_best_metric = "pair_acc" if args.ppm_best_metric == "pair_acc" else "loss"
         training_args = PRMConfig(
             **common_cfg,
-            metric_for_best_model=ppm_best_metric,
-            greater_is_better=(ppm_best_metric == "pair_acc"),
+            metric_for_best_model="pair_acc",
+            greater_is_better=True,
             group_by_length=False,
             remove_unused_columns=False,  # already needed for PPM collator
             label_names=["labels"],
@@ -1113,7 +1068,6 @@ def main():
             peft_config=peft_cfg,
             compute_metrics=compute_regression_metrics,
             loss_type=args.loss,
-            huber_beta=args.huber_beta,
             data_collator=data_collator,
         )
 
@@ -1143,7 +1097,6 @@ def main():
             peft_config=peft_cfg,
             compute_metrics=compute_regression_metrics,
             loss_type=args.loss,
-            huber_beta=args.huber_beta,
             data_collator=data_collator,
         )
 
@@ -1167,11 +1120,7 @@ def main():
             "lora_r": args.lora_r,
             "lora_alpha": args.lora_alpha,
             "lora_dropout": args.lora_dropout,
-            "train_new_token_only": args.train_new_token_only,
-            "new_token_indices": new_token_indices,
-            "best_model_metric": (
-                f"eval_{args.ppm_best_metric}" if args.mode == "ppm" else "eval_pearson"
-            ),
+            "best_model_metric": ("eval_pair_acc" if args.mode == "ppm" else "eval_pearson"),
         }
     )
     args.output_dir.mkdir(parents=True, exist_ok=True)

@@ -175,7 +175,7 @@ def main():
             writer.writerow(row)
 
     print("-" * 60)
-    print(f"Aggregation complete.")
+    print("Aggregation complete.")
     print(f"Processed {len(aggregated_data)} unique experiments.")
     print(f"Results saved to: {os.path.abspath(OUTPUT_CSV)}")
     print("-" * 60)

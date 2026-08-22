@@ -19,7 +19,7 @@ from transformers import (
 from transformers import BitsAndBytesConfig
 from peft import PeftModel, PeftConfig
 
-from answer_utils import numbers_equal
+from answer_utils import answers_equal, numbers_equal
 from handoff_mas import (
     FINAL_RECIPIENT,
     HandoffContext,
@@ -29,7 +29,7 @@ from handoff_mas import (
     parse_routed_turn,
 )
 from mas import MAS
-from mcts import BaseMCTS, Node
+from mcts import BaseMCTS, Node, uct_score
 from agent import Agent
 
 
@@ -306,13 +306,10 @@ def score_path_logprob(
     mas,
     question: str,
     steps: list[str],
-    *,
-    agg: str = "sum",
 ) -> tuple[float, TokenStats]:
     usage = TokenStats()
     traj_so_far: Dict[int, List[str]] = {}
-    s_total = 0.0
-    token_total = 0
+    step_scores: List[float] = []
 
     # Walk the dynamic graph: the k-th provided step belongs to whichever
     # agent is runnable given the trajectory so far (in a static DAG this
@@ -326,22 +323,14 @@ def score_path_logprob(
 
         lp, p_len, g_len = compute_logprob_and_token_counts(mas.agents[agent_idx], msgs, text)
         usage.scorer += p_len + g_len
-        s_total += lp
-        token_total += max(0, g_len)
+        step_scores.append(_sigmoid(lp / max(1, g_len)))
 
         traj_so_far[agent_idx] = [text]
 
-    if agg in ("avg_token", "avg", "mean_token"):
-        value = s_total / max(1, token_total)
-    elif agg in ("avg_step", "mean_step"):
-        value = s_total / max(1, len(steps))
-    else:  # "sum" (default)
-        value = s_total
-
-    return value, usage
+    return (sum(step_scores) / len(step_scores) if step_scores else 0.0), usage
 
 
-def score_path_prm_product(
+def score_path_prm_mean(
     score_fn,
     mas,
     question: str,
@@ -353,7 +342,7 @@ def score_path_prm_product(
 ) -> tuple[float, TokenStats]:
     usage = TokenStats()
     traj: Dict[int, List[str]] = {}
-    product = 1.0
+    scores: List[float] = []
     for text in steps:
         result = mas.next_runnable(question, traj)
         if result is None:
@@ -365,15 +354,14 @@ def score_path_prm_product(
         )
         v = float(score_fn(s_text))  # [-1, 1]
         usage.prm_calls += 1
-        w = (v + 1.0) / 2.0
-        product *= max(1e-6, w)
+        scores.append(v)
         if tokenizer is not None:
             usage.scorer += _text_token_len_tok(tokenizer, s_text)
-    return product, usage
+    return (sum(scores) / len(scores) if scores else 0.0), usage
 
 
 def score_orm_end(orm_fn, text: str, tokenizer=None) -> tuple[float, TokenStats]:
-    usage = TokenStats()
+    usage = TokenStats(prm_calls=1)
     v = float(orm_fn(text))  # expect ~[-1, 1]
     if tokenizer is not None:
         usage.scorer += _text_token_len_tok(tokenizer, text)
@@ -398,7 +386,6 @@ def sbs_decode2(
     trace: Optional[List[Dict[str, Any]]] = None,
     return_trace: bool = False,
     *,
-    logprob_agg: str = "sum",  # "sum" | "avg_token" | "avg_step"
     final_answers_out: Optional[List[str]] = None,  # collect beam finals for pass@k
     view_mode: str = "full",  # "full" | "local" — PRM state scope
 ):
@@ -406,7 +393,7 @@ def sbs_decode2(
     usage = TokenStats()
     gen_kwargs = gen_kwargs or {}
     agent_order = _agent_order(mas)
-    beams: List[Tuple[Dict[int, List[str]], float]] = [({}, 0.0)]
+    beams: List[Tuple[Dict[int, List[str]], float, List[float]]] = [({}, 0.0, [])]
     local_trace: List[Dict[str, Any]] = [] if (trace is not None or return_trace) else None
 
     # Walk agent_order (topological). For each agent, only beams that have
@@ -415,17 +402,17 @@ def sbs_decode2(
     # different beams traverse different subsets of the DAG when
     # conditional edges suppress dispatch.
     for agent_idx in agent_order:
-        new_beams: List[Tuple[Dict[int, List[str]], float]] = []
+        new_beams: List[Tuple[Dict[int, List[str]], float, List[float]]] = []
         cand_infos_all: List[Tuple[List[str], float]] = []
         any_beam_ran = False
 
-        for traj, prev_score in beams:
+        for traj, prev_score, path_scores in beams:
             inbox, _, _ = mas._replay(question, set(traj), traj)
 
             if not mas.is_runnable(agent_idx, inbox) or agent_idx in traj:
                 # Beam skips this agent (conditional edge suppressed, or
                 # somehow already decided). Carry it forward unchanged.
-                new_beams.append((traj, prev_score))
+                new_beams.append((traj, prev_score, path_scores))
                 continue
 
             any_beam_ran = True
@@ -471,20 +458,14 @@ def sbs_decode2(
                         mas.agents[agent_idx], None, outs[0], prompt_ids=enc
                     )
                     usage.scorer += sp + sg
-                    if logprob_agg in ("avg_token", "avg", "mean_token"):
-                        v = s / max(1, sg)
-                    elif logprob_agg in ("avg_step", "mean_step"):
-                        # one step => same as "sum"
-                        v = s
-                    else:
-                        v = s
+                    v = _sigmoid(s / max(1, sg))
                 else:
                     v = 0.0
                 cand_infos.append((outs, v))
                 cand_infos_all.append((outs, v))
 
             for outs, v in cand_infos:
-                new_beams.append(({**traj, agent_idx: outs}, v))
+                new_beams.append(({**traj, agent_idx: outs}, v, [*path_scores, v]))
 
         if local_trace is not None and any_beam_ran:
             local_trace.append(
@@ -507,7 +488,7 @@ def sbs_decode2(
         beams = new_beams[: max(1, B1)]
 
         if local_trace is not None and any_beam_ran:
-            chosen_traj, chosen_val = beams[0]
+            chosen_traj, chosen_val, _ = beams[0]
             chosen_outs = chosen_traj.get(agent_idx)
             # If the top beam was a carry-forward (didn't run this agent),
             # leave chosen_text as None so downstream consumers skip it.
@@ -520,11 +501,20 @@ def sbs_decode2(
     # collect final answers for all surviving beams (for pass@k)
     if final_answers_out is not None:
         final_answers_out.clear()
-        for traj, _ in beams:
+        ranked_beams = (
+            sorted(
+                beams,
+                key=lambda beam: sum(beam[2]) / max(1, len(beam[2])),
+                reverse=True,
+            )
+            if score_type != "none"
+            else beams
+        )
+        for traj, _, _ in ranked_beams:
             _, primary_out_i, last_i = mas._replay(question, set(traj), traj)
             final_answers_out.append(mas._aggregate_final(primary_out_i, last_i))
 
-    best_traj, _ = beams[0]
+    best_traj, _, _ = beams[0]
     inbox, primary_out, last = mas._replay(question, set(best_traj), best_traj)
     final_answer = mas._aggregate_final(primary_out, last)
 
@@ -762,9 +752,8 @@ def handoff_sbs_decode(
     initial_speaker: str = "Problem Analyst",
     fixed_schedule: Optional[Sequence[str]] = None,
     gen_kwargs: Optional[Dict[str, Any]] = None,
-    logprob_agg: str = "avg_token",
     step_separator: str = "</step>",
-    max_context_tokens: int = 16384,
+    max_context_tokens: int = 2048,
     seed: int = 42,
     allow_self: bool = False,
     random_can_finalize: bool = True,
@@ -927,14 +916,9 @@ def handoff_sbs_decode(
                 prompt_ids=prompt_ids,
             )
             usage.scorer += sum(prompt_len + length for length in generated_lengths)
-            if logprob_agg in {"avg_token", "avg", "mean_token"}:
-                values = [
-                    value / max(1, length) for value, length in zip(values, generated_lengths)
-                ]
-            elif logprob_agg in {"avg_step", "mean_step", "sum"}:
-                pass
-            else:
-                raise ValueError(f"Unknown logprob aggregation: {logprob_agg!r}.")
+            values = [
+                _sigmoid(value / max(1, length)) for value, length in zip(values, generated_lengths)
+            ]
 
         best_idx = max(range(len(valid_turns)), key=lambda idx: values[idx])
         return valid_turns[best_idx]
@@ -972,7 +956,7 @@ def _majority_by_numbers_equal(preds: List[str]) -> str:
     for p in preds:
         placed = False
         for i, r in enumerate(reps):
-            if numbers_equal(p, r):
+            if numbers_equal(p, r) or answers_equal(p, r):
                 counts[i] += 1
                 members[i].append(p)
                 placed = True
@@ -1003,7 +987,7 @@ def _cluster_answers(preds: Sequence[Tuple[str, float]]) -> str:
     clusters: List[Dict[str, Any]] = []
     for ans, w in preds:
         for c in clusters:
-            if numbers_equal(ans, c["rep"]):
+            if numbers_equal(ans, c["rep"]) or answers_equal(ans, c["rep"]):
                 c["weight"] += w
                 c["members"].append((ans, w))
                 break
@@ -1013,7 +997,7 @@ def _cluster_answers(preds: Sequence[Tuple[str, float]]) -> str:
     return min((a for a, _ in best["members"]), key=len)
 
 
-def score_pooled_runs(
+def score_sc_runs(
     mas: Any,
     question: str,
     runs: Sequence[Dict[str, Any]],
@@ -1023,23 +1007,16 @@ def score_pooled_runs(
     prm_tokenizer=None,
     orm_tokenizer=None,
     step_separator: str = "</step>",
-    logprob_agg: str = "sum",
     view_mode: str = "full",
 ) -> tuple[List[float], TokenStats]:
-    """Selection weights for cached SC trajectories under one scorer.
-
-    Every selector receives the identical candidate pool; only the weights
-    differ. Each run is {"steps": [...], "agent_ids": [...]} in decision
-    order. Weight conventions match `make_scored_voter`: PRM step-product,
-    exp(sum-logprob), sigmoid(ORM end), or 1.0 for plain self-consistency.
-    """
+    """Selection weights for completed SC trajectories under one scorer."""
     usage = TokenStats()
     weights: List[float] = []
     for run in runs:
         steps = [str(step) for step in run.get("steps", [])]
         agent_ids = [int(agent_id) for agent_id in run.get("agent_ids", [])]
         if score_mode == "prm":
-            w, u = score_path_prm_product(
+            raw_score, u = score_path_prm_mean(
                 score_fn,
                 mas,
                 question,
@@ -1048,9 +1025,10 @@ def score_pooled_runs(
                 step_separator=step_separator,
                 view_mode=view_mode,
             )
+            w = _sigmoid(raw_score)
         elif score_mode == "logprob":
-            raw_score, u = score_path_logprob(mas, question, steps, agg=logprob_agg)
-            w = _safe_exp(raw_score)
+            raw_score, u = score_path_logprob(mas, question, steps)
+            w = _sigmoid(raw_score)
         elif score_mode == "orm":
             # ORM scores the final state; for local view, scope to the last
             # decided agent on the path (typically the answer-producing sink).
@@ -1066,10 +1044,8 @@ def score_pooled_runs(
             )
             raw_score, u = score_orm_end(score_fn, state_text, tokenizer=orm_tokenizer)
             w = _sigmoid(raw_score)
-        elif score_mode == "sc":
-            w, u = 1.0, TokenStats()
         else:
-            raise ValueError(f"Unknown pooled score mode: {score_mode!r}.")
+            raise ValueError(f"Unknown SC score mode: {score_mode!r}.")
         usage.add(u)
         weights.append(float(w))
     return weights, usage
@@ -1085,13 +1061,12 @@ def make_scored_voter(
     orm_tokenizer=None,
     step_separator: str = "</step>",
     k: int = 5,
-    logprob_agg: str = "sum",  # "sum" | "avg_token" | "avg_step"
     return_all_answers: bool = False,  # expose the k raw answers for pass@k
     view_mode: str = "full",  # "full" | "local" — scope of state text fed to PRM/ORM
 ) -> Callable[[Any, str], Any]:
     """
-    Runs k decodes with trace, groups predictions by numeric equivalence, and picks the
-    group with the largest total *score weight* (PRM-product / sum-logprob / ORM-end).
+    Runs k decodes with trace, groups equivalent predictions, and picks the
+    group with the largest total sigmoid-normalized path-score weight.
 
     Returns either:
       - (chosen_answer, combined_usage)
@@ -1115,147 +1090,30 @@ def make_scored_voter(
                 "steps": [e["chosen_text"] for e in tr_run],
                 "agent_ids": [e["agent_idx"] for e in tr_run],
             }
-            run_weights, u2 = score_pooled_runs(
+            run_weights, u2 = score_sc_runs(
                 mas_i,
                 q,
                 [run],
-                score_mode=(score_mode if score_mode in {"prm", "logprob", "orm"} else "sc"),
+                score_mode=score_mode,
                 score_fn=score_fn,
                 prm_tokenizer=prm_tokenizer,
                 orm_tokenizer=orm_tokenizer,
                 step_separator=step_separator,
-                logprob_agg=logprob_agg,
                 view_mode=view_mode,
             )
             usages.add(u2)
             preds.append((ans, run_weights[0]))
 
         chosen = _cluster_answers(preds)
-        raw_answers = [ans for ans, _ in preds]
+        raw_answers = [
+            answer for answer, _ in sorted(preds, key=lambda item: item[1], reverse=True)
+        ]
 
         if return_all_answers:
             return chosen, usages, raw_answers
         return chosen, usages
 
     return decoder
-
-
-# =========================================================
-#  LLM-as-judge selection on cached SC pools (Experiment 2)
-# =========================================================
-
-
-JUDGE_SYSTEM_PROMPT = (
-    "You are a strict evaluator of multi-agent reasoning transcripts. You "
-    "assign per-message credits that reflect real problem-solving progress. "
-    "You never see the reference answer and must judge on reasoning quality "
-    "alone."
-)
-
-
-def render_judge_batch(question: str, trajectories: Sequence[Sequence[str]]) -> str:
-    """Listwise judge prompt over the shared candidate pool (no gold answer)."""
-    parts = [
-        "Evaluate every candidate trajectory produced for the problem below.",
-        f"PROBLEM:\n{question}",
-    ]
-    for t_idx, steps in enumerate(trajectories):
-        lines = [f"TRAJECTORY {t_idx + 1}:"]
-        for s_idx, step in enumerate(steps):
-            lines.append(f"[message {s_idx + 1}] {step}")
-        parts.append("\n".join(lines))
-    counts = ", ".join(str(len(steps)) for steps in trajectories)
-    parts.append(
-        "Assign one credit in [-1, 1] to every message. Reward substantive "
-        "progress toward a correct solution and genuine corrections of "
-        "earlier mistakes. Penalize misleading reasoning and incorrect "
-        "conclusions. Do not reward verbosity, confidence, or agreement. "
-        'Reply with exactly one JSON object of the form {"credits": '
-        "[[...], ...]} holding one list of numbers per trajectory with "
-        f"message counts {counts}, and no other text."
-    )
-    return "\n\n".join(parts)
-
-
-def parse_judge_credits(text: str, expected_lengths: Sequence[int]) -> Optional[List[List[float]]]:
-    """Extract per-trajectory credit lists, clamped to [-1, 1].
-
-    Returns None when the reply holds no JSON object with one non-empty
-    numeric list per trajectory. Inner lengths are not enforced: the mean
-    credit is what selection consumes, so a ragged but numeric reply is
-    still a usable judgment rather than a parse failure.
-    """
-    match = re.search(r"\{.*\}", str(text or ""), flags=re.S)
-    if not match:
-        return None
-    try:
-        payload = json.loads(match.group(0))
-    except json.JSONDecodeError:
-        return None
-    credits = payload.get("credits") if isinstance(payload, dict) else None
-    if not isinstance(credits, list) or len(credits) != len(expected_lengths):
-        return None
-    parsed: List[List[float]] = []
-    for row in credits:
-        if not isinstance(row, list) or not row:
-            return None
-        try:
-            parsed.append([min(1.0, max(-1.0, float(value))) for value in row])
-        except (TypeError, ValueError):
-            return None
-    return parsed
-
-
-def make_llm_judge_voter(
-    judge_model: Any,
-    judge_tokenizer: Any,
-    *,
-    max_new_tokens: int = 256,
-) -> Callable[[str, Sequence[Sequence[str]]], Tuple[List[float], Dict[str, Any]]]:
-    """One deterministic listwise judge call per pool.
-
-    Returns (weights, info): weights are (mean_credit + 1) / 2 per
-    trajectory; on a parse failure the weights fall back to uniform 0.5
-    (plain majority) and info["parsed"] is False.
-    """
-
-    @torch.inference_mode()
-    def judge(
-        question: str, trajectories: Sequence[Sequence[str]]
-    ) -> Tuple[List[float], Dict[str, Any]]:
-        messages = [
-            {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
-            {"role": "user", "content": render_judge_batch(question, trajectories)},
-        ]
-        prompt_ids = _encode_prompt_ids(judge_tokenizer, messages)
-        device = next(judge_model.parameters()).device
-        input_ids = torch.tensor([prompt_ids], dtype=torch.long, device=device)
-        pad_id = judge_tokenizer.pad_token_id
-        if pad_id is None:
-            pad_id = judge_tokenizer.eos_token_id
-        output = judge_model.generate(
-            input_ids=input_ids,
-            attention_mask=torch.ones_like(input_ids),
-            do_sample=False,
-            max_new_tokens=int(max_new_tokens),
-            use_cache=True,
-            pad_token_id=pad_id,
-        )
-        reply = judge_tokenizer.decode(output[0, input_ids.shape[1] :], skip_special_tokens=True)
-        credits = parse_judge_credits(reply, [len(steps) for steps in trajectories])
-        if credits is None:
-            weights = [0.5] * len(trajectories)
-        else:
-            weights = [(sum(row) / len(row) + 1.0) / 2.0 for row in credits]
-        info = {
-            "parsed": credits is not None,
-            "reply": reply,
-            "prompt_tokens": len(prompt_ids),
-            "generated_tokens": int(output.shape[1] - input_ids.shape[1]),
-        }
-        return weights, info
-
-    return judge
 
 
 def render_action_ranking(
@@ -1265,6 +1123,7 @@ def render_action_ranking(
     candidates: Sequence[str],
 ) -> str:
     """Stepwise judge prompt: rank candidate next actions at one search state."""
+    score_names = ",".join(f"s{idx + 1}" for idx in range(len(candidates)))
     if prefix_steps:
         transcript = "\n".join(
             f"[step {idx + 1} | {role}] {text}" for idx, (role, text) in enumerate(prefix_steps)
@@ -1272,22 +1131,19 @@ def render_action_ranking(
     else:
         transcript = "(no steps yet)"
     lines = [
-        "A multi-agent team is solving the problem below. Score each "
-        "candidate next action for the state shown.",
-        f"PROBLEM:\n{question}",
-        f"TRANSCRIPT SO FAR:\n{transcript}",
-        f"CANDIDATE NEXT ACTIONS by {speaker}:",
+        "Score how much each candidate advances a correct solution.",
+        f"Problem: {question}",
+        f"Transcript: {transcript}",
+        f"Acting agent: {speaker}",
+        "Candidates:",
     ]
     for idx, text in enumerate(candidates):
-        lines.append(f"[candidate {idx + 1}] {text}")
+        lines.append(f"{idx + 1}. {text}")
     lines.append(
-        "Assign one score in [-1, 1] per candidate for how much it advances "
-        "a correct solution from this state. Reward correct, verifiable "
-        "progress and genuine error corrections; penalize mistakes, "
-        "contradictions, and misleading conclusions; do not reward "
-        "verbosity, confidence, or agreement. Reply with exactly one JSON "
-        'object of the form {"scores": [...]} containing '
-        f"{len(candidates)} numbers, and no other text."
+        f'Return only {{"scores":[{score_names}]}}, with each score in [-1,1].\n'
+        "Reward correct, verifiable progress and error correction. Penalize\n"
+        "errors, contradictions, and misleading conclusions. Ignore verbosity,\n"
+        "confidence, and agreement."
     )
     return "\n\n".join(lines)
 
@@ -1334,11 +1190,10 @@ def make_llm_action_ranker(
         candidates: Sequence[str],
     ) -> Tuple[List[float], Dict[str, Any]]:
         messages = [
-            {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
             {
                 "role": "user",
                 "content": render_action_ranking(question, prefix_steps, speaker, candidates),
-            },
+            }
         ]
         prompt_ids = _encode_prompt_ids(judge_tokenizer, messages)
         device = next(judge_model.parameters()).device
@@ -1456,7 +1311,7 @@ def load_prm_scorer(
     # Resolve base model if not supplied
     if base_model_id is None:
         cfg = PeftConfig.from_pretrained(str(adapter_dir))
-        base_model_id = getattr(cfg, "base_model_name_or_path", None) or "Qwen/Qwen2.5-7B-Instruct"
+        base_model_id = getattr(cfg, "base_model_name_or_path", None) or "Qwen/Qwen2.5-7B"
 
     # Tokenizer: prefer saved with adapter; else base
     tok_src = str(adapter_dir) if (adapter_dir / "tokenizer.json").exists() else base_model_id
@@ -1694,10 +1549,6 @@ class MCTSInfer(BaseMCTS):
         c_uct: float = 2.0,
         gen_kwargs: Optional[Dict[str, Any]] = None,
         step_separator: str = "</step>",
-        uct_type: str = "uct",  #  "uct" | "puct"
-        leaf_score_type: Optional[str] = None,  # override leaf eval, e.g., "orm"
-        logprob_agg: str = "sum",  # "sum" | "avg_token" | "avg_step"
-        leaf_score_fn: Optional[Callable[[str], float]] = None,  # leaf PRM/ORM
         view_mode: str = "full",  # "full" | "local" — scope of state text for PRM/ORM
         action_ranker: Optional[
             Callable[
@@ -1706,13 +1557,7 @@ class MCTSInfer(BaseMCTS):
             ]
         ] = None,  # stepwise judge for score_type="judge"
     ):
-        super().__init__(
-            mas,
-            question,
-            gen_kwargs=gen_kwargs,
-            root_init_value=0.0,
-            root_init_visits=1,
-        )
+        super().__init__(mas, question, gen_kwargs=gen_kwargs)
         self.q = question
         self.score_fn = score_fn
         self.score_type = score_type
@@ -1721,14 +1566,10 @@ class MCTSInfer(BaseMCTS):
         self.max_children = int(max(1, max_children))
         self.c = float(c_uct)
         self.sep = step_separator
-        self.leaf_score_fn = leaf_score_fn or score_fn
         self.action_ranker = action_ranker
         if score_type == "judge" and action_ranker is None:
             raise ValueError('score_type="judge" requires an action_ranker.')
 
-        self.uct_type = (uct_type or "uct").lower()
-        self.leaf = (leaf_score_type or "").lower() or None
-        self.logprob_agg = (logprob_agg or "sum").lower()
         self.view_mode = (view_mode or "full").lower()
         self.usage = TokenStats()
         self.judge_calls = 0
@@ -1757,20 +1598,8 @@ class MCTSInfer(BaseMCTS):
         )
         return [float(value) for value in values]
 
-    def _uct(self, parent: Node, child: Node) -> float:
-        Np = max(parent.visits + 1, 1)
-        Nc = child.visits + 1
-        return child.q_mean + self.c * math.sqrt(math.log(Np) / Nc)
-
-    def _puct(self, parent: Node, child: Node) -> float:
-        Np = max(parent.visits, 1)
-        Nc = child.visits
-        return child.q_mean + self.c * child.prior * math.sqrt(Np) / (1.0 + Nc)
-
     def _select_score(self, parent: Node, child: Node) -> float:
-        if self.uct_type == "puct":
-            return self._puct(parent, child)
-        return self._uct(parent, child)
+        return uct_score(parent, child, self.c)
 
     def _expand(self, node: Node) -> None:
         # With conditional edges, terminality is determined by `next_runnable`
@@ -1836,40 +1665,14 @@ class MCTSInfer(BaseMCTS):
                     self.mas.agents[agent_idx], None, outs[0], prompt_ids=enc
                 )
                 self.usage.scorer += p_len + g_len
-                if self.logprob_agg in ("avg_token", "avg", "mean_token"):
-                    v = v_lp / max(1, g_len)
-                else:  # "sum" or "avg_step" (per-step = sum here)
-                    v = v_lp
+                v = _sigmoid(v_lp / max(1, g_len))
 
             else:  # "orm" does not score partials
                 v = 0.0
 
             vals.append(v)
 
-        # 2) compute priors for PUCT (softmax over v_init); safe even if UCT
-        priors = [1.0 / len(candidates)] * len(candidates) if candidates else []
-        if self.uct_type == "puct" and candidates:
-            can_logprob = getattr(self.mas.agents[agent_idx], "model", None) is not None
-            if can_logprob:
-                try:
-                    logpriors = []
-                    for outs in candidates:
-                        text = outs[0] if outs else ""
-                        lp, sp, sg = compute_logprob_and_token_counts(
-                            self.mas.agents[agent_idx], None, text, prompt_ids=enc
-                        )
-                        self.usage.scorer += sp + sg
-                        logpriors.append(lp / max(1, sg))
-
-                    m = max(logpriors)
-                    exps = [math.exp(lp - m) for lp in logpriors]
-                    Z = sum(exps) if exps else 1.0
-                    priors = [e / Z for e in exps]
-                except Exception:
-                    pass  # keep uniform
-
-        # 3) create children with v_init and prior
-        for v, outs, p0 in zip(vals, candidates, priors):
+        for v, outs in zip(vals, candidates):
             node.children.append(
                 self._make_child(
                     node,
@@ -1877,7 +1680,6 @@ class MCTSInfer(BaseMCTS):
                     outs,
                     init_value=v,
                     init_visits=1,
-                    prior=p0,
                 )
             )
 
@@ -1897,18 +1699,8 @@ class MCTSInfer(BaseMCTS):
                 path.append(node)
 
         leaf_traj = path[-1].trajectory
-        leaf_type = self.leaf or self.score_type
-
-        if leaf_type in ("prm", "judge"):
+        if self.score_type in ("prm", "judge", "logprob"):
             v_leaf = path[-1].init_value  # cached score for this node
-
-        elif leaf_type == "logprob":
-            steps = [
-                leaf_traj[agent_idx][0] for agent_idx in self.order if leaf_traj.get(agent_idx)
-            ]
-            v_leaf, u = score_path_logprob(self.mas, self.q, steps, agg=self.logprob_agg)
-            self.usage.add(u)
-
         else:  # "orm"
             # Pick the last decided agent in topological order (the sink of
             # the realized path), not just the highest index — different in
@@ -1924,10 +1716,9 @@ class MCTSInfer(BaseMCTS):
                 agent_idx=leaf_last,
             )
             v_leaf, u = score_orm_end(
-                self.leaf_score_fn, state_text, tokenizer=self.orm_tokenizer
+                self.score_fn, state_text, tokenizer=self.orm_tokenizer
             )  # use leaf scorer on the same format seen during training
             self.usage.add(u)
-            self.usage.prm_calls += 1
 
         for n in path:
             n.visits += 1
@@ -1947,16 +1738,17 @@ class MCTSInfer(BaseMCTS):
 
     def get_topk_answers(self, k: int = 5) -> List[str]:
         """
-        Collect up to k final answers from the current MCTS tree, ranked by node q_mean.
-        This only replays stored trajectories (no extra model calls).
+        Collect up to k terminal answers. Stepwise scorers rank each path by
+        its mean edge score, as specified for Hit@k in the paper. ORM paths
+        use their backed-up terminal score.
         """
         if k <= 0:
             return []
 
         candidates: List[Tuple[float, str]] = []
-        stack = [self.root]
+        stack: List[Tuple[Node, List[float]]] = [(self.root, [])]
         while stack:
-            node = stack.pop()
+            node, path_scores = stack.pop()
             # Use nodes that can serve as final states (leaf or terminal) and that have a trajectory.
             if node.trajectory and self._is_terminal(node) and node.visits > 0:
                 _, primary_out, last = self.mas._replay(
@@ -1965,8 +1757,13 @@ class MCTSInfer(BaseMCTS):
                     node.trajectory,
                 )
                 ans = self.mas._aggregate_final(primary_out, last)
-                candidates.append((node.q_mean, ans))
-            stack.extend(node.children)
+                rank_score = (
+                    node.q_mean
+                    if self.score_type == "orm"
+                    else sum(path_scores) / max(1, len(path_scores))
+                )
+                candidates.append((rank_score, ans))
+            stack.extend((child, [*path_scores, child.init_value]) for child in node.children)
 
         if not candidates:
             return []

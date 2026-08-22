@@ -1,14 +1,4 @@
-"""
-Example:
-    # PRM-only (original behavior, global view)
-    python src/train/preprocess_data.py --target-nodes 4 --dedupe
-
-    # PPM (global view)
-    python preprocess_prm.py --input trees_dir_or_file --make-ppm --ppm-max-pairs 8
-
-    # Local view (MASPRM: each record scoped to a single agent's inbox + output)
-    python src/train/preprocess_data.py --view local --make-ppm
-"""
+"""Convert MAS-MCTS trees into pointwise samples and sibling preferences."""
 
 import argparse
 import json
@@ -192,11 +182,6 @@ def _records_from_tree(
     """
     prompt = _extract_prompt(data, fallback=filename_hint)
 
-    # FILTER: keep only trees whose ROOT score is within [-0.7, 0.7]
-    root_q = _node_value(data)
-    if (root_q is None) or not (-0.7 <= float(root_q) <= 0.7):
-        return [], 0, 0
-
     out: List[Dict[str, Any]] = []
     n_pos = 0  # number of terminal leaves with reward +1
     n_neg = 0  # number of terminal leaves with reward -1
@@ -249,11 +234,6 @@ def _records_from_tree_local(
     by `render_state_text(view="local")` at inference time.
     """
     question = _extract_prompt(data, fallback=filename_hint)
-
-    # Preserve the same root-q filter as the global path.
-    root_q = _node_value(data)
-    if (root_q is None) or not (-0.7 <= float(root_q) <= 0.7):
-        return [], 0, 0
 
     out: List[Dict[str, Any]] = []
     n_pos = 0
@@ -333,8 +313,7 @@ def _ppm_pairs_from_tree(
     pos_topk: int = 4,
     neg_topk: int = 4,
     max_pairs: int = 8,
-    require_root_window: Optional[Tuple[float, float]] = None,
-) -> Tuple[List[Dict[str, Any]], int, int]:
+) -> List[Dict[str, Any]]:
     """
     rStar-Math style step-wise PPM.
 
@@ -352,15 +331,8 @@ def _ppm_pairs_from_tree(
         depth). ``None`` or ``0`` -> variable-depth mode.
       • max_pairs limits the TOTAL pairs per tree.
 
-    Returns: (records, num_positive_candidates, num_negative_candidates).
+    Returns the mined preference records.
     """
-    # Optional root-q filter
-    if require_root_window is not None:
-        root_q = _node_value(data)
-        lo, hi = require_root_window
-        if (root_q is None) or not (float(lo) <= float(root_q) <= float(hi)):
-            return []
-
     prompt = _extract_prompt(data, fallback=filename_hint)
 
     def _norm_text(s: str) -> str:
@@ -392,7 +364,11 @@ def _ppm_pairs_from_tree(
             continue
 
         # Children usable at this step
-        children = nd.get("children") or []
+        children = [
+            child
+            for child in (nd.get("children") or [])
+            if int(child.get("visits", 0)) > 0
+        ]
         if not children:
             continue
         # "Final step" check. In fixed-depth mode this is purely positional
@@ -515,17 +491,10 @@ def _ppm_pairs_from_tree_local(
     pos_topk: int = 4,
     neg_topk: int = 4,
     max_pairs: int = 8,
-    require_root_window: Optional[Tuple[float, float]] = None,
 ) -> List[Dict[str, Any]]:
     """Local-view PPM pairs: each pair differs at one agent's step output, with
     the shared upstream prefix collapsed into `prompt` via MAS inbox replay.
     """
-    if require_root_window is not None:
-        root_q = _node_value(data)
-        lo, hi = require_root_window
-        if (root_q is None) or not (float(lo) <= float(root_q) <= float(hi)):
-            return []
-
     question = _extract_prompt(data, fallback=filename_hint)
 
     def _norm_text(s: str) -> str:
@@ -558,7 +527,11 @@ def _ppm_pairs_from_tree_local(
         if fixed_len and (depth >= tn - 1):
             continue
 
-        children = nd.get("children") or []
+        children = [
+            child
+            for child in (nd.get("children") or [])
+            if int(child.get("visits", 0)) > 0
+        ]
         if not children:
             continue
         # See _ppm_pairs_from_tree: in fixed-depth mode "final step" is by
@@ -689,20 +662,11 @@ def main():
     ap.add_argument(
         "--target-nodes",
         type=int,
-        default=5,
+        default=0,
         help=(
-            "Exact path length in nodes (root + actions). Pass <=0 to enable "
-            "variable-depth mode, which accepts any root->leaf path whose leaf "
-            "is terminal — required for dynamic-scheduler MAS configs (e.g., "
-            "DyLAN-style judge-gated refinement) where AGREE branches end "
-            "earlier than DISAGREE branches."
+            "Optional exact path length in nodes (root + actions). The default "
+            "accepts every terminal path and supports both fixed and conditional schedules."
         ),
-    )
-    ap.add_argument(
-        "--dedupe",
-        action="store_true",
-        default=True,
-        help="Remove exact duplicate samples",
     )
     # Preference Pair Mining (PPM) switches
     ap.add_argument(
@@ -720,21 +684,13 @@ def main():
         "--ppm-pos-topk",
         type=int,
         default=4,
-        help="Top-K positive terminal paths to consider.",
+        help="Top-K valued sibling actions to consider at each prefix.",
     )
     ap.add_argument(
         "--ppm-neg-topk",
         type=int,
         default=4,
-        help="Top-K negative terminal paths to consider.",
-    )
-    ap.add_argument(
-        "--ppm-root-window",
-        type=float,
-        nargs=2,
-        default=(-0.7, 0.7),
-        metavar=("LO", "HI"),
-        help="Optional root-q window filter for PPM (e.g., -0.7 0.7). If omitted, no root filter is applied.",
+        help="Bottom-K valued sibling actions to consider at each prefix.",
     )
     ap.add_argument(
         "--view",
@@ -802,7 +758,10 @@ def main():
         else None
     )
 
-    json_files = sorted(args.input.rglob("*.json"))
+    if args.input.is_file():
+        json_files = [args.input] if args.input.suffix.lower() == ".json" else []
+    else:
+        json_files = sorted(args.input.rglob("*.json"))
     n_files = len(json_files)
     print(f"[preprocess_prm] Found {n_files} JSON files under {args.input.resolve()}")
     for f in tqdm(json_files, desc="Processing trees"):
@@ -827,15 +786,14 @@ def main():
             prm_n_neg += cneg
             for r in recs:
                 prm_n_paths += 1
-                if args.dedupe:
-                    key = (
-                        r["prompt"],
-                        tuple(r["completions"]),
-                        tuple(round(float(x), 4) for x in r["labels"]),
-                    )
-                    if key in seen_prm:
-                        continue
-                    seen_prm.add(key)
+                key = (
+                    r["prompt"],
+                    tuple(r["completions"]),
+                    tuple(round(float(x), 4) for x in r["labels"]),
+                )
+                if key in seen_prm:
+                    continue
+                seen_prm.add(key)
                 prm_out.write(json.dumps(r, ensure_ascii=False) + "\n")
                 prm_n_kept += 1
 
@@ -850,11 +808,6 @@ def main():
                         pos_topk=args.ppm_pos_topk,
                         neg_topk=args.ppm_neg_topk,
                         max_pairs=args.ppm_max_pairs,
-                        require_root_window=(
-                            tuple(args.ppm_root_window)
-                            if args.ppm_root_window
-                            else None
-                        ),
                     )
                 else:
                     pairs = _ppm_pairs_from_tree(
@@ -864,21 +817,15 @@ def main():
                         pos_topk=args.ppm_pos_topk,
                         neg_topk=args.ppm_neg_topk,
                         max_pairs=args.ppm_max_pairs,
-                        require_root_window=(
-                            tuple(args.ppm_root_window)
-                            if args.ppm_root_window
-                            else None
-                        ),
                     )
 
                 for p in pairs:
-                    if args.dedupe:
-                        key = tuple(
-                            [p["prompt"]] + p["chosen_actions"] + p["rejected_actions"]
-                        )
-                        if key in seen_ppm:
-                            continue
-                        seen_ppm.add(key)
+                    key = tuple(
+                        [p["prompt"]] + p["chosen_actions"] + p["rejected_actions"]
+                    )
+                    if key in seen_ppm:
+                        continue
+                    seen_ppm.add(key)
                     ppm_out.write(json.dumps(p, ensure_ascii=False) + "\n")
                     ppm_n_pairs += 1
 

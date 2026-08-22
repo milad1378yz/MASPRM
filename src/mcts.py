@@ -24,7 +24,6 @@ class Node:
     node_text: Optional[str] = None
     init_value: float = field(default=0.0, repr=False)
     init_visits: int = field(default=0, repr=False)
-    prior: float = field(default=0.0, repr=False)
 
     @property
     def q_mean(self) -> float:
@@ -106,7 +105,6 @@ class BaseMCTS:
         *,
         init_value: float = 0.0,
         init_visits: int = 0,
-        prior: float = 0.0,
     ) -> Node:
         child = Node(
             steps=parent.steps + ([outs[0]] if outs else [""]),
@@ -117,16 +115,17 @@ class BaseMCTS:
             trajectory={**parent.trajectory, agent_idx: outs},
             init_value=init_value,
             init_visits=init_visits,
-            prior=prior,
         )
         self._finalize_node(child)
         return child
 
 
 def uct_score(parent: Node, child: Node, c: float) -> float:
-    Np = max(parent.visits, 1)
-    Nc = max(child.visits, 1)
-    return child.q_mean + c * math.sqrt(math.log(Np) / Nc)
+    total_visits = sum(sibling.visits + sibling.init_visits for sibling in parent.children)
+    child_visits = child.visits + child.init_visits
+    return child.q_mean + c * math.sqrt(
+        math.log(1 + total_visits) / (1 + child_visits)
+    )
 
 
 class MAS_MCTS(BaseMCTS):
@@ -135,8 +134,8 @@ class MAS_MCTS(BaseMCTS):
         mas: MAS,
         question: str,
         ground_truth_answer: str,
-        c: float = 2.0,
-        n_candidates: int = 4,
+        c: float = 4.0,
+        n_candidates: int = 3,
         gen_kwargs: Optional[Dict[str, Any]] = None,
     ):
         """
@@ -154,7 +153,7 @@ class MAS_MCTS(BaseMCTS):
 
     def search(
         self,
-        n_rollouts: int = 32,
+        n_rollouts: int = 40,
         early_stop_patience: int = 24,
         tol: float = 1e-2,  # treat changes smaller than this as "no change"
     ) -> Node:

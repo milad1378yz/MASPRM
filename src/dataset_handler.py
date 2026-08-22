@@ -2,7 +2,7 @@ from datasets import load_dataset
 import re
 from fractions import Fraction
 
-from answer_utils import _to_number
+from answer_utils import _to_number, extract_last_boxed, normalize_answer
 
 
 _SOFT_NEWLINE_CODEPOINTS = dict.fromkeys((11, 12, 13, 0x85, 0x2028, 0x2029))
@@ -159,21 +159,11 @@ def gold_from_gsm8k(answer_field: str):
 
 #  gold extractors for each dataset
 def gold_competition_math(example):
-    # solution usually ends with \boxed{<ans>} possibly with spaces or signs
-    sol = example["solution"]
-    m = re.findall(r"\\boxed\{([^}]+)\}", sol)
-    if m:
-        # last \boxed is the final answer
-        x = m[-1]
-        # strip LaTeX cruft like \frac{a}{b}
-        if re.match(r"^\s*\\frac\{[-+]?\d+\}\{[-+]?\d+\}\s*$", x):
-            num, den = re.findall(r"-?\d+", x)
-            return float(Fraction(int(num), int(den)))
-        # remove latex spacing
-        x = re.sub(r"\\[a-zA-Z]+", "", x)
-        x = x.replace("{", "").replace("}", "").strip()
-        return _to_number(x)
-    return None
+    boxed = extract_last_boxed(example["solution"])
+    if boxed is None:
+        return None
+    normalized = normalize_answer(boxed)
+    return float(normalized) if isinstance(normalized, Fraction) else normalized
 
 
 def format_mmlu_question(ex):
@@ -240,4 +230,3 @@ def gold_mmlu(ex):
 
 def _norm(s):
     return re.sub(r"\s+", " ", str(s)).strip().lower()
-

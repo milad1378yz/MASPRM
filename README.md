@@ -64,7 +64,6 @@ python src/run_mcts.py \
   --temperature 0.7 \
   --top_p 0.95 \
   --mas_config configs/gsm8k.yaml \
-  --load_in_4bit \
   --ray \
   --gpus_per_actor 1 \
   --actors 8
@@ -79,10 +78,10 @@ python src/train/preprocess_data.py \
   --make-ppm \
   --ppm-max-pairs 8 \
   --ppm-pos-topk 4 \
-  --ppm-neg-topk 4 \
-  --view full \
-  --config configs/gsm8k.yaml
+  --ppm-neg-topk 4
 ```
+
+For another fixed graph, set `--target-nodes` to one plus its number of scheduled agent turns. Omit it for a conditional schedule, where terminal paths can have different lengths.
 
 ## Scorer Training
 
@@ -92,7 +91,7 @@ The output preference file is next to the tree directory. This command uses the 
 python src/train/trainer.py \
   --mode ppm \
   --data_dir results/ppm_pairs_gsm8k_res_train_Qwen_Qwen2.5-1.5B-Instruct_r40_c4_cand3_t0p7_p0p95.jsonl \
-  --model-id Qwen/Qwen2.5-1.5B-Instruct \
+  --model-id Qwen/Qwen2.5-1.5B \
   --output-dir checkpoints/MASPRM-GSM8K-1.5B \
   --epochs 5 \
   --lr 1e-5 \
@@ -104,11 +103,11 @@ python src/train/trainer.py \
   --seed 42
 ```
 
-Use `--mode orm` with terminal outcome samples to train an ORM. Use `Qwen/Qwen2.5-7B-Instruct` as the model identifier to train the 7B scorer.
+Use `--mode orm` with terminal outcome samples to train an ORM. Use `Qwen/Qwen2.5-7B` as the model identifier to train the 7B scorer.
 
 ## Evaluation
 
-Run each evaluation with seeds 14, 24, and 42. The command below evaluates the main GSM8K Single Pass, SBS, and MCTS conditions on the full test split.
+Run each evaluation with seeds 14, 24, and 42. The command below evaluates the paper's non-ORM GSM8K Single-Pass, SC@5, SBS(5,3), and MCTS(10,3) conditions on the full test split.
 
 ```bash
 python src/experiments/compare_sbs_mcts.py \
@@ -116,10 +115,10 @@ python src/experiments/compare_sbs_mcts.py \
   --split test \
   --seed 14 \
   --prm_dir checkpoints/MASPRM-GSM8K-1.5B \
-  --prm_base_model_id Qwen/Qwen2.5-1.5B-Instruct \
+  --prm_base_model_id Qwen/Qwen2.5-1.5B \
   --gen_model_id Qwen/Qwen2.5-1.5B-Instruct \
   --mas_config configs/gsm8k.yaml \
-  --methods single_pass sbs_logprob sbs_prm mcts_logprob mcts_prm \
+  --methods single_pass voter_plain voter_logprob voter_prm sbs_logprob sbs_prm mcts_logprob mcts_prm \
   --b1 3 \
   --b2 5 \
   --n_simulations 10 \
@@ -129,6 +128,8 @@ python src/experiments/compare_sbs_mcts.py \
   --mcts_temperature 0.7 \
   --top_p 0.95
 ```
+
+Run SBS(5,1) separately with `--b1 1`. To include the ORM rows, provide `--orm_dir` and add `voter_orm mcts_orm` to `--methods`. Evaluation reports the paper's Hit@1, Hit@3, Hit@5, generated-token, and agent-call metrics.
 
 Repeat the command for seeds 24 and 42, then aggregate the text logs.
 

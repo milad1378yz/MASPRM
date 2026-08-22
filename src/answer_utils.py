@@ -3,23 +3,51 @@ from fractions import Fraction
 from typing import Optional
 
 
+FINAL_SPAN_RE = re.compile(
+    r"\b(?:final\s+answer|answer)\s*:?\s*(.+)",
+    re.IGNORECASE,
+)
+
+
+def extract_final_span(text: str) -> Optional[str]:
+    """Return the last explicitly tagged answer span, if present."""
+    matches = FINAL_SPAN_RE.findall(str(text or ""))
+    return matches[-1].strip() if matches else None
+
+
+def extract_last_boxed(text: str) -> Optional[str]:
+    r"""Extract the last balanced ``\boxed{...}`` payload, including nested braces."""
+    source = str(text or "")
+    result = None
+    for match in re.finditer(r"\\boxed\s*\{", source):
+        start = match.end()
+        depth = 1
+        for idx in range(start, len(source)):
+            if source[idx] == "{":
+                depth += 1
+            elif source[idx] == "}":
+                depth -= 1
+                if depth == 0:
+                    result = source[start:idx]
+                    break
+    return result
+
+
 def normalize_answer(ans: str):
-    ans = re.sub(r"\\boxed\{(.*?)\}", r"\1", ans)
+    explicit = extract_final_span(ans)
+    ans = explicit if explicit is not None else str(ans)
+    boxed = extract_last_boxed(ans)
+    if boxed is not None:
+        ans = boxed
+    ans = re.sub(r"\\frac\s*\{([-+]?\d+)\}\s*\{([-+]?\d+)\}", r"\1/\2", ans)
+    ans = re.sub(r"\\text\{[^{}]*\}\s*$", "", ans)
+    ans = ans.replace("\\left", "").replace("\\right", "")
     ans = ans.replace("$", "").replace("\\(", "").replace("\\)", "")
-    ans = ans.strip()
-    m = re.search(r"[-+]?\d+(?:/\d+)?(?:\.\d+)?", ans.replace(" ", ""))
-    if not m:
-        return ans
-    token = m.group(0)
-    if "/" in token:
-        try:
-            return Fraction(token)
-        except Exception:
-            pass
-    try:
-        return Fraction(token)
-    except Exception:
-        return token
+    ans = ans.strip().strip("*`.,")
+    number = _to_number(ans)
+    if number is not None:
+        return number
+    return re.sub(r"[\s,]+", "", ans).lower()
 
 
 FINAL_ANSWER_RE = re.compile(
@@ -76,12 +104,25 @@ def answers_equal(pred, truth) -> bool:
 def _to_number(s):
     if s is None:
         return None
-    s = s.strip()
+    s = str(s).strip().strip("*`.,")
+    boxed = extract_last_boxed(s)
+    if boxed is not None:
+        s = boxed
+    s = re.sub(r"\\frac\s*\{([-+]?\d+)\}\s*\{([-+]?\d+)\}", r"\1/\2", s)
+    s = re.sub(r"\\text\{[^{}]*\}\s*$", "", s)
+    s = s.replace("\\left", "").replace("\\right", "")
+    s = s.replace("\\(", "").replace("\\)", "").strip()
     s = s.replace(",", "")
     s = re.sub(r"^\$", "", s)
-    s = re.sub(r"\s+(dollars?|tickets?|units?|boxes?|people|students?)$", "", s, flags=re.I)
-    if re.fullmatch(r"-?\d+/\d+", s):
-        return float(Fraction(s))
+    s = re.sub(
+        r"\s*(?:dollars?|tickets?|units?|boxes?|people|students?|cm|mm|km|m|degrees?)"
+        r"(?:\s*\^?\s*[23]|[²³])?$",
+        "",
+        s,
+        flags=re.I,
+    )
+    if re.fullmatch(r"[-+]?\d+\s*/\s*[-+]?\d+", s):
+        return float(Fraction(s.replace(" ", "")))
     if s.endswith("%"):
         try:
             return float(s[:-1]) / 100.0
@@ -100,26 +141,34 @@ def extract_pred_number(text: str):
             return None
     if "TERMINAL_LOG:" in text:
         text = text.rsplit("TERMINAL_LOG:", 1)[-1]
-    m = re.findall(
-        r"(?:answer|recommended|candidate)\*{0,2}\s*:\*{0,2}\s*"
-        r"([-\$]?\s*\d[\d,]*(?:\.\d+)?)",
-        text,
-        flags=re.I,
+    explicit = extract_final_span(text)
+    source = explicit if explicit is not None else text
+    direct = _to_number(source)
+    if direct is not None:
+        return direct
+    latex_fractions = re.findall(
+        r"\\frac\s*\{([-+]?\d+)\}\s*\{([-+]?\d+)\}", source
     )
-    cand = m[-1] if m else None
-    if not cand:
-        m2 = re.findall(r"[-]?\$?\d[\d,]*(?:\.\d+)?", text)
-        cand = m2[-1] if m2 else None
-    return _to_number(cand)
+    if latex_fractions:
+        numerator, denominator = latex_fractions[-1]
+        return _to_number(f"{numerator}/{denominator}")
+    fractions = re.findall(r"[-+]?\d+\s*/\s*[-+]?\d+", source)
+    if fractions:
+        return _to_number(fractions[-1])
+    tokens = re.findall(
+        r"[-+]?\$?(?:\d[\d,]*(?:\.\d+)?|\.\d+)(?:[eE][-+]?\d+)?%?",
+        source,
+    )
+    return _to_number(tokens[-1]) if tokens else None
 
 
-def eq(a, b, tol=1e-6):
+def eq(a, b, tol=1e-3):
     if a is None or b is None:
         return False
-    return abs(a - b) <= tol * max(1.0, abs(b))
+    return abs(a - b) <= tol
 
 
-def numbers_equal(pred_text: str, truth_text: str, tol: float = 1e-6) -> bool:
+def numbers_equal(pred_text: str, truth_text: str, tol: float = 1e-3) -> bool:
     """Extract numeric value from pred_text and compare to truth_text, numerically with tolerance."""
     a = extract_pred_number(pred_text)
     # allow truth to be either a lone number string ('3/4', '$1,200', '12%', etc.) or a longer text

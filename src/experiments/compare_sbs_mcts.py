@@ -34,11 +34,6 @@ METHODS = (
     "voter_prm",
     "voter_logprob",
     "voter_orm",
-    "pooled_sc",
-    "pooled_logprob",
-    "pooled_orm",
-    "pooled_prm",
-    "pooled_judge",
     "handoff_fixed",
     "handoff_random",
     "handoff_policy",
@@ -76,8 +71,7 @@ def build_condition_specs(args: argparse.Namespace) -> List[ConditionSpec]:
                         "handoff_candidates": args.handoff_candidates,
                         "min_turns": args.min_turns,
                         "max_turns": args.max_turns,
-                        "gen_kwargs": sbs_kwargs,
-                        "logprob_agg": args.handoff_logprob_agg,
+                        "gen_kwargs": {**sbs_kwargs, "temperature": 1.0},
                         "prm_context_length": args.prm_context_length,
                         "allow_self": args.allow_self_handoff,
                         "random_can_finalize": not args.random_fixed_horizon,
@@ -89,34 +83,18 @@ def build_condition_specs(args: argparse.Namespace) -> List[ConditionSpec]:
         if method == "single_pass":
             conditions.append(
                 ConditionSpec(
-                    "DyLAN single pass (no scorer)",
+                    "Single-Pass (no scorer)",
                     "sbs_none",
                     {"B1": 1, "B2": 1, "gen_kwargs": sbs_kwargs},
                 )
             )
             continue
 
-        if method.startswith("pooled_"):
-            pooled_names = {
-                "pooled_sc": f"SC@{args.voter_k} majority vote (shared pool)",
-                "pooled_logprob": "Policy likelihood (shared pool)",
-                "pooled_orm": "ORM (shared pool)",
-                "pooled_prm": "MASPRM (shared pool)",
-                "pooled_judge": "LLM-MCA-style Judge (shared pool)",
-            }
-            params = {"k": args.voter_k, "gen_kwargs": sbs_kwargs}
-            if method in {"pooled_prm", "pooled_orm"}:
-                params["view_mode"] = args.view_mode
-            if method == "pooled_logprob" and args.logprob_agg != "sum":
-                params["logprob_agg"] = args.logprob_agg
-            conditions.append(ConditionSpec(pooled_names[method], method, params))
-            continue
-
         family, scorer = method.split("_", 1)
         if family == "sbs":
             params = {"B1": args.b1, "B2": args.b2, "gen_kwargs": sbs_kwargs}
             details = [f"B1={args.b1}", f"B2={args.b2}"]
-            name = f"SBS + {'PRM' if scorer == 'prm' else 'logprob'}"
+            name = f"SBS + {'MASPRM' if scorer == 'prm' else 'policy likelihood'}"
         elif family == "mcts":
             params = {
                 "n_simulations": args.n_simulations,
@@ -125,35 +103,26 @@ def build_condition_specs(args: argparse.Namespace) -> List[ConditionSpec]:
                 "mcts_kwargs": mcts_kwargs,
             }
             details = [f"N={args.n_simulations}", f"{args.max_children} children"]
-            search_name = "MCTS" if args.uct_type == "uct" else "MCTS (PUCT)"
             scorer_name = {
-                "prm": "PPM",
-                "logprob": "logprob",
+                "prm": "MASPRM",
+                "logprob": "policy likelihood",
                 "orm": "ORM",
-                "judge": "Judge (stepwise action ranking)",
+                "judge": "zero shot judge",
             }[scorer]
-            name = f"{'DyLAN ' if method == 'mcts_prm' else ''}{search_name} + {scorer_name}"
-            if args.uct_type != "uct":
-                params["uct_type"] = args.uct_type
-            if method == "mcts_prm" and args.orm_leaf:
-                params["leaf_score_type"] = "orm"
-                details.insert(0, "ORM leaf")
+            name = f"MCTS + {scorer_name}"
         else:
             params = {"k": args.voter_k, "gen_kwargs": sbs_kwargs}
             details = []
             voter_descriptions = {
-                "plain": "policy only, no PRM",
-                "prm": "score-weighted, PRM-steps",
-                "logprob": "score-weighted, logprob",
-                "orm": "score-weighted, ORM end",
+                "plain": "no scorer",
+                "prm": "MASPRM",
+                "logprob": "policy likelihood",
+                "orm": "ORM",
             }
-            name = f"Greedy + Voter ({voter_descriptions[scorer]})"
+            name = f"SC@{args.voter_k} + {voter_descriptions[scorer]}"
 
         if scorer in {"prm", "orm"}:
             params["view_mode"] = args.view_mode
-        if scorer == "logprob" and args.logprob_agg != "sum":
-            params["logprob_agg"] = args.logprob_agg
-            details.insert(0, args.logprob_agg.replace("_", "-"))
         if details:
             name += f" ({', '.join(details)})"
 
@@ -165,7 +134,11 @@ def build_condition_specs(args: argparse.Namespace) -> List[ConditionSpec]:
 def main():
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", default=None)
+    parser.add_argument(
+        "--dataset",
+        choices=["competition_math", "gsm8k", "mgsm", "mmlu", "logiqa"],
+        default="gsm8k",
+    )
     parser.add_argument("--split", default="test")
     parser.add_argument("--sample_n", type=int, default=None)  # set None for full
     parser.add_argument(
@@ -181,7 +154,7 @@ def main():
         "--prm_dir",
         default="checkpoints/Qwen2.5-1.5B-RM",
     )
-    parser.add_argument("--prm_base_model_id", default="Qwen/Qwen2.5-1.5B-Instruct")
+    parser.add_argument("--prm_base_model_id", default="Qwen/Qwen2.5-1.5B")
     parser.add_argument(
         "--handoff_prm_dir",
         default=None,
@@ -196,7 +169,7 @@ def main():
     parser.add_argument(
         "--judge_model_id",
         default="Qwen/Qwen2.5-7B-Instruct",
-        help="Zero-shot judge LM for mcts_judge / pooled_judge (never sees gold).",
+        help="Zero-shot judge LM for mcts_judge (never sees gold).",
     )
     parser.add_argument(
         "--judge_load_in_4bit",
@@ -243,19 +216,8 @@ def main():
         "--max_children", type=int, default=3, help="Maximum MCTS children per node."
     )
     method_args.add_argument("--c_uct", type=float, default=2.0)
-    method_args.add_argument("--uct_type", choices=["uct", "puct"], default="uct")
-    method_args.add_argument(
-        "--orm_leaf",
-        action="store_true",
-        help="Use ORM leaf scoring with mcts_prm.",
-    )
-    method_args.add_argument(
-        "--logprob_agg",
-        choices=["sum", "avg_token", "avg_step"],
-        default="sum",
-    )
-    method_args.add_argument("--sbs_temperature", type=float, default=1.0)
-    method_args.add_argument("--mcts_temperature", type=float, default=0.6)
+    method_args.add_argument("--sbs_temperature", type=float, default=0.7)
+    method_args.add_argument("--mcts_temperature", type=float, default=0.7)
     method_args.add_argument("--top_p", type=float, default=0.95)
     method_args.add_argument("--max_new_tokens", type=int, default=1024)
     method_args.add_argument(
@@ -268,32 +230,24 @@ def main():
     handoff_args.add_argument("--handoff_candidates", type=int, default=3)
     handoff_args.add_argument("--min_turns", type=int, default=4)
     handoff_args.add_argument("--max_turns", type=int, default=12)
-    handoff_args.add_argument(
-        "--handoff_logprob_agg",
-        choices=["sum", "avg_token"],
-        default="avg_token",
-    )
-    handoff_args.add_argument("--prm_context_length", type=int, default=16384)
+    handoff_args.add_argument("--prm_context_length", type=int, default=2048)
     handoff_args.add_argument("--allow_self_handoff", action="store_true")
     handoff_args.add_argument(
         "--random_fixed_horizon",
         action="store_true",
         help="Prevent the random-routing control from sampling FINAL before max_turns.",
     )
-    handoff_args.add_argument("--math_levels", nargs="+", type=int, default=[4, 5])
-    handoff_args.add_argument("--math_stratify_by", default="type")
     args = parser.parse_args()
 
     uses_handoff = any(method.startswith("handoff_") for method in args.methods)
-    uses_pooled = any(method.startswith("pooled_") for method in args.methods)
-    uses_judge = any(method in {"mcts_judge", "pooled_judge"} for method in args.methods)
+    uses_judge = "mcts_judge" in args.methods
     if uses_handoff and any(not method.startswith("handoff_") for method in args.methods):
         parser.error(
             "handoff and static methods require different MAS configs; run them in "
             "separate invocations"
         )
-    if args.dataset is None:
-        args.dataset = "gsm8k" if (uses_handoff or uses_pooled or uses_judge) else "mmlu"
+    if uses_handoff and args.dataset != "gsm8k":
+        parser.error("The paper evaluates dynamic handoff only on GSM8K")
     if uses_handoff and args.sample_n is None:
         args.sample_n = 200
 
@@ -317,16 +271,13 @@ def main():
         parser.error("temperatures must be greater than zero")
     if not 0 < args.top_p <= 1:
         parser.error("--top_p must be in the interval (0, 1]")
-    if args.orm_leaf and "mcts_prm" not in args.methods:
-        parser.error("--orm_leaf requires the mcts_prm method")
     if args.max_turns < args.min_turns:
         parser.error("--max_turns must be greater than or equal to --min_turns")
 
     conditions = build_condition_specs(args)
 
     needs_orm = any(
-        condition.kind in {"mcts_orm", "voter_orm", "pooled_orm"}
-        or condition.params.get("leaf_score_type") == "orm"
+        condition.kind in {"mcts_orm", "voter_orm"}
         for condition in conditions
     )
     if "handoff_prm" in args.methods and not args.handoff_prm_dir:
@@ -334,13 +285,13 @@ def main():
             "--handoff_prm_dir is required for handoff_prm; the requested MASPRM-7B "
             "checkpoint is not available at the repository's 1.5B default"
         )
-    static_prm_methods = {"sbs_prm", "mcts_prm", "voter_prm", "pooled_prm"}
+    static_prm_methods = {"sbs_prm", "mcts_prm", "voter_prm"}
     if any(method in static_prm_methods for method in args.methods) and not args.prm_dir:
         parser.error("--prm_dir is required by the selected static PRM methods")
     if needs_orm and not args.orm_dir:
         parser.error("--orm_dir is required by the selected methods")
     if uses_judge and not args.judge_model_id:
-        parser.error("--judge_model_id is required by mcts_judge / pooled_judge")
+        parser.error("--judge_model_id is required by mcts_judge")
 
     # Dataset
     DATASET_NAME = args.dataset
@@ -354,13 +305,6 @@ def main():
         SPLIT,
         n=(None if args.exclude_questions_file else SAMPLE_N),
         seed=SEED,
-        levels=(args.math_levels if uses_handoff and DATASET_NAME == "competition_math" else None),
-        stratify_by=(
-            args.math_stratify_by if uses_handoff and DATASET_NAME == "competition_math" else None
-        ),
-        # Restrict the stratified MATH pool to items the evaluator can grade
-        # BEFORE sampling, so the handoff run gets its full quota.
-        require_parseable_gold=(uses_handoff and DATASET_NAME == "competition_math"),
     )
     if args.exclude_questions_file:
         if DATASET_NAME != "gsm8k":
@@ -399,13 +343,6 @@ def main():
         if g is not None:
             data.append({"question": q_fn(ex), "answer": str(g)})
     print(f"[info] Loaded {len(data)} {DATASET_NAME}/{SPLIT} examples.")
-    if uses_handoff and len(data) != SAMPLE_N:
-        parser.error(
-            f"requested {SAMPLE_N} handoff examples but only {len(data)} have answers "
-            "supported by the current evaluator; choose a symbolic MATH verifier or "
-            "an explicitly numeric-only stratified subset before running this experiment"
-        )
-
     # MAS graph config
 
     cfg_path = (
@@ -477,18 +414,18 @@ def main():
         return
     # Pretty print table
     print("\n" + "#" * 80)
-    print("Table-4 style results")
+    print("Paper-style results")
     print("#" * 80)
     name_width = max(len(k) for k in results) + 2
-    max_k = 5
-    header_metrics = "  ".join([f"p@{i}" for i in range(1, max_k + 1)])
+    reported_k = (1, 3, 5)
+    header_metrics = "  ".join(f"p@{i}" for i in reported_k)
     print(f"{'Condition':<{name_width}}  {header_metrics}   {'Tokens (avg±std)':>22}")
-    print("-" * (name_width + 32 + 10 * max_k))
+    print("-" * (name_width + 32 + 10 * len(reported_k)))
     for cond_name, v in results.items():
         # pass_at_1 is identical to accuracy
         passes = [
             v.get(f"pass_at_{i}", v.get("accuracy", 0.0 if i == 1 else 0.0))
-            for i in range(1, max_k + 1)
+            for i in reported_k
         ]
         tmean = v.get("tok_mean", 0.0)
         tstd = v.get("tok_std", 0.0)
@@ -509,50 +446,12 @@ def main():
                 f"{values['hit_at_12']:>7.3f}  "
                 f"{values['realized_depth_mean']:>7.2f}"
             )
-        comparison = next(
-            (values for values in handoff_results.values() if "paired_accuracy_delta" in values),
-            None,
-        )
-        if comparison:
-            for threshold in (8, 12):
-                prefix = f"t{threshold}_"
-                print(
-                    f"T={threshold} dynamic MASPRM − policy: "
-                    f"Δ={comparison[prefix + 'paired_accuracy_delta']:.3f}, "
-                    f"95% CI [{comparison[prefix + 'paired_bootstrap_ci_low']:.3f}, "
-                    f"{comparison[prefix + 'paired_bootstrap_ci_high']:.3f}], "
-                    f"McNemar p={comparison[prefix + 'mcnemar_exact_p']:.4g}"
-                )
-
-    pooled_rows = {name: values for name, values in results.items() if "oracle_hit_at_k" in values}
-    if pooled_rows:
-        print("\nShared-pool selection results")
-        print(
-            f"{'Condition':<{name_width}}  {'Oracle':>7}  {'Sel|solv':>8}  "
-            f"{'AUC':>6}  {'Lat(s)':>7}"
-        )
-        for cond_name, values in pooled_rows.items():
-            print(
-                f"{cond_name:<{name_width}}  "
-                f"{values['oracle_hit_at_k']:>7.3f}  "
-                f"{values['selection_accuracy_given_solvable']:>8.3f}  "
-                f"{values['candidate_auc']:>6.3f}  "
-                f"{values.get('latency_mean_s', 0.0):>7.3f}"
-            )
     for cond_name, values in results.items():
         if "judge_parse_failure_rate" in values:
             print(
                 f"{cond_name}: judge calls/example="
                 f"{values.get('judge_calls_mean', 0.0):.2f}, "
                 f"parse-failure rate={values['judge_parse_failure_rate']:.4f}"
-            )
-        if "vs_masprm_paired_accuracy_delta" in values:
-            print(
-                f"{cond_name}: MASPRM − this: "
-                f"Δ={values['vs_masprm_paired_accuracy_delta']:.3f}, "
-                f"95% CI [{values['vs_masprm_paired_bootstrap_ci_low']:.3f}, "
-                f"{values['vs_masprm_paired_bootstrap_ci_high']:.3f}], "
-                f"McNemar p={values['vs_masprm_mcnemar_exact_p']:.4g}"
             )
 
 
