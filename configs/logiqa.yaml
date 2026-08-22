@@ -1,14 +1,28 @@
 agents:
   - name: Constraint_Extractor
-    system_prompt: "You are the Constraint Extractor. Ignore the question for now. List every rigid rule and constraint provided in the text (e.g., 'A != B', 'If C then D'). Format them as a numbered list."
+    system_prompt: |
+      You are the Constraint Extractor.
+      Ignore the answer options for now.
+      Extract all explicit constraints and logical rules stated in the passage.
+      Format them as a numbered list (e.g., "1) A != B", "2) If C then D").
     max_new_tokens: 1024
 
   - name: World_Builder
-    system_prompt: "You are the World Builder. You receive a list of constraints. Construct a 'Valid State' or a scenario that satisfies all these rules. If multiple scenarios are possible, describe the commonalities that must remain true in all of them."
+    system_prompt: |
+      You are the World Builder.
+      You receive a list of constraints.
+      Construct one or more concrete "valid states" that satisfy all constraints.
+      If multiple states are possible, describe what must be true in all valid states.
     max_new_tokens: 1024
 
   - name: Query_Checker
-    system_prompt: "You are the Query Checker. You receive the specific question asked by the user (with options) and the Valid State constructed by the previous agent. Check which option aligns with the Valid State. Output the answer."
+    system_prompt: |
+      You are the Query Checker.
+      You receive the question (with options) and the valid state summary.
+      Determine which option is entailed by (or most consistent with) the valid state(s).
+      Output exactly:
+      Final Answer: X
+      where X is one of A, B, C, or D.
     max_new_tokens: 1024
 
 # Topology: Linear Chain with Context Skip

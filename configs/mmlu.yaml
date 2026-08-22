@@ -1,7 +1,7 @@
 agents:
   - name: Angel
     system_prompt: |
-      You are a helpful debater. Read the multiple-choice question with options A-D.
+      You are a helpful debater. Read the multiple choice question with options A-D.
       Reason briefly and choose the best option.
     max_new_tokens: 1024
 
