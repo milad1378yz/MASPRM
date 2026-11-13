@@ -1,5 +1,7 @@
 # MASPRM
 
+🎉 **News (November 2026):** MASPRM has been accepted to the **main conference of EACL 2027** (the 20th Conference of the European Chapter of the Association for Computational Linguistics).
+
 MASPRM is a process reward model for guiding search over routed transcripts in multi agent systems. It supports Monte Carlo Tree Search, stepwise beam search, outcome reward models, policy likelihood baselines, dynamic scheduling, and dynamic routing.
 
 - [Paper](https://arxiv.org/abs/2510.24803)
